@@ -189,7 +189,7 @@ body { display: flex; flex-direction: column; }
   height: 14px;
   flex-shrink: 0;
 }
-.wind-row .wind-row-dir .wind-sock { left: 26px; top: calc(50% - 5px); }
+.wind-row .wind-row-dir .wind-sock { left: 26px; top: calc(50% - 6.5px); }
 .wind-row .wind-speed { color: var(--accent); font-weight: 600; }
 .civ-row .station-name { color: var(--muted); }
 
@@ -293,11 +293,12 @@ body { display: flex; flex-direction: column; }
 .wind-sock {
   position: absolute;
   left: 0;
-  top: -5px;
-  height: 10px;
+  top: -6.5px;
+  height: 13px;
   transform-origin: 0 50%;
-  clip-path: polygon(0 6%, 0 94%, 100% 50%);
-  opacity: 0.9;
+  clip-path: polygon(0 0, 0 100%, 100% 50%);
+  /* white rim matching the pill border, so pill + sock read as one outline */
+  filter: drop-shadow(0 0 1px rgba(255, 255, 255, 0.65));
   pointer-events: none;
 }
 

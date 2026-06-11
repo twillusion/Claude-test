@@ -315,10 +315,70 @@ function updateWindBlend() {
 
 // ---------- NEA observed wind (primary source for the particles) ----------
 
-// data.gov.sg real-time wind: same reliable host as the temperatures.
-// Live-only (no time dimension here); scrubbed times fall back to the
-// Open-Meteo field when it's available.
-let neaWind = null; // [{lat, lon, u, v}] in km/h
+/* data.gov.sg real-time wind: same reliable host as the temperatures.
+   Per-station history is built from day files (yesterday + today) at
+   startup and appended by the per-minute polls, so the time scrubber
+   replays observed wind. The live view shows each station's last known
+   reading — the feed is sparse, so reading ages vary by station. */
+const windStations = new Map(); // id -> {id, name, lat, lon, series: [{t, u, v}]}
+let windVectors = [];           // station vectors at the displayed time
+const windVectorsById = new Map();
+let windFieldT = NaN;
+let windDayLoaded = false;
+
+function vecFrom(kn, deg) {
+  const kmh = kn * KNOTS_TO_KMH;
+  const rad = (deg * Math.PI) / 180; // direction the wind comes FROM
+  return { u: -kmh * Math.sin(rad), v: -kmh * Math.cos(rad) };
+}
+
+function addWindPoint(id, st, t, kn, deg) {
+  if (kn == null || deg == null || !st?.location || !Number.isFinite(t)) return;
+  let rec = windStations.get(id);
+  if (!rec) {
+    rec = {
+      id, name: st.name || `Wind station ${id}`,
+      lat: st.location.latitude, lon: st.location.longitude, series: [],
+    };
+    windStations.set(id, rec);
+  }
+  const last = rec.series[rec.series.length - 1];
+  if (last && last.t === t) return;
+  const { u, v } = vecFrom(kn, deg);
+  rec.series.push({ t, u, v });
+  if (last && last.t > t) rec.series.sort((x, y) => x.t - y.t);
+}
+
+// Vectors at the displayed time: live = each station's latest reading;
+// scrubbed = the last reading at or before that moment (within 90 min).
+function updateWindField() {
+  windFieldT = displayedT === null ? Infinity : displayedT;
+  windVectors = [];
+  windVectorsById.clear();
+  for (const st of windStations.values()) {
+    const arr = st.series;
+    if (!arr.length) continue;
+    let p;
+    if (displayedT === null) {
+      p = arr[arr.length - 1];
+    } else {
+      let lo = 0, hi = arr.length - 1, idx = -1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (arr[mid].t <= displayedT + 60_000) { idx = mid; lo = mid + 1; } else hi = mid - 1;
+      }
+      if (idx < 0 || displayedT - arr[idx].t > 90 * 60_000) continue;
+      p = arr[idx];
+    }
+    const vec = { id: st.id, name: st.name, lat: st.lat, lon: st.lon, u: p.u, v: p.v };
+    windVectors.push(vec);
+    windVectorsById.set(st.id, vec);
+  }
+}
+
+function ensureWindField() {
+  if ((displayedT === null ? Infinity : displayedT) !== windFieldT) updateWindField();
+}
 
 async function fetchWindAt(dt) {
   const q = dt ? `?date_time=${encodeURIComponent(sgtStamp(dt))}` : "";
@@ -331,28 +391,54 @@ async function fetchWindAt(dt) {
   for (const s of [...spd.metadata.stations, ...dir.metadata.stations]) locs.set(s.id, s);
   return {
     locs,
+    ts: new Date(spd.items[0].timestamp).getTime(),
     speeds: new Map(spd.items[0].readings.map((r) => [r.station_id, r.value])),
     dirs: new Map(dir.items[0].readings.map((r) => [r.station_id, r.value])),
   };
 }
 
-function joinWind(snaps) {
-  const merged = new Map();
-  for (const s of snaps) {
-    for (const [id, kn] of s.speeds) {
-      const deg = s.dirs.get(id);
-      const st = s.locs.get(id);
-      if (kn == null || deg == null || !st?.location || merged.has(id)) continue;
-      const kmh = kn * KNOTS_TO_KMH;
-      const rad = (deg * Math.PI) / 180; // direction the wind comes FROM
-      merged.set(id, {
-        id, name: st.name || `Wind station ${id}`,
-        lat: st.location.latitude, lon: st.location.longitude,
-        u: -kmh * Math.sin(rad), v: -kmh * Math.cos(rad),
-      });
+// Whole-day files: every snapshot of the day, catching stations no matter
+// which minutes they reported in.
+async function fetchWindDayRaw(dayStr) {
+  const [spd, dir] = await Promise.all(
+    [`${WIND_SPEED_URL}?date=${dayStr}`, `${WIND_DIR_URL}?date=${dayStr}`].map(async (url) => {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`wind day HTTP ${res.status}`);
+      return res.json();
+    }));
+  const locs = new Map();
+  for (const s of [...spd.metadata.stations, ...dir.metadata.stations]) locs.set(s.id, s);
+  const dirByTs = new Map(dir.items.map((it) => [it.timestamp, it.readings]));
+  for (const it of spd.items) {
+    const dirReadings = dirByTs.get(it.timestamp);
+    if (!dirReadings) continue;
+    const degs = new Map(dirReadings.map((r) => [r.station_id, r.value]));
+    const t = new Date(it.timestamp).getTime();
+    for (const r of it.readings) {
+      addWindPoint(r.station_id, locs.get(r.station_id), t, r.value, degs.get(r.station_id));
     }
   }
-  return [...merged.values()];
+}
+
+async function fetchWind() {
+  const snap = await fetchWindAt();
+  for (const [id, kn] of snap.speeds) {
+    addWindPoint(id, snap.locs.get(id), snap.ts, kn, snap.dirs.get(id));
+  }
+  if (!windDayLoaded) {
+    windDayLoaded = true;
+    for (const day of [sgtDate(new Date()), sgtDate(new Date(Date.now() - 86_400_000))]) {
+      try { await fetchWindDayRaw(day); } catch { /* day files are best-effort */ }
+    }
+  }
+  const cutoff = Date.now() - (HISTORY_HOURS + 1) * 3600_000;
+  for (const st of windStations.values()) {
+    while (st.series.length && st.series[0].t < cutoff) st.series.shift();
+  }
+  updateWindField();
+  renderWindStatus();
+  renderWindPins();
+  scheduleRender(); // hybrid pill socks may have changed
 }
 
 /* Wind direction glyph: a windsock wedge — a tapered streak growing out
@@ -365,14 +451,15 @@ function tailGeom(wv, a = 0, b = 0) {
   const kmh = Math.hypot(wv.u, wv.v);
   const toward = (Math.atan2(wv.u, wv.v) * 180 / Math.PI + 360) % 360;
   const rot = toward - 90; // CSS rotation: 0deg points east on screen
-  let inset = 4;
+  let inset = 3;
   if (a && b) {
+    // start right at the host marker's rim (3px tucked under, hiding the seam)
     const t = (rot * Math.PI) / 180;
-    inset = (a * b) / Math.sqrt((b * Math.cos(t)) ** 2 + (a * Math.sin(t)) ** 2) - 2;
+    inset = (a * b) / Math.sqrt((b * Math.cos(t)) ** 2 + (a * Math.sin(t)) ** 2) - 3;
   }
   return {
     rot: Math.round(rot),
-    len: Math.round(Math.min(42, 12 + kmh * 1.8)),
+    len: Math.round(Math.min(46, 14 + kmh * 2)),
     inset: Math.round(inset),
   };
 }
@@ -400,8 +487,9 @@ const windPins = new Map();
 
 function renderWindPins() {
   if (typeof L === "undefined" || !map) return;
+  ensureWindField();
   const seen = new Set();
-  for (const p of neaWind ?? []) {
+  for (const p of windVectors) {
     if (stations.get(p.id)?.kind === "nea") {
       const existing = windPins.get(p.id);
       if (existing) { existing.remove(); windPins.delete(p.id); }
@@ -427,66 +515,14 @@ function renderWindPins() {
   }
 }
 
-// Permanent union of anemometers: unlike the temperature feed (every station,
-// every minute), the wind feed publishes sparse snapshots — some stations
-// surface only occasionally and not at predictable minutes. A station's last
-// known reading persists until a newer one replaces it.
-const windSeen = new Map(); // id -> latest known vector
-let windDayTried = false;
-
-// Latest value per station across a whole day of snapshots (items are
-// chronological, so later readings overwrite earlier ones).
-function latestPerStation(items) {
-  const m = new Map();
-  for (const it of items ?? []) {
-    for (const r of it.readings ?? []) {
-      if (r.value != null) m.set(r.station_id, r.value);
-    }
-  }
-  return m;
-}
-
-// The day file catches every station that reported at all today — immune to
-// the "which minute did it report?" problem that spot-checks have.
-async function fetchWindDayFile(dayStr) {
-  const [spd, dir] = await Promise.all(
-    [`${WIND_SPEED_URL}?date=${dayStr}`, `${WIND_DIR_URL}?date=${dayStr}`].map(async (url) => {
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`wind day HTTP ${res.status}`);
-      return res.json();
-    }));
-  const locs = new Map();
-  for (const s of [...spd.metadata.stations, ...dir.metadata.stations]) locs.set(s.id, s);
-  return { locs, speeds: latestPerStation(spd.items), dirs: latestPerStation(dir.items) };
-}
-
-async function fetchWind() {
-  const out = joinWind([await fetchWindAt()]);
-  for (const e of out) windSeen.set(e.id, e);
-  if (!windDayTried && windSeen.size < 8) {
-    windDayTried = true;
-    for (const day of [sgtDate(new Date()), sgtDate(new Date(Date.now() - 86_400_000))]) {
-      try {
-        const dayOut = joinWind([await fetchWindDayFile(day)]);
-        for (const e of dayOut) if (!windSeen.has(e.id)) windSeen.set(e.id, e);
-      } catch { /* try the next day back */ }
-      if (windSeen.size >= 8) break;
-    }
-  }
-  neaWind = windSeen.size ? [...windSeen.values()] : null;
-  renderWindStatus();
-  renderWindPins();
-  scheduleRender(); // hybrid pills carry wind tails that may have changed
-}
-
 function pollWind() {
-  fetchWind().catch(() => { neaWind = null; renderWindStatus(); });
+  fetchWind().catch(() => renderWindStatus());
 }
 
 function idwWind(lat, lon) {
   const cosLat = Math.cos((1.35 * Math.PI) / 180);
   let wSum = 0, uSum = 0, vSum = 0;
-  for (const p of neaWind) {
+  for (const p of windVectors) {
     const dx = (lon - p.lon) * cosLat * KM_PER_DEG;
     const dy = (lat - p.lat) * KM_PER_DEG;
     const w = 1 / (dx * dx + dy * dy + 0.5);
@@ -496,8 +532,9 @@ function idwWind(lat, lon) {
 }
 
 function windVecAt(lat, lon) {
-  if (displayedT === null && neaWind) return idwWind(lat, lon); // live: observed
-  if (!windU) return null; // scrubbed: model field if we have one
+  ensureWindField();
+  if (windVectors.length >= 2) return idwWind(lat, lon); // observed at displayed time
+  if (!windU) return null; // fall back to the model field if we have one
   const u = gridSample(windU, lat, lon);
   const v = gridSample(windV, lat, lon);
   return u == null || v == null ? null : { u, v };
@@ -510,19 +547,21 @@ const COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
 
 function renderWindStatus() {
   const el = document.getElementById("wind-status");
-  let u = 0, v = 0, n = 0;
-  if (displayedT === null && neaWind) {
-    for (const p of neaWind) { u += p.u; v += p.v; n++; }
+  ensureWindField();
+  let u = 0, v = 0, n = 0, src = "";
+  if (windVectors.length) {
+    for (const p of windVectors) { u += p.u; v += p.v; n++; }
+    src = ` (${windVectors.length} stations)`;
   } else if (windU) {
     for (let i = 0; i < windU.length; i++) {
       if (!Number.isNaN(windU[i]) && !Number.isNaN(windV[i])) { u += windU[i]; v += windV[i]; n++; }
     }
+    src = " (model)";
   }
   if (!n) { el.textContent = "–"; return; }
   u /= n; v /= n;
   const speed = Math.hypot(u, v);
   const from = (Math.atan2(-u, -v) * 180 / Math.PI + 360) % 360;
-  const src = displayedT === null && neaWind ? ` (${neaWind.length} stations)` : " (model)";
   el.textContent = `${speed.toFixed(0)} km/h from ${COMPASS[Math.round(from / 22.5) % 16]}${src}`;
 }
 
@@ -781,7 +820,7 @@ function renderMarker(s, v) {
       `<span class="civ-dot" style="--pill:${tempColor(v)}"></span></span>`;
   } else {
     const cls = s.id === selectedId ? "temp-pill selected" : "temp-pill";
-    const wv = windSeen.get(s.id); // hybrid: this station also reports wind
+    const wv = windVectorsById.get(s.id); // hybrid: this station also reports wind
     key = cls + (wv ? "+wind" : "");
     html = `${wv ? windSockHtml(wv, 22, 9, tempColor(v)) : ""}` +
       `<span class="${cls}" style="--pill:${tempColor(v)}">${fmt(v)}</span>`;
@@ -795,7 +834,7 @@ function renderMarker(s, v) {
       text.textContent = fmt(v);
       tinted.style.setProperty("--pill", tempColor(v));
       if (s.kind !== "civ") {
-        const wv = windSeen.get(s.id);
+        const wv = windVectorsById.get(s.id);
         const sock = root.querySelector(".wind-sock");
         if (wv && sock && sock.style) applySock(sock, wv, 22, 9, tempColor(v));
       }
@@ -896,7 +935,8 @@ function renderList(values) {
     for (const s of temp) rows.push(tempRow(s, values));
   }
   if (listFilter === "all" || listFilter === "wind") {
-    const wind = (neaWind ?? []).slice().sort((a, b) => (a.name < b.name ? -1 : 1));
+    ensureWindField();
+    const wind = windVectors.slice().sort((a, b) => (a.name < b.name ? -1 : 1));
     for (const p of wind) rows.push(windRow(p));
   }
   if (listFilter === "all" || listFilter === "civ") {
@@ -1086,6 +1126,7 @@ function renderAll() {
   const values = displayedValues(t);
   const grid = buildBlendedGrid(t ?? Date.now());
   updateWindBlend();
+  ensureWindField(); // socks, pins, and particles follow the displayed time
   updateScale(values, grid); // normalize colours before anything draws
   if (map && map.getContainer) {
     const boost = 1 + DAY_BRIGHT_BOOST * dayFactor(t ?? Date.now());
@@ -1098,6 +1139,7 @@ function renderAll() {
   renderOverlay(values, grid);
   renderTimebar(t);
   renderWindStatus();
+  renderWindPins();
 }
 
 // Coalesce slider-drag renders to animation frames.
@@ -1135,8 +1177,9 @@ let windParts = [];
 // Particles only where there's actual wind data nearby — the IDW field happily
 // extrapolates over Malaysia, but that's invention, not data.
 function windCovered(lat, lon) {
-  const pts = neaWind ||
-    [...stations.values()].filter((s) => s.kind === "nea" && Number.isFinite(s.lat));
+  const pts = windStations.size
+    ? [...windStations.values()]
+    : [...stations.values()].filter((s) => s.kind === "nea" && Number.isFinite(s.lat));
   if (!pts.length) return false;
   const cosLat = Math.cos((1.35 * Math.PI) / 180);
   for (const p of pts) {

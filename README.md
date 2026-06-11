@@ -47,10 +47,12 @@ static page, no backend, no hosting costs.
   redraws those tails every frame, so streaks stay glued to the land
   while panning (zoom gets a brief fade while projections settle). Live
   data comes from NEA's observed wind stations (data.gov.sg
-  wind-speed/wind-direction; sparse latest snapshots are topped up from a
-  10-minute-old one); scrubbed times fall back to the Open-Meteo wind
-  field when available. The footer shows the island-average wind and the
-  station count feeding it.
+  wind-speed/wind-direction). Per-station wind history is built from the
+  day files at startup and appended by the per-minute polls, so the time
+  scrubber replays observed wind — socks, pins, and the particle field all
+  follow the displayed time, falling back to the Open-Meteo field only
+  where history doesn't reach. The footer shows the island-average wind
+  and the station count feeding it.
 - On the live view each station's displayed value drifts by up to ±0.09°
   so the numbers tick like a real-time feed between the actual per-minute
   polls. Only the number displays refresh (no overlay re-rasterization),
