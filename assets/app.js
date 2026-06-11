@@ -383,29 +383,25 @@ function renderWindPins() {
   }
 }
 
-// Rolling union of recently-seen anemometers: a sparse poll must not shrink
-// the station set (one thin 1-minute snapshot used to wipe it down to 2).
-const windSeen = new Map(); // id -> {vector..., t: last seen}
-const WIND_STALE_MS = 25 * 60_000;
+// Permanent union of anemometers: unlike the temperature feed (every station,
+// every minute), the wind feed publishes sparse snapshots — some stations
+// surface only occasionally. A station's last known reading persists until a
+// newer one replaces it, so the set only ever grows.
+const windSeen = new Map(); // id -> latest known vector
 
 async function fetchWind() {
-  // The 1-minute snapshots are sparse (stations report on different
-  // cadences) — NEA runs ~14 anemometers but any single minute may carry
-  // only a couple. Merge progressively older snapshots (newest reading per
-  // station wins) until the set fills out.
   const snaps = [await fetchWindAt()];
   let out = joinWind(snaps);
-  for (let back = 5; back <= 20 && out.length < 10; back += 5) {
+  // First fill digs up to an hour back to find the whole network; once the
+  // set is populated, routine polls just take the latest snapshot.
+  const deep = windSeen.size < 10;
+  for (let back = 10; deep && back <= 60 && out.length < 10; back += 10) {
     try {
       snaps.push(await fetchWindAt(new Date(Date.now() - back * 60_000)));
       out = joinWind(snaps);
     } catch { break; }
   }
-  const now = Date.now();
-  for (const e of out) windSeen.set(e.id, { ...e, t: now });
-  for (const [id, e] of windSeen) {
-    if (now - e.t > WIND_STALE_MS) windSeen.delete(id);
-  }
+  for (const e of out) windSeen.set(e.id, e);
   neaWind = windSeen.size ? [...windSeen.values()] : null;
   renderWindStatus();
   renderWindPins();
@@ -1115,15 +1111,28 @@ function startWind() {
   fit();
   map.on("resize", fit);
 
-  let animatingZoom = false;
+  /* Fluid zoom: while Leaflet's zoom animation CSS-scales the canvas from
+     the old view to the new one, we keep advancing and redrawing particles
+     in the OLD view's coordinate frame (computed explicitly from the
+     pre-zoom zoom level, immune to Leaflet's internal state flipping
+     mid-animation). The animated element transform carries that old-frame
+     drawing to the right screen positions, so motion never pauses. Pinch
+     zoom never fires zoomanim — its projections update live, so the normal
+     path already handles it. */
+  let zoomCand = null, zoomRef = null;
+  map.on("zoomstart", () => {
+    const z = map.getZoom();
+    const o = map.project(map.containerPointToLatLng([0, 0]), z);
+    zoomCand = { zoom: z, ox: o.x, oy: o.y };
+  });
   map.on("zoomanim", (e) => {
     if (!map.getZoomScale || !map._latLngBoundsToNewLayerBounds) return;
-    animatingZoom = true;
+    zoomRef = zoomCand;
     const scale = map.getZoomScale(e.zoom);
     const offset = map._latLngBoundsToNewLayerBounds(map.getBounds(), e.zoom, e.center).min;
     L.DomUtil.setTransform(windCanvas, offset, scale);
   });
-  map.on("zoomend", () => { animatingZoom = false; });
+  map.on("zoomend", () => { zoomRef = null; zoomCand = null; });
 
   windParts = Array.from({ length: WIND_N }, () => spawnPart());
   const cosLat = Math.cos((1.35 * Math.PI) / 180);
@@ -1131,14 +1140,19 @@ function startWind() {
 
   function frame(ts) {
     requestAnimationFrame(frame);
-    if (!windOn || document.hidden || animatingZoom) { last = ts; return; }
+    if (!windOn || document.hidden) { last = ts; return; }
     if (ts - last < WIND_TICK_MS) return;
     const dt = Math.min(0.1, (ts - last) / 1000);
     last = ts;
     tick++;
 
-    // pin the canvas to the current viewport, then draw in container coords
-    L.DomUtil.setPosition(windCanvas, map.containerPointToLayerPoint([0, 0]));
+    const ref = zoomRef;
+    const toPt = ref
+      ? (ll) => { const p = map.project(ll, ref.zoom); return { x: p.x - ref.ox, y: p.y - ref.oy }; }
+      : (ll) => map.latLngToContainerPoint(ll);
+    // pin the canvas to the viewport — but never mid-zoom, where setPosition
+    // would stomp the animated transform
+    if (!ref) L.DomUtil.setPosition(windCanvas, map.containerPointToLayerPoint([0, 0]));
     windCtx.clearRect(0, 0, windCanvas.width, windCanvas.height);
     windCtx.lineCap = "round";
     for (const p of windParts) {
@@ -1159,10 +1173,10 @@ function startWind() {
       if (p.hist.length < 2) continue;
       // faint full tail, brighter head
       windCtx.beginPath();
-      let pt = map.latLngToContainerPoint(p.hist[0]);
+      let pt = toPt(p.hist[0]);
       windCtx.moveTo(pt.x, pt.y);
       for (let i = 1; i < p.hist.length; i++) {
-        pt = map.latLngToContainerPoint(p.hist[i]);
+        pt = toPt(p.hist[i]);
         windCtx.lineTo(pt.x, pt.y);
       }
       windCtx.strokeStyle = "rgba(214, 233, 255, 0.08)";
@@ -1170,10 +1184,10 @@ function startWind() {
       windCtx.stroke();
       const headStart = Math.max(0, p.hist.length - 4);
       windCtx.beginPath();
-      pt = map.latLngToContainerPoint(p.hist[headStart]);
+      pt = toPt(p.hist[headStart]);
       windCtx.moveTo(pt.x, pt.y);
       for (let i = headStart + 1; i < p.hist.length; i++) {
-        pt = map.latLngToContainerPoint(p.hist[i]);
+        pt = toPt(p.hist[i]);
         windCtx.lineTo(pt.x, pt.y);
       }
       windCtx.strokeStyle = "rgba(222, 240, 255, 0.24)";
