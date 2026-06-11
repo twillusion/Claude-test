@@ -355,17 +355,43 @@ function joinWind(snaps) {
   return [...merged.values()];
 }
 
-// Small arrow pins at the anemometer sites, pointing downwind.
+/* Wind direction glyph: a "windsock tail" — a thin streak anchored at the
+   station, extending downwind, longer in stronger wind, fading at the tip.
+   Same visual language as the particles; no arrowheads. */
+function tailGeom(wv) {
+  const kmh = Math.hypot(wv.u, wv.v);
+  const toward = (Math.atan2(wv.u, wv.v) * 180 / Math.PI + 360) % 360;
+  return { len: Math.round(Math.min(36, 10 + kmh * 1.6)), rot: Math.round(toward - 90) };
+}
+
+function windTailHtml(wv, insetPx) {
+  const g = tailGeom(wv);
+  return `<span class="wind-tail" style="width:${g.len}px;transform:rotate(${g.rot}deg) translateX(${insetPx}px)"></span>`;
+}
+
+function applyTail(el, wv, insetPx) {
+  const g = tailGeom(wv);
+  el.style.width = `${g.len}px`;
+  el.style.transform = `rotate(${g.rot}deg) translateX(${insetPx}px)`;
+}
+
+// Standalone anemometer pins (dot + tail). Stations that also report
+// temperature are "hybrid": their wind tail rides on the temperature pill
+// instead, so no separate pin.
 const windPins = new Map();
 
 function renderWindPins() {
   if (typeof L === "undefined" || !map) return;
   const seen = new Set();
   for (const p of neaWind ?? []) {
+    if (stations.get(p.id)?.kind === "nea") {
+      const existing = windPins.get(p.id);
+      if (existing) { existing.remove(); windPins.delete(p.id); }
+      continue;
+    }
     seen.add(p.id);
     const kmh = Math.hypot(p.u, p.v);
-    const toward = (Math.atan2(p.u, p.v) * 180 / Math.PI + 360) % 360;
-    const from = (toward + 180) % 360;
+    const from = (tailGeom(p).rot + 90 + 180) % 360;
     let m = windPins.get(p.id);
     if (!m) {
       m = L.marker([p.lat, p.lon], { keyboard: false }).addTo(map);
@@ -373,7 +399,7 @@ function renderWindPins() {
     }
     m.setIcon(L.divIcon({
       className: "",
-      html: `<span class="wind-pin" style="transform:translate(-50%,-50%) rotate(${toward.toFixed(0)}deg)">▲</span>`,
+      html: `<span class="wind-spot">${windTailHtml(p, 4)}<span class="wind-dot"></span></span>`,
       iconSize: [0, 0],
     }));
     m.bindTooltip(`${p.name} · ${kmh.toFixed(0)} km/h from ${COMPASS[Math.round(from / 22.5) % 16]}`);
@@ -425,17 +451,14 @@ async function fetchWind() {
       try {
         const dayOut = joinWind([await fetchWindDayFile(day)]);
         for (const e of dayOut) if (!windSeen.has(e.id)) windSeen.set(e.id, e);
-        console.info(`[sgtemp] wind day ${day}: ${dayOut.length} stations (known now ${windSeen.size})`);
-      } catch (e) {
-        console.info(`[sgtemp] wind day ${day} failed: ${e.message}`);
-      }
+      } catch { /* try the next day back */ }
       if (windSeen.size >= 8) break;
     }
   }
-  console.info(`[sgtemp] wind poll: ${out.length} in latest snapshot, ${windSeen.size} known total`);
   neaWind = windSeen.size ? [...windSeen.values()] : null;
   renderWindStatus();
   renderWindPins();
+  scheduleRender(); // hybrid pills carry wind tails that may have changed
 }
 
 function pollWind() {
@@ -740,8 +763,10 @@ function renderMarker(s, v) {
       `<span class="civ-dot" style="--pill:${tempColor(v)}"></span></span>`;
   } else {
     const cls = s.id === selectedId ? "temp-pill selected" : "temp-pill";
-    key = cls;
-    html = `<span class="${cls}" style="--pill:${tempColor(v)}">${fmt(v)}</span>`;
+    const wv = windSeen.get(s.id); // hybrid: this station also reports wind
+    key = cls + (wv ? "+wind" : "");
+    html = `${wv ? windTailHtml(wv, 11) : ""}` +
+      `<span class="${cls}" style="--pill:${tempColor(v)}">${fmt(v)}</span>`;
   }
 
   const root = s.iconKey === key && s.marker.getElement && s.marker.getElement();
@@ -751,6 +776,11 @@ function renderMarker(s, v) {
     if (text && tinted && tinted.style && tinted.style.setProperty) {
       text.textContent = fmt(v);
       tinted.style.setProperty("--pill", tempColor(v));
+      if (s.kind !== "civ") {
+        const wv = windSeen.get(s.id);
+        const tail = root.querySelector(".wind-tail");
+        if (wv && tail && tail.style) applyTail(tail, wv, 11);
+      }
       return;
     }
   }
@@ -810,15 +840,14 @@ function windRow(p) {
     el.className = "wind-row";
     el.innerHTML = `
       <span class="station-name"></span>
-      <span class="wind-row-arrow">▲</span>
+      <span class="wind-row-dir"></span>
       <span class="station-temp wind-speed"></span>`;
     el.addEventListener("click", () => { if (map && map.panTo) map.panTo([p.lat, p.lon]); });
     windListEls.set(p.id, el);
   }
   const kmh = Math.hypot(p.u, p.v);
-  const toward = (Math.atan2(p.u, p.v) * 180 / Math.PI + 360) % 360;
   el.querySelector(".station-name").textContent = p.name;
-  el.querySelector(".wind-row-arrow").style.transform = `rotate(${toward.toFixed(0)}deg)`;
+  el.querySelector(".wind-row-dir").innerHTML = windTailHtml(p, 0);
   el.querySelector(".wind-speed").textContent = `${kmh.toFixed(0)} km/h`;
   return el;
 }

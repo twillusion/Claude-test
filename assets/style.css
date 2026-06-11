@@ -183,14 +183,13 @@ body { display: flex; flex-direction: column; }
   padding: 2px 4px;
 }
 
-.wind-row .wind-row-arrow {
-  display: inline-block;
-  color: var(--accent);
-  font-size: 0.7rem;
+.wind-row .wind-row-dir {
+  position: relative;
   width: 70px;
-  text-align: center;
+  height: 12px;
   flex-shrink: 0;
 }
+.wind-row .wind-row-dir .wind-tail { left: 26px; top: 50%; }
 .wind-row .wind-speed { color: var(--accent); font-weight: 600; }
 .civ-row .station-name { color: var(--muted); }
 
@@ -288,13 +287,30 @@ body { display: flex; flex-direction: column; }
 }
 .civ-marker.selected .civ-dot { outline: 2px solid #fff; }
 
-/* anemometer sites: tiny arrow pointing downwind */
-.wind-pin {
-  display: inline-block;
-  font-size: 10px;
-  line-height: 1;
-  color: rgba(159, 208, 255, 0.85);
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
+/* wind direction: a windsock tail anchored at the station, extending
+   downwind, fading at the tip — no arrowheads */
+.wind-tail {
+  position: absolute;
+  left: 0;
+  top: -1px;
+  height: 2px;
+  border-radius: 1px;
+  transform-origin: 0 50%;
+  background: linear-gradient(90deg, rgba(159, 208, 255, 0.95), rgba(159, 208, 255, 0));
+  pointer-events: none;
+}
+
+.wind-spot { position: absolute; }
+
+.wind-dot {
+  position: absolute;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #9fd0ff;
+  border: 1.5px solid rgba(255, 255, 255, 0.85);
+  transform: translate(-50%, -50%);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
 }
 
 .leaflet-container { font: inherit; }
