@@ -288,6 +288,8 @@ body { display: flex; flex-direction: column; }
   transform: translate(-50%, -50%);
 }
 .temp-pill.selected { outline: 2px solid #fff; }
+.temp-pill.fc { border-style: dashed; opacity: 0.92; } /* forecast, not observation */
+#time-label.future { color: var(--accent); }
 
 /* civilian sensors: small pin with a modest temperature chip above it */
 .civ-marker {
