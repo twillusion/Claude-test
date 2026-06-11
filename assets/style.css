@@ -186,10 +186,10 @@ body { display: flex; flex-direction: column; }
 .wind-row .wind-row-dir {
   position: relative;
   width: 70px;
-  height: 12px;
+  height: 14px;
   flex-shrink: 0;
 }
-.wind-row .wind-row-dir .wind-tail { left: 26px; top: 50%; }
+.wind-row .wind-row-dir .wind-sock { left: 26px; top: calc(50% - 5px); }
 .wind-row .wind-speed { color: var(--accent); font-weight: 600; }
 .civ-row .station-name { color: var(--muted); }
 
@@ -287,16 +287,17 @@ body { display: flex; flex-direction: column; }
 }
 .civ-marker.selected .civ-dot { outline: 2px solid #fff; }
 
-/* wind direction: a windsock tail anchored at the station, extending
-   downwind, fading at the tip — no arrowheads */
-.wind-tail {
+/* wind direction: a windsock wedge growing out from under the marker,
+   extending downwind, tapering and fading at the tip — no arrowheads.
+   Colour comes inline (the host pill's temperature colour on hybrids). */
+.wind-sock {
   position: absolute;
   left: 0;
-  top: -1px;
-  height: 2px;
-  border-radius: 1px;
+  top: -5px;
+  height: 10px;
   transform-origin: 0 50%;
-  background: linear-gradient(90deg, rgba(159, 208, 255, 0.95), rgba(159, 208, 255, 0));
+  clip-path: polygon(0 6%, 0 94%, 100% 50%);
+  opacity: 0.9;
   pointer-events: none;
 }
 

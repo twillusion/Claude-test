@@ -355,24 +355,42 @@ function joinWind(snaps) {
   return [...merged.values()];
 }
 
-/* Wind direction glyph: a "windsock tail" — a thin streak anchored at the
-   station, extending downwind, longer in stronger wind, fading at the tip.
-   Same visual language as the particles; no arrowheads. */
-function tailGeom(wv) {
+/* Wind direction glyph: a windsock wedge — a tapered streak growing out
+   from under the marker's edge, extending downwind, longer in stronger
+   wind, fading at the tip. On hybrid stations it's drawn in the pill's own
+   temperature colour so pill + sock read as one object. The (a, b) ellipse
+   semi-axes approximate the host marker's outline so the wedge emerges
+   flush from its rim at any angle. */
+function tailGeom(wv, a = 0, b = 0) {
   const kmh = Math.hypot(wv.u, wv.v);
   const toward = (Math.atan2(wv.u, wv.v) * 180 / Math.PI + 360) % 360;
-  return { len: Math.round(Math.min(36, 10 + kmh * 1.6)), rot: Math.round(toward - 90) };
+  const rot = toward - 90; // CSS rotation: 0deg points east on screen
+  let inset = 4;
+  if (a && b) {
+    const t = (rot * Math.PI) / 180;
+    inset = (a * b) / Math.sqrt((b * Math.cos(t)) ** 2 + (a * Math.sin(t)) ** 2) - 2;
+  }
+  return {
+    rot: Math.round(rot),
+    len: Math.round(Math.min(42, 12 + kmh * 1.8)),
+    inset: Math.round(inset),
+  };
 }
 
-function windTailHtml(wv, insetPx) {
-  const g = tailGeom(wv);
-  return `<span class="wind-tail" style="width:${g.len}px;transform:rotate(${g.rot}deg) translateX(${insetPx}px)"></span>`;
+function sockStyle(g, color) {
+  return `width:${g.len}px;transform:rotate(${g.rot}deg) translateX(${g.inset}px);` +
+    `background:linear-gradient(90deg, ${color}, ${color} 30%, transparent 95%)`;
 }
 
-function applyTail(el, wv, insetPx) {
-  const g = tailGeom(wv);
+function windSockHtml(wv, a, b, color) {
+  return `<span class="wind-sock" style="${sockStyle(tailGeom(wv, a, b), color)}"></span>`;
+}
+
+function applySock(el, wv, a, b, color) {
+  const g = tailGeom(wv, a, b);
   el.style.width = `${g.len}px`;
-  el.style.transform = `rotate(${g.rot}deg) translateX(${insetPx}px)`;
+  el.style.transform = `rotate(${g.rot}deg) translateX(${g.inset}px)`;
+  el.style.background = `linear-gradient(90deg, ${color}, ${color} 30%, transparent 95%)`;
 }
 
 // Standalone anemometer pins (dot + tail). Stations that also report
@@ -399,7 +417,7 @@ function renderWindPins() {
     }
     m.setIcon(L.divIcon({
       className: "",
-      html: `<span class="wind-spot">${windTailHtml(p, 4)}<span class="wind-dot"></span></span>`,
+      html: `<span class="wind-spot">${windSockHtml(p, 5, 5, "rgba(159, 208, 255, 0.9)")}<span class="wind-dot"></span></span>`,
       iconSize: [0, 0],
     }));
     m.bindTooltip(`${p.name} · ${kmh.toFixed(0)} km/h from ${COMPASS[Math.round(from / 22.5) % 16]}`);
@@ -765,7 +783,7 @@ function renderMarker(s, v) {
     const cls = s.id === selectedId ? "temp-pill selected" : "temp-pill";
     const wv = windSeen.get(s.id); // hybrid: this station also reports wind
     key = cls + (wv ? "+wind" : "");
-    html = `${wv ? windTailHtml(wv, 11) : ""}` +
+    html = `${wv ? windSockHtml(wv, 22, 9, tempColor(v)) : ""}` +
       `<span class="${cls}" style="--pill:${tempColor(v)}">${fmt(v)}</span>`;
   }
 
@@ -778,8 +796,8 @@ function renderMarker(s, v) {
       tinted.style.setProperty("--pill", tempColor(v));
       if (s.kind !== "civ") {
         const wv = windSeen.get(s.id);
-        const tail = root.querySelector(".wind-tail");
-        if (wv && tail && tail.style) applyTail(tail, wv, 11);
+        const sock = root.querySelector(".wind-sock");
+        if (wv && sock && sock.style) applySock(sock, wv, 22, 9, tempColor(v));
       }
       return;
     }
@@ -847,7 +865,7 @@ function windRow(p) {
   }
   const kmh = Math.hypot(p.u, p.v);
   el.querySelector(".station-name").textContent = p.name;
-  el.querySelector(".wind-row-dir").innerHTML = windTailHtml(p, 0);
+  el.querySelector(".wind-row-dir").innerHTML = windSockHtml(p, 2, 2, "rgba(94, 193, 255, 0.9)");
   el.querySelector(".wind-speed").textContent = `${kmh.toFixed(0)} km/h`;
   return el;
 }
