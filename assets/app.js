@@ -1173,20 +1173,20 @@ function rebuild(now = Date.now()) {
   }
   timeline = [...times].sort((a, b) => a - b);
 
+  // Uniform 5-minute ticks: -24h .. LIVE .. +24h, so LIVE sits dead centre
+  // and both directions scrub at the same speed. Past values resolve via
+  // valueAt (30-min tolerance); future values interpolate the hourly model
+  // smoothly, so 5-minute forecast steps cost nothing extra.
+  const step = SLIDER_STEP_MIN * 60_000;
+  const anchor = Math.floor(now / step) * step;
   sliderTicks = [];
-  let lastBucket = -1;
-  for (const t of timeline) {
-    const b = Math.floor(t / (SLIDER_STEP_MIN * 60_000));
-    if (b !== lastBucket) { sliderTicks.push(t); lastBucket = b; }
-  }
-  // LIVE sits at the end of the observed past; beyond it, hourly forecast
-  // ticks from the model (when we have one) extend the slider up to +24h
+  for (let i = -HISTORY_HOURS * 12; i <= 0; i++) sliderTicks.push(anchor + i * step);
   sliderLiveIdx = sliderTicks.length - 1;
   if (model) {
-    const horizon = now + FORECAST_HOURS * 3600_000;
-    for (const mt of model.times) {
-      if (mt > now + 30 * 60_000 && mt <= horizon) sliderTicks.push(mt);
-    }
+    const horizon = Math.min(
+      anchor + FORECAST_HOURS * 3600_000,
+      model.times[model.times.length - 1]);
+    for (let t = anchor + step; t <= horizon; t += step) sliderTicks.push(t);
   }
 }
 
@@ -1628,6 +1628,10 @@ function renderTimebar(t) {
   const future = isFutureView();
   label.textContent = t ? (future ? `≈ ${fmtTime(t)}` : fmtTime(t)) : "–";
   if (label.classList) label.classList.toggle("future", future);
+  if (slider.classList) {
+    // centre notch marks LIVE once the forecast half exists
+    slider.classList.toggle("has-forecast", sliderTicks.length - 1 > sliderLiveIdx);
+  }
   const f = dayFactor(t ?? Date.now());
   document.getElementById("sky-icon").textContent = f > 0.8 ? "☀️" : f < 0.2 ? "🌙" : "🌅";
   liveBtn.classList.toggle("active", displayedT === null);

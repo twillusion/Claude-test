@@ -291,6 +291,17 @@ body { display: flex; flex-direction: column; }
 .temp-pill.fc { border-style: dashed; opacity: 0.92; } /* forecast, not observation */
 #time-label.future { color: var(--accent); }
 
+/* with a forecast half, LIVE sits at the centre — mark it */
+#time-slider.has-forecast {
+  background: linear-gradient(90deg,
+    transparent calc(50% - 1.5px),
+    #7fe6a0 calc(50% - 1.5px), #7fe6a0 calc(50% + 1.5px),
+    transparent calc(50% + 1.5px));
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 100% 60%;
+}
+
 /* civilian sensors: small pin with a modest temperature chip above it */
 .civ-marker {
   display: flex;
