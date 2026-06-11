@@ -9,6 +9,8 @@ const V2_URL = "https://api-open.data.gov.sg/v2/real-time/api/air-temperature";
 const V1_URL = "https://api.data.gov.sg/v1/environment/air-temperature";
 const WIND_SPEED_URL = "https://api.data.gov.sg/v1/environment/wind-speed";
 const WIND_DIR_URL = "https://api.data.gov.sg/v1/environment/wind-direction";
+const RAIN_URL = "https://api.data.gov.sg/v1/environment/rainfall";
+const RAIN_POLL_MS = 5 * 60_000; // gauges report 5-minute totals
 const KNOTS_TO_KMH = 1.852;
 const OM_URL = "https://api.open-meteo.com/v1/forecast";
 const POLL_MS = 60_000;
@@ -421,6 +423,100 @@ function buildWindGrid() {
       else { windGridU[i] = u / wSum; windGridV[i] = v / wSum; }
     }
   }
+}
+
+// ---------- rain (NEA rain gauges, live view only) ----------
+
+/* 5-minute rainfall totals from ~60 gauges, rasterized onto the same coarse
+   grid as the wind so rain streaks can sample intensity with one bilinear
+   lookup. Live-only for now: there's no archived series, so scrubbing hides
+   the rain rather than inventing it. */
+const RAIN_COVER_KM = 10;
+let rainReadings = []; // [{lat, lon, mm}]
+let wetGauges = [];    // readings with mm above drizzle threshold
+let rainGrid = null;   // Float32Array over WGRID; NaN outside coverage
+
+async function fetchRain() {
+  const res = await fetch429(RAIN_URL);
+  if (!res.ok) throw new Error(`rain HTTP ${res.status}`);
+  const json = await res.json();
+  const locs = new Map(json.metadata.stations.map((s) => [s.id, s.location]));
+  rainReadings = [];
+  for (const r of json.items[0].readings) {
+    const loc = locs.get(r.station_id);
+    if (!loc || r.value == null || r.value < 0) continue;
+    rainReadings.push({ lat: loc.latitude, lon: loc.longitude, mm: r.value });
+  }
+  wetGauges = rainReadings.filter((g) => g.mm > 0.2);
+  buildRainGrid();
+  renderRainStatus();
+}
+
+function pollRain() {
+  fetchRain().catch(() => {
+    const el = document.getElementById("rain-status");
+    if (el) el.textContent = "unreachable";
+  });
+}
+
+function buildRainGrid() {
+  if (!rainReadings.length) { rainGrid = null; return; }
+  const { nx, ny } = WGRID;
+  rainGrid = new Float32Array(nx * ny);
+  const cosLat = Math.cos((1.35 * Math.PI) / 180);
+  const cover2 = RAIN_COVER_KM * RAIN_COVER_KM;
+  for (let iy = 0; iy < ny; iy++) {
+    const lat = OVERLAY.latMax - ((iy + 0.5) / ny) * (OVERLAY.latMax - OVERLAY.latMin);
+    for (let ix = 0; ix < nx; ix++) {
+      const lon = OVERLAY.lonMin + ((ix + 0.5) / nx) * (OVERLAY.lonMax - OVERLAY.lonMin);
+      let wSum = 0, mm = 0, nearest = Infinity;
+      for (const g of rainReadings) {
+        const dx = (lon - g.lon) * cosLat * KM_PER_DEG;
+        const dy = (lat - g.lat) * KM_PER_DEG;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < nearest) nearest = d2;
+        const w = 1 / (d2 + 0.5);
+        wSum += w; mm += w * g.mm;
+      }
+      rainGrid[iy * nx + ix] = nearest > cover2 ? NaN : mm / wSum;
+    }
+  }
+}
+
+function rainAt(lat, lon) {
+  return rainGrid ? gridSample2(rainGrid, lat, lon) : null;
+}
+
+function renderRainStatus() {
+  const el = document.getElementById("rain-status");
+  if (!el) return;
+  if (!rainReadings.length) { el.textContent = "–"; return; }
+  if (!wetGauges.length) { el.textContent = "none"; return; }
+  const max = Math.max(...wetGauges.map((g) => g.mm));
+  el.textContent = `${wetGauges.length} gauge${wetGauges.length > 1 ? "s" : ""} wet · up to ${max.toFixed(1)} mm`;
+}
+
+// Drops anchor near a wet gauge and replay a short screen-space fall, drawn
+// from the same loop and canvas as the wind particles.
+const RAIN_N = 160;
+const rainDrops = [];
+
+function spawnDrop(d) {
+  if (!wetGauges.length) { d.mm = 0; return d; }
+  for (let i = 0; i < 10; i++) {
+    const g = wetGauges[(Math.random() * wetGauges.length) | 0];
+    const lat = g.lat + (Math.random() - 0.5) * 0.07;
+    const lon = g.lon + (Math.random() - 0.5) * 0.07;
+    const mm = rainAt(lat, lon);
+    if (mm != null && mm > 0.1) {
+      d.lat = lat; d.lon = lon; d.mm = mm;
+      d.phase = Math.random();
+      d.speed = 0.8 + Math.random() * 0.7;
+      return d;
+    }
+  }
+  d.mm = 0;
+  return d;
 }
 
 // Bilinear sample over a WGRID-shaped array (row 0 = north); null on NaN.
@@ -1421,6 +1517,27 @@ function startWind() {
       windCtx.lineWidth = 1.5;
       windCtx.stroke();
     }
+
+    // rain streaks: live view only, riding the same canvas and budget
+    if (displayedT === null && wetGauges.length) {
+      if (!rainDrops.length) for (let i = 0; i < RAIN_N; i++) rainDrops.push(spawnDrop({}));
+      windCtx.beginPath();
+      for (const d of rainDrops) {
+        if (!d.mm) { spawnDrop(d); continue; }
+        d.phase += dt * d.speed;
+        if (d.phase >= 1) { spawnDrop(d); continue; }
+        const pt = toPt([d.lat, d.lon]);
+        const drift = (windVecAt(d.lat, d.lon)?.u ?? 0) * 0.35; // lean with the wind
+        const x = pt.x + drift * d.phase;
+        const y = pt.y - 45 + d.phase * 90;
+        const len = 8 + Math.min(9, d.mm * 1.5); // heavier rain, longer streaks
+        windCtx.moveTo(x, y);
+        windCtx.lineTo(x + drift * 0.08, y + len);
+      }
+      windCtx.strokeStyle = "rgba(178, 212, 255, 0.45)";
+      windCtx.lineWidth = 1.2;
+      windCtx.stroke();
+    }
   }
   requestAnimationFrame(frame);
 }
@@ -1645,10 +1762,12 @@ initMap();
 startWind();
 refresh().then(loadHistory).then(() => {
   pollCommunity();
+  pollRain();
   // wind archive matters only for scrubbing — let the visible stuff win
   setTimeout(() => loadWindHistory().catch(() => {}), 1500);
 });
 pollWind();
+setInterval(pollRain, RAIN_POLL_MS);
 setInterval(pollWind, POLL_MS);
 refreshModel();
 setInterval(refresh, POLL_MS);
