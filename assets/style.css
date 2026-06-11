@@ -287,6 +287,39 @@ body { display: flex; flex-direction: column; }
 }
 .civ-marker.selected .civ-dot { outline: 2px solid #fff; }
 
+/* forecast clouds: blurred sprites drifting via CSS (margin, not transform —
+   Leaflet owns the transform), GPU-composited, zero per-frame JS */
+.cloud-puff {
+  position: absolute;
+  width: 120px;
+  height: 50px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: radial-gradient(ellipse at center, rgba(222, 230, 242, 0.5), rgba(222, 230, 242, 0) 70%);
+  filter: blur(7px);
+  pointer-events: none;
+  animation: cloud-drift 46s ease-in-out infinite alternate;
+}
+.cloud-puff.light { opacity: 0.4; }
+.cloud-puff.cloudy { opacity: 0.65; width: 150px; height: 60px; }
+.cloud-puff.rainy {
+  opacity: 0.7;
+  width: 150px;
+  height: 60px;
+  background: radial-gradient(ellipse at center, rgba(150, 165, 190, 0.6), rgba(150, 165, 190, 0) 70%);
+}
+.cloud-puff.storm {
+  opacity: 0.78;
+  width: 165px;
+  height: 66px;
+  background: radial-gradient(ellipse at center, rgba(108, 120, 145, 0.7), rgba(108, 120, 145, 0) 70%);
+}
+
+@keyframes cloud-drift {
+  from { margin-left: -9px; }
+  to { margin-left: 9px; }
+}
+
 /* wind direction: a windsock wedge growing out from under the marker,
    extending downwind, tapering and fading at the tip — no arrowheads.
    Colour comes inline (the host pill's temperature colour on hybrids). */

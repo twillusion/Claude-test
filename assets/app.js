@@ -11,6 +11,8 @@ const WIND_SPEED_URL = "https://api.data.gov.sg/v1/environment/wind-speed";
 const WIND_DIR_URL = "https://api.data.gov.sg/v1/environment/wind-direction";
 const RAIN_URL = "https://api.data.gov.sg/v1/environment/rainfall";
 const RAIN_POLL_MS = 5 * 60_000; // gauges report 5-minute totals
+const FORECAST_URL = "https://api.data.gov.sg/v1/environment/2-hour-weather-forecast";
+const FORECAST_POLL_MS = 30 * 60_000;
 const KNOTS_TO_KMH = 1.852;
 const OM_URL = "https://api.open-meteo.com/v1/forecast";
 const POLL_MS = 60_000;
@@ -517,6 +519,62 @@ function spawnDrop(d) {
   }
   d.mm = 0;
   return d;
+}
+
+// ---------- clouds (2-hour forecast per area, live view only) ----------
+
+/* NEA's 2-hour forecast names ~47 areas with condition text. Cloudy ones
+   get a single blurred sprite at the area's label point, drifting via CSS
+   animation in its own map pane — GPU-composited, no per-frame JS. The pane
+   hides while scrubbing, since the forecast only describes "now". */
+const cloudMarkers = new Map(); // area name -> marker
+
+function hashStr(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return h;
+}
+
+function cloudClass(forecast) {
+  const f = forecast.toLowerCase();
+  if (f.includes("thunder")) return "storm";
+  if (f.includes("rain") || f.includes("showers")) return "rainy";
+  if (f.includes("partly") || f.includes("hazy") || f.includes("mist") || f.includes("fog")) return "light";
+  if (f.includes("cloudy") || f.includes("overcast")) return "cloudy";
+  return null; // fair / clear / sunny / windy
+}
+
+async function fetchForecast() {
+  const res = await fetch429(FORECAST_URL);
+  if (!res.ok) throw new Error(`forecast HTTP ${res.status}`);
+  const json = await res.json();
+  const locs = new Map(json.area_metadata.map((a) => [a.name, a.label_location]));
+  const seen = new Set();
+  for (const f of json.items[0].forecasts) {
+    const cls = cloudClass(f.forecast || "");
+    const loc = locs.get(f.area);
+    if (!cls || !loc) continue;
+    seen.add(f.area);
+    let m = cloudMarkers.get(f.area);
+    if (!m) {
+      m = L.marker([loc.latitude, loc.longitude],
+        { pane: "clouds", keyboard: false, interactive: false }).addTo(map);
+      cloudMarkers.set(f.area, m);
+    }
+    const delay = -(Math.abs(hashStr(f.area)) % 40);
+    m.setIcon(L.divIcon({
+      className: "",
+      html: `<span class="cloud-puff ${cls}" style="animation-delay:${delay}s"></span>`,
+      iconSize: [0, 0],
+    }));
+  }
+  for (const [name, m] of cloudMarkers) {
+    if (!seen.has(name)) { m.remove(); cloudMarkers.delete(name); }
+  }
+}
+
+function pollForecast() {
+  fetchForecast().catch(() => {});
 }
 
 // Bilinear sample over a WGRID-shaped array (row 0 = north); null on NaN.
@@ -1330,6 +1388,9 @@ function renderAll() {
   renderTimebar(t);
   renderWindStatus();
   renderWindPins();
+  // clouds describe the 2h forecast — only honest on the live view
+  const cloudPane = map && map.getPane && map.getPane("clouds");
+  if (cloudPane) cloudPane.style.display = displayedT === null ? "" : "none";
 }
 
 // Coalesce slider-drag renders to animation frames.
@@ -1710,6 +1771,9 @@ function initMap() {
     maxBoundsViscosity: 1.0, // hard wall when panning
     zoomSnap: 0, // fractional zoom, so min zoom can match the bounds exactly
   });
+  const cloudPane = map.createPane("clouds");
+  cloudPane.style.zIndex = 430; // above the shading (400), below markers (600)
+  cloudPane.style.pointerEvents = "none";
   map.fitBounds(dataBounds);
   // Fully zoomed out = screen completely filled by the data window
   // (inside=true), so the map can never show past the data edge. Recompute
@@ -1763,11 +1827,13 @@ startWind();
 refresh().then(loadHistory).then(() => {
   pollCommunity();
   pollRain();
+  pollForecast();
   // wind archive matters only for scrubbing — let the visible stuff win
   setTimeout(() => loadWindHistory().catch(() => {}), 1500);
 });
 pollWind();
 setInterval(pollRain, RAIN_POLL_MS);
+setInterval(pollForecast, FORECAST_POLL_MS);
 setInterval(pollWind, POLL_MS);
 refreshModel();
 setInterval(refresh, POLL_MS);
