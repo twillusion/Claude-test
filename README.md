@@ -14,10 +14,15 @@ static page, no backend, no hosting costs.
   (the API returns a whole calendar day per request), then polls for the
   latest reading every minute. History older than 24 hours is dropped
   client-side — the API is the database, so nothing is stored in this repo.
-- The map shading is inverse-distance-weighted interpolation of the station
-  readings (light blue = cool, orange = hot), rendered to a canvas and
-  stretched over the island; it fades out away from stations, since values
-  far from any sensor are guesswork.
+- The map shading (light blue = cool, orange = hot) blends two sources: a
+  ~5 km grid of hourly 2m-temperature from the
+  [Open-Meteo](https://open-meteo.com) forecast API (free, CC-BY, no key)
+  as the smooth base field, corrected by the NEA station readings — where a
+  real sensor disagrees with the model, the field is nudged to match it,
+  with the correction decaying over ~12 km. If Open-Meteo is unreachable,
+  it falls back to station-only IDW shading that fades out away from
+  sensors. The model grid refreshes every 30 minutes (the models themselves
+  update hourly) and covers the full 24h scrubber window.
 - The time slider scrubs the 24-hour window in 5-minute steps
   (`SLIDER_STEP_MIN` in `assets/app.js`); the LIVE button snaps back to the
   newest reading.

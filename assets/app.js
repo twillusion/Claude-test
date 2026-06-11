@@ -7,13 +7,21 @@
 
 const V2_URL = "https://api-open.data.gov.sg/v2/real-time/api/air-temperature";
 const V1_URL = "https://api.data.gov.sg/v1/environment/air-temperature";
+const OM_URL = "https://api.open-meteo.com/v1/forecast";
 const POLL_MS = 60_000;
+const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
 const HISTORY_HOURS = 24;
 const SLIDER_STEP_MIN = 5; // scrubber granularity; underlying data is per-minute
 
-// Geographic window and raster size for the shading overlay.
+// Geographic window and raster size for the shading overlay; the Open-Meteo
+// sample grid shares the same bounds so the raster never extrapolates.
 const OVERLAY = { latMin: 1.16, latMax: 1.495, lonMin: 103.55, lonMax: 104.15, w: 240, h: 140 };
+const GRID_NLAT = 8;
+const GRID_NLON = 12;
 const KM_PER_DEG = 111.32;
+// Station residuals shrink toward zero away from stations; at ~12 km the
+// correction is halved, so the model field dominates where there's no sensor.
+const RESIDUAL_LAMBDA = 1 / (12 * 12);
 
 const stations = new Map(); // id -> {id, name, lat, lon, marker, listEl, series: Map t->v, history: [{t,v}], latest}
 let timeline = [];    // sorted unique reading timestamps (ms) within the 24h window
@@ -22,6 +30,7 @@ let displayedT = null; // null = live (latest reading)
 let selectedId = null;
 let map, overlayLayer, overlayCanvas;
 let renderQueued = false;
+let model = null; // {times: [ms], grids: [Float32Array(GRID_NLAT*GRID_NLON)]}
 
 // ---------- API ----------
 
@@ -107,6 +116,106 @@ async function fetchDay(dateStr) {
     token = d.paginationToken;
   } while (token);
   return { stations: stationsOut, items };
+}
+
+// ---------- Open-Meteo model grid ----------
+
+// One request fetches hourly 2m-temperature for the whole sample grid,
+// covering yesterday through today (so the scrubber window is fully covered).
+async function fetchModel() {
+  const lats = [], lons = [];
+  for (let iy = 0; iy < GRID_NLAT; iy++) {
+    for (let ix = 0; ix < GRID_NLON; ix++) {
+      lats.push((OVERLAY.latMin + (iy * (OVERLAY.latMax - OVERLAY.latMin)) / (GRID_NLAT - 1)).toFixed(4));
+      lons.push((OVERLAY.lonMin + (ix * (OVERLAY.lonMax - OVERLAY.lonMin)) / (GRID_NLON - 1)).toFixed(4));
+    }
+  }
+  const url = `${OM_URL}?latitude=${lats.join(",")}&longitude=${lons.join(",")}` +
+    `&hourly=temperature_2m&past_days=1&forecast_days=1&timeformat=unixtime&timezone=UTC`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`open-meteo HTTP ${res.status}`);
+  let results = await res.json();
+  if (!Array.isArray(results)) results = [results];
+  if (results.length !== lats.length) throw new Error("open-meteo result count mismatch");
+
+  const times = results[0].hourly.time.map((s) => s * 1000);
+  const grids = times.map((_, k) => {
+    const g = new Float32Array(results.length);
+    for (let i = 0; i < results.length; i++) {
+      const v = results[i].hourly.temperature_2m[k];
+      g[i] = v == null ? NaN : v;
+    }
+    return g;
+  });
+  model = { times, grids };
+}
+
+async function refreshModel() {
+  try {
+    await fetchModel();
+    document.getElementById("shade-mode").textContent = "Open-Meteo model + station correction";
+    scheduleRender();
+  } catch {
+    // keep whatever model we had; station-only IDW covers the gap
+    if (!model) setTimeout(refreshModel, 3 * 60_000);
+  }
+}
+
+// Model grid blended in time to the displayed moment.
+function buildBlendedGrid(t) {
+  if (!model) return null;
+  const { times, grids } = model;
+  let k = 0;
+  while (k < times.length - 2 && times[k + 1] <= t) k++;
+  const t0 = times[k], t1 = times[Math.min(k + 1, times.length - 1)];
+  const f = t1 > t0 ? Math.min(1, Math.max(0, (t - t0) / (t1 - t0))) : 0;
+  const a = grids[k], b = grids[Math.min(k + 1, grids.length - 1)];
+  const out = new Float32Array(a.length);
+  for (let i = 0; i < a.length; i++) {
+    out[i] = Number.isNaN(a[i]) ? b[i] : Number.isNaN(b[i]) ? a[i] : a[i] + (b[i] - a[i]) * f;
+  }
+  return out;
+}
+
+// Bilinear sample of a blended grid at a coordinate.
+function gridSample(grid, lat, lon) {
+  const fy = ((OVERLAY.latMax - lat) / (OVERLAY.latMax - OVERLAY.latMin)) * (GRID_NLAT - 1);
+  const fx = ((lon - OVERLAY.lonMin) / (OVERLAY.lonMax - OVERLAY.lonMin)) * (GRID_NLON - 1);
+  const cy = Math.min(GRID_NLAT - 2, Math.max(0, Math.floor(fy)));
+  const cx = Math.min(GRID_NLON - 2, Math.max(0, Math.floor(fx)));
+  const ty = Math.min(1, Math.max(0, fy - cy)), tx = Math.min(1, Math.max(0, fx - cx));
+  // grid index iy counts from latMin upward; fy counts from latMax downward
+  const at = (iy, ix) => grid[(GRID_NLAT - 1 - iy) * GRID_NLON + ix];
+  const v00 = at(cy, cx), v01 = at(cy, cx + 1), v10 = at(cy + 1, cx), v11 = at(cy + 1, cx + 1);
+  if ([v00, v01, v10, v11].some(Number.isNaN)) return null;
+  const top = v00 + (v01 - v00) * tx;
+  const bot = v10 + (v11 - v10) * tx;
+  return top + (bot - top) * ty;
+}
+
+// Station residuals vs the model at the displayed time: where NEA disagrees
+// with Open-Meteo, the field is nudged toward the real sensor nearby.
+function computeResiduals(obsPts, grid) {
+  const out = [];
+  for (const p of obsPts) {
+    const m = gridSample(grid, p.lat, p.lon);
+    if (m != null) out.push({ lat: p.lat, lon: p.lon, r: p.v - m });
+  }
+  return out;
+}
+
+function fieldAt(lat, lon, grid, residuals) {
+  const base = gridSample(grid, lat, lon);
+  if (base == null) return null;
+  let wSum = 0, rSum = 0;
+  for (const p of residuals) {
+    const dx = (lon - p.lon) * Math.cos((1.35 * Math.PI) / 180) * KM_PER_DEG;
+    const dy = (lat - p.lat) * KM_PER_DEG;
+    const w = 1 / (dx * dx + dy * dy + 0.05);
+    wSum += w;
+    rSum += w * p.r;
+  }
+  return base + rSum / (wSum + RESIDUAL_LAMBDA);
 }
 
 // ---------- temperature colour scale (light blue = cool -> orange = hot) ----------
@@ -320,14 +429,18 @@ function renderDetail(values, t) {
   document.getElementById("detail-high").textContent = vs.length ? fmt(Math.max(...vs)) : "–";
 }
 
-/* Shading overlay: inverse-distance-weighted interpolation of station readings,
-   rasterized to a small canvas and stretched over the island as an image layer.
-   Alpha fades with distance to the nearest station so the open sea stays clear. */
-function renderOverlay(values) {
+/* Shading overlay, rasterized to a small canvas and stretched over the island
+   as an image layer. With the Open-Meteo model loaded, every pixel is the
+   model field corrected by nearby station residuals (smooth everywhere, exact
+   at the sensors). Without it, falls back to station-only IDW with alpha
+   fading away from stations, since values far from any sensor are guesswork. */
+function renderOverlay(values, t) {
   const pts = [...stations.values()]
     .filter((s) => values.has(s.id) && Number.isFinite(s.lat) && Number.isFinite(s.lon))
     .map((s) => ({ lat: s.lat, lon: s.lon, v: values.get(s.id) }));
-  if (pts.length < 3) return;
+  const grid = buildBlendedGrid(t ?? Date.now());
+  if (!grid && pts.length < 3) return;
+  const residuals = grid ? computeResiduals(pts, grid) : [];
 
   if (!overlayCanvas) {
     overlayCanvas = document.createElement("canvas");
@@ -338,26 +451,36 @@ function renderOverlay(values) {
   const ctx = overlayCanvas.getContext("2d");
   const img = ctx.createImageData(OVERLAY.w, OVERLAY.h);
   const cosLat = Math.cos((1.35 * Math.PI) / 180);
+  const edgePx = Math.round(OVERLAY.w * 0.05);
 
   for (let py = 0; py < OVERLAY.h; py++) {
     const lat = OVERLAY.latMax - ((py + 0.5) / OVERLAY.h) * (OVERLAY.latMax - OVERLAY.latMin);
     for (let px = 0; px < OVERLAY.w; px++) {
       const lon = OVERLAY.lonMin + ((px + 0.5) / OVERLAY.w) * (OVERLAY.lonMax - OVERLAY.lonMin);
-      let wSum = 0, vSum = 0, nearest = Infinity;
-      for (const p of pts) {
-        const dx = (lon - p.lon) * cosLat * KM_PER_DEG;
-        const dy = (lat - p.lat) * KM_PER_DEG;
-        const d2 = dx * dx + dy * dy + 0.05;
-        const w = 1 / d2; // IDW, power 2
-        wSum += w;
-        vSum += w * p.v;
-        if (d2 < nearest) nearest = d2;
+      let val, alpha;
+      if (grid) {
+        val = fieldAt(lat, lon, grid, residuals);
+        if (val == null) continue;
+        // soft fade only at the raster's outer edges
+        const edge = Math.min(px, OVERLAY.w - 1 - px, py, OVERLAY.h - 1 - py) / edgePx;
+        alpha = 0.5 * Math.min(1, edge);
+      } else {
+        let wSum = 0, vSum = 0, nearest = Infinity;
+        for (const p of pts) {
+          const dx = (lon - p.lon) * cosLat * KM_PER_DEG;
+          const dy = (lat - p.lat) * KM_PER_DEG;
+          const d2 = dx * dx + dy * dy + 0.05;
+          const w = 1 / d2; // IDW, power 2
+          wSum += w;
+          vSum += w * p.v;
+          if (d2 < nearest) nearest = d2;
+        }
+        val = vSum / wSum;
+        // full shade within 8 km of a station, gone past 18 km
+        alpha = 0.55 * Math.min(1, Math.max(0, (18 - Math.sqrt(nearest)) / 10));
       }
-      const distKm = Math.sqrt(nearest);
-      // full shade within 8 km of a station, gone past 18 km
-      const alpha = 0.55 * Math.min(1, Math.max(0, (18 - distKm) / 10));
       if (alpha <= 0) continue;
-      const [r, g, b] = tempRGB(vSum / wSum);
+      const [r, g, b] = tempRGB(val);
       const i = (py * OVERLAY.w + px) * 4;
       img.data[i] = r; img.data[i + 1] = g; img.data[i + 2] = b;
       img.data[i + 3] = Math.round(alpha * 255);
@@ -395,7 +518,7 @@ function renderAll() {
   renderList(values);
   renderSummary(values);
   renderDetail(values, t);
-  renderOverlay(values);
+  renderOverlay(values, t);
   renderTimebar(t);
 }
 
@@ -482,4 +605,6 @@ document.getElementById("live-btn").addEventListener("click", () => {
 
 initMap();
 refresh().then(loadHistory);
+refreshModel();
 setInterval(refresh, POLL_MS);
+setInterval(refreshModel, MODEL_REFRESH_MS);
