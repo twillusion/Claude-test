@@ -126,6 +126,10 @@ body { display: flex; flex-direction: column; }
   margin-right: 1rem;
 }
 
+/* .panel sets display:flex later in the file, which outranks .hidden at
+   equal specificity — this makes the collapse actually win */
+#side-panel.hidden { display: none; }
+
 #panel-show {
   position: absolute;
   top: 50%;
@@ -351,6 +355,16 @@ body { display: flex; flex-direction: column; }
 }
 
 .leaflet-container { font: inherit; }
+
+/* attribution must stay visible (OSM/CARTO licence), but it can be subtle */
+.leaflet-control-attribution {
+  font-size: 0.55rem;
+  line-height: 1.3;
+  padding: 1px 5px;
+  background: rgba(14, 19, 32, 0.65);
+  color: var(--muted);
+}
+.leaflet-control-attribution a { color: var(--muted); }
 
 /* daytime gently brightens the dark basemap (driven by --day-boost) */
 #map .leaflet-tile-pane {
