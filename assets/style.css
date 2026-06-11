@@ -1,0 +1,145 @@
+:root {
+  --bg: #0e1320;
+  --panel: #161d2e;
+  --panel-2: #1d2740;
+  --text: #e8edf6;
+  --muted: #8b97ad;
+  --accent: #5ec1ff;
+  --border: #273150;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+body { display: flex; flex-direction: column; }
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.6rem 1rem;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.brand h1 { margin: 0; font-size: 1.15rem; letter-spacing: 0.02em; }
+.brand .subtitle { font-size: 0.7rem; color: var(--muted); display: block; }
+
+.summary { display: flex; gap: 1.2rem; margin-left: auto; }
+.stat { text-align: center; }
+.stat-value { display: block; font-size: 1.05rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.stat-label { font-size: 0.65rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+
+.refresh { font-size: 0.7rem; color: var(--muted); min-width: 7rem; text-align: right; }
+
+.banner {
+  padding: 0.5rem 1rem;
+  background: #4a1f25;
+  color: #ffb3b8;
+  font-size: 0.85rem;
+}
+.hidden { display: none; }
+
+.layout { flex: 1; display: flex; min-height: 0; }
+
+#map { flex: 1; min-height: 0; background: #0a0e18; }
+
+.panel {
+  width: 340px;
+  overflow-y: auto;
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+}
+
+.panel-title {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin: 0;
+  padding: 0.8rem 1rem 0.4rem;
+}
+.panel-title span { font-weight: 400; }
+
+#station-list { list-style: none; margin: 0; padding: 0 0 0.5rem; }
+
+#station-list li {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.45rem 1rem;
+  cursor: pointer;
+  border-left: 3px solid transparent;
+}
+#station-list li:hover { background: var(--panel-2); }
+#station-list li.selected { background: var(--panel-2); border-left-color: var(--accent); }
+
+.station-name { flex: 1; font-size: 0.85rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.station-temp { font-weight: 600; font-variant-numeric: tabular-nums; }
+.station-spark { width: 70px; height: 24px; flex-shrink: 0; }
+.station-spark polyline { fill: none; stroke-width: 1.5; }
+
+.detail {
+  border-bottom: 1px solid var(--border);
+  padding: 0.8rem 1rem 1rem;
+  background: var(--panel-2);
+}
+.detail-head { display: flex; align-items: center; }
+.detail-head h2 { margin: 0; font-size: 1rem; flex: 1; }
+#detail-close {
+  background: none; border: none; color: var(--muted);
+  font-size: 1.3rem; cursor: pointer; line-height: 1; padding: 0 0.2rem;
+}
+.detail-now { margin: 0.3rem 0 0.5rem; }
+#detail-temp { font-size: 2rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.detail-when { font-size: 0.7rem; color: var(--muted); margin-left: 0.6rem; }
+#detail-spark { width: 100%; height: 80px; background: var(--bg); border-radius: 6px; }
+#detail-spark polyline { fill: none; stroke: var(--accent); stroke-width: 2; }
+#detail-spark .spark-fill { fill: rgba(94, 193, 255, 0.12); stroke: none; }
+.detail-range { display: flex; justify-content: space-between; margin-top: 0.5rem; font-size: 0.75rem; color: var(--muted); }
+.detail-range strong { color: var(--text); font-variant-numeric: tabular-nums; }
+
+.footer {
+  padding: 0.4rem 1rem;
+  font-size: 0.7rem;
+  color: var(--muted);
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+}
+.footer a { color: var(--accent); text-decoration: none; }
+
+/* temperature pill markers on the map */
+.temp-pill {
+  background: var(--pill, #555);
+  color: #08101e;
+  font-weight: 700;
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  border-radius: 999px;
+  padding: 2px 7px;
+  border: 1.5px solid rgba(255, 255, 255, 0.85);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+  white-space: nowrap;
+  display: inline-block;
+  transform: translate(-50%, -50%);
+}
+.temp-pill.selected { outline: 2px solid #fff; }
+
+.leaflet-container { font: inherit; }
+
+@media (max-width: 760px) {
+  .layout { flex-direction: column; }
+  #map { height: 48vh; flex: none; }
+  .panel { width: 100%; flex: 1; border-left: none; border-top: 1px solid var(--border); }
+  .refresh { width: 100%; text-align: left; min-width: 0; }
+}
