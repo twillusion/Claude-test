@@ -127,12 +127,13 @@ body { display: flex; flex-direction: column; }
 }
 
 /* wind streaklines: above tiles and shading (z 200/400), below markers (600) */
+/* lives inside the windParticles map pane; Leaflet positions it via
+   transforms, so only anchor the top-left (inset would zero its size) */
 #wind {
   position: absolute;
-  inset: 0;
-  z-index: 450;
+  left: 0;
+  top: 0;
   pointer-events: none;
-  transition: opacity 0.35s ease;
 }
 
 

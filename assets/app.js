@@ -383,6 +383,11 @@ function renderWindPins() {
   }
 }
 
+// Rolling union of recently-seen anemometers: a sparse poll must not shrink
+// the station set (one thin 1-minute snapshot used to wipe it down to 2).
+const windSeen = new Map(); // id -> {vector..., t: last seen}
+const WIND_STALE_MS = 25 * 60_000;
+
 async function fetchWind() {
   // The 1-minute snapshots are sparse (stations report on different
   // cadences) — NEA runs ~14 anemometers but any single minute may carry
@@ -396,7 +401,12 @@ async function fetchWind() {
       out = joinWind(snaps);
     } catch { break; }
   }
-  neaWind = out.length ? out : null;
+  const now = Date.now();
+  for (const e of out) windSeen.set(e.id, { ...e, t: now });
+  for (const [id, e] of windSeen) {
+    if (now - e.t > WIND_STALE_MS) windSeen.delete(id);
+  }
+  neaWind = windSeen.size ? [...windSeen.values()] : null;
   renderWindStatus();
   renderWindPins();
 }
@@ -1087,15 +1097,33 @@ function startWind() {
   try { windOn = localStorage.getItem("sgtemp-wind") !== "off"; } catch { /* default on */ }
   updateWindBtn();
 
+  // The canvas lives in its own map pane so it pans with the tiles, and the
+  // zoomanim hook lets Leaflet's zoom animation scale the drawn particles
+  // smoothly along with the map (same mechanism tiles use). At zoomend the
+  // normal frame loop resumes and redraws crisp at the new zoom.
+  const pane = map.createPane("windParticles");
+  pane.style.zIndex = 450;
+  pane.style.pointerEvents = "none";
+  pane.appendChild(windCanvas);
+  windCanvas.classList.add("leaflet-zoom-animated");
+
   const fit = () => {
     const size = map.getSize();
     windCanvas.width = size.x;
     windCanvas.height = size.y;
   };
   fit();
-  // tails are geographic and redraw every frame, so pan/zoom need no
-  // special handling beyond keeping the canvas sized to the container
   map.on("resize", fit);
+
+  let animatingZoom = false;
+  map.on("zoomanim", (e) => {
+    if (!map.getZoomScale || !map._latLngBoundsToNewLayerBounds) return;
+    animatingZoom = true;
+    const scale = map.getZoomScale(e.zoom);
+    const offset = map._latLngBoundsToNewLayerBounds(map.getBounds(), e.zoom, e.center).min;
+    L.DomUtil.setTransform(windCanvas, offset, scale);
+  });
+  map.on("zoomend", () => { animatingZoom = false; });
 
   windParts = Array.from({ length: WIND_N }, () => spawnPart());
   const cosLat = Math.cos((1.35 * Math.PI) / 180);
@@ -1103,12 +1131,14 @@ function startWind() {
 
   function frame(ts) {
     requestAnimationFrame(frame);
-    if (!windOn || document.hidden) { last = ts; return; }
+    if (!windOn || document.hidden || animatingZoom) { last = ts; return; }
     if (ts - last < WIND_TICK_MS) return;
     const dt = Math.min(0.1, (ts - last) / 1000);
     last = ts;
     tick++;
 
+    // pin the canvas to the current viewport, then draw in container coords
+    L.DomUtil.setPosition(windCanvas, map.containerPointToLayerPoint([0, 0]));
     windCtx.clearRect(0, 0, windCanvas.width, windCanvas.height);
     windCtx.lineCap = "round";
     for (const p of windParts) {
