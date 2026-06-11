@@ -17,6 +17,10 @@ const OM_URL = "https://api.open-meteo.com/v1/forecast";
 const POLL_MS = 60_000;
 const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
 const HISTORY_HOURS = 24;
+// Shown in the footer; bump together with the ?v= stamps in index.html so a
+// glance settles "am I looking at the new build or a stale cache?"
+const APP_VERSION = "20260611t";
+
 const SLIDER_STEP_MIN = 5; // scrubber granularity; underlying data is per-minute
 
 // Geographic window and raster size for the shading overlay; the Open-Meteo
@@ -2121,6 +2125,11 @@ document.getElementById("wind-btn").addEventListener("click", () => {
   updateWindBtn();
 });
 
+{
+  const v = document.getElementById("app-version");
+  if (v) v.textContent = APP_VERSION;
+  console.info(`[sgtemp] app version ${APP_VERSION}`);
+}
 initMap();
 startWind();
 refresh().then(loadHistory).then(() => {
