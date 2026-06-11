@@ -7,6 +7,9 @@
 
 const V2_URL = "https://api-open.data.gov.sg/v2/real-time/api/air-temperature";
 const V1_URL = "https://api.data.gov.sg/v1/environment/air-temperature";
+const WIND_SPEED_URL = "https://api.data.gov.sg/v1/environment/wind-speed";
+const WIND_DIR_URL = "https://api.data.gov.sg/v1/environment/wind-direction";
+const KNOTS_TO_KMH = 1.852;
 const OM_URL = "https://api.open-meteo.com/v1/forecast";
 const POLL_MS = 60_000;
 const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
@@ -310,8 +313,54 @@ function updateWindBlend() {
   windV = blendGrids(model.vGrids, t);
 }
 
+// ---------- NEA observed wind (primary source for the particles) ----------
+
+// data.gov.sg real-time wind: same reliable host as the temperatures.
+// Live-only (no time dimension here); scrubbed times fall back to the
+// Open-Meteo field when it's available.
+let neaWind = null; // [{lat, lon, u, v}] in km/h
+
+async function fetchWind() {
+  const [spd, dir] = await Promise.all([WIND_SPEED_URL, WIND_DIR_URL].map(async (url) => {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`wind HTTP ${res.status}`);
+    return res.json();
+  }));
+  const locs = new Map();
+  for (const s of [...spd.metadata.stations, ...dir.metadata.stations]) locs.set(s.id, s.location);
+  const speeds = new Map(spd.items[0].readings.map((r) => [r.station_id, r.value]));
+  const out = [];
+  for (const r of dir.items[0].readings) {
+    const kn = speeds.get(r.station_id);
+    const loc = locs.get(r.station_id);
+    if (kn == null || !loc) continue;
+    const kmh = kn * KNOTS_TO_KMH;
+    const rad = (r.value * Math.PI) / 180; // direction the wind comes FROM
+    out.push({ lat: loc.latitude, lon: loc.longitude, u: -kmh * Math.sin(rad), v: -kmh * Math.cos(rad) });
+  }
+  neaWind = out.length ? out : null;
+  renderWindStatus();
+}
+
+function pollWind() {
+  fetchWind().catch(() => { neaWind = null; renderWindStatus(); });
+}
+
+function idwWind(lat, lon) {
+  const cosLat = Math.cos((1.35 * Math.PI) / 180);
+  let wSum = 0, uSum = 0, vSum = 0;
+  for (const p of neaWind) {
+    const dx = (lon - p.lon) * cosLat * KM_PER_DEG;
+    const dy = (lat - p.lat) * KM_PER_DEG;
+    const w = 1 / (dx * dx + dy * dy + 0.5);
+    wSum += w; uSum += w * p.u; vSum += w * p.v;
+  }
+  return { u: uSum / wSum, v: vSum / wSum };
+}
+
 function windVecAt(lat, lon) {
-  if (!windU) return null;
+  if (displayedT === null && neaWind) return idwWind(lat, lon); // live: observed
+  if (!windU) return null; // scrubbed: model field if we have one
   const u = gridSample(windU, lat, lon);
   const v = gridSample(windV, lat, lon);
   return u == null || v == null ? null : { u, v };
@@ -324,13 +373,16 @@ const COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
 
 function renderWindStatus() {
   const el = document.getElementById("wind-status");
-  if (!windU) { el.textContent = "–"; return; }
-  let su = 0, sv = 0, n = 0;
-  for (let i = 0; i < windU.length; i++) {
-    if (!Number.isNaN(windU[i]) && !Number.isNaN(windV[i])) { su += windU[i]; sv += windV[i]; n++; }
+  let u = 0, v = 0, n = 0;
+  if (displayedT === null && neaWind) {
+    for (const p of neaWind) { u += p.u; v += p.v; n++; }
+  } else if (windU) {
+    for (let i = 0; i < windU.length; i++) {
+      if (!Number.isNaN(windU[i]) && !Number.isNaN(windV[i])) { u += windU[i]; v += windV[i]; n++; }
+    }
   }
   if (!n) { el.textContent = "–"; return; }
-  const u = su / n, v = sv / n;
+  u /= n; v /= n;
   const speed = Math.hypot(u, v);
   const from = (Math.atan2(-u, -v) * 180 / Math.PI + 360) % 360;
   el.textContent = `${speed.toFixed(0)} km/h from ${COMPASS[Math.round(from / 22.5) % 16]}`;
@@ -569,14 +621,23 @@ function dayFactor(t) {
   return Math.min(smooth01((h - 6.0) / 2.0), 1 - smooth01((h - 18.2) / 2.0));
 }
 
+/* Rebuilding a divIcon replaces its DOM node, which reads as a flash (and
+   restarts the pulse animation). So the icon is only rebuilt when its
+   structure changes (selection, live state, value appearing); routine value
+   ticks just rewrite the text and colour in place. */
 function renderMarker(s, v) {
   if (!s.marker) return;
-  if (v == null) { s.marker.setIcon(L.divIcon({ className: "", html: "", iconSize: [0, 0] })); return; }
-  let html;
+  if (v == null) {
+    if (s.iconKey !== "empty") {
+      s.marker.setIcon(L.divIcon({ className: "", html: "", iconSize: [0, 0] }));
+      s.iconKey = "empty";
+    }
+    return;
+  }
+  let key, html;
   if (s.kind === "civ") {
-    // small pin + a modest temperature chip, clearly subordinate to the
-    // official station pills
     const sel = s.id === selectedId ? " selected" : "";
+    key = `civ${sel}`;
     html = `<span class="civ-marker${sel}">` +
       `<span class="civ-temp">${fmt(v)}</span>` +
       `<span class="civ-dot" style="--pill:${tempColor(v)}"></span></span>`;
@@ -584,9 +645,22 @@ function renderMarker(s, v) {
     let cls = "temp-pill";
     if (s.id === selectedId) cls += " selected";
     if (displayedT === null) cls += " live"; // gentle pulse on current readings
+    key = cls;
     html = `<span class="${cls}" style="--pill:${tempColor(v)}">${fmt(v)}</span>`;
   }
+
+  const root = s.iconKey === key && s.marker.getElement && s.marker.getElement();
+  if (root && root.querySelector) {
+    const text = root.querySelector(s.kind === "civ" ? ".civ-temp" : ".temp-pill");
+    const tinted = root.querySelector(s.kind === "civ" ? ".civ-dot" : ".temp-pill");
+    if (text && tinted && tinted.style && tinted.style.setProperty) {
+      text.textContent = fmt(v);
+      tinted.style.setProperty("--pill", tempColor(v));
+      return;
+    }
+  }
   s.marker.setIcon(L.divIcon({ className: "", html, iconSize: [0, 0] }));
+  s.iconKey = key;
   s.marker.bindTooltip(s.name);
 }
 
@@ -1019,6 +1093,8 @@ document.getElementById("live-btn").addEventListener("click", () => {
 initMap();
 startWind();
 refresh().then(loadHistory).then(pollCommunity);
+pollWind();
+setInterval(pollWind, POLL_MS);
 refreshModel();
 setInterval(refresh, POLL_MS);
 setInterval(refreshModel, MODEL_REFRESH_MS);
