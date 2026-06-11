@@ -35,7 +35,16 @@ static page, no backend, no hosting costs.
 - The basemap follows the sun: a day layer (capped at 60% so it stays easy
   on the eyes) crossfades over the night layer through two-hour dawn/dusk
   ramps at the displayed time, with a sun/moon icon next to the clock.
-- Ambient touches: stylized waves bob on open water.
+- Ambient touches: stylized waves bob on open water, and the shading
+  carries a faint travelling ripple (a few hundredths of a degree) so the
+  field looks alive while idle. The ripple repaints a cached raster — no
+  recomputation, and it pauses when the tab is hidden.
+- Citizen sensors from [Sensor.Community](https://sensor.community) (open
+  API, no key) appear as smaller dashed pills and sharpen the shading via
+  reduced-weight residuals. They're sanity-filtered (range check, plus a
+  ±4°C check against the NEA median to drop sun-baked balcony sensors),
+  kept out of the headline stats and colour scale, and live-only — there's
+  no archive, so readings accumulate client-side while the page is open.
 - Overlay opacity scales with distance from the middle of the colour scale:
   near-average areas stay transparent so the basemap reads clearly, and
   only genuine hot/cold anomalies get painted.

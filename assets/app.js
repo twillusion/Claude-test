@@ -24,15 +24,23 @@ const KM_PER_DEG = 111.32;
 // correction is halved, so the model field dominates where there's no sensor.
 const RESIDUAL_LAMBDA = 1 / (12 * 12);
 
+// Sensor.Community citizen sensors (open API, no key). Civilian-grade:
+// included at reduced weight, sanity-filtered, and live-only (no archive).
+const CIV_URL = "https://data.sensor.community/airrohr/v1/filter/" +
+  `box=${OVERLAY.latMin},${OVERLAY.lonMin},${OVERLAY.latMax},${OVERLAY.lonMax}`;
+const CIV_POLL_MS = 120_000; // their readings update ~every 2.5 minutes
+const CIV_RESIDUAL_WT = 0.35;
+
 const stations = new Map(); // id -> {id, name, lat, lon, marker, listEl, series: Map t->v, history: [{t,v}], latest}
 let timeline = [];    // sorted unique reading timestamps (ms) within the 24h window
 let sliderTicks = []; // timeline thinned to SLIDER_STEP_MIN buckets
 let displayedT = null; // null = live (latest reading)
 let selectedId = null;
-let map, overlayLayer, overlayCanvas, dayTiles;
+let map, overlayLayer, overlayCanvas, dayTiles, dayTilesOn = false;
 let renderQueued = false;
 let model = null; // {times: [ms], grids: [Float32Array(GRID_NLAT*GRID_NLON)]}
 let latestReadingT = null, statusPinned = false;
+let fieldCache = null, fadeCache = null; // last rasterized field, reused by the shimmer
 
 // ---------- API ----------
 
@@ -120,6 +128,46 @@ async function fetchDay(dateStr) {
   return { stations: stationsOut, items };
 }
 
+// ---------- Sensor.Community citizen sensors ----------
+
+// Last ~5 minutes of readings inside our box. Readings accumulate into the
+// same series as NEA stations (so they scrub for as long as you've had the
+// page open), but there's no archive to backfill, so older scrub times show
+// official stations only. Obvious junk (out-of-range, or wildly off the NEA
+// median — a sensor on a sunny balcony) is dropped.
+async function fetchCommunity() {
+  const res = await fetch(CIV_URL);
+  if (!res.ok) throw new Error(`sensor.community HTTP ${res.status}`);
+  const arr = await res.json();
+  const latest = new Map();
+  for (const m of arr) {
+    const tv = (m.sensordatavalues || []).find((d) => d.value_type === "temperature");
+    const lat = parseFloat(m.location?.latitude);
+    const lon = parseFloat(m.location?.longitude);
+    const v = tv ? parseFloat(tv.value) : NaN;
+    const t = new Date(String(m.timestamp).replace(" ", "T") + "Z").getTime(); // UTC
+    if (!Number.isFinite(v) || v < 18 || v > 42) continue;
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(t)) continue;
+    const id = `civ-${m.sensor.id}`;
+    const prev = latest.get(id);
+    if (!prev || t > prev.t) latest.set(id, { id, lat, lon, t, v });
+  }
+  const neaVals = [...stations.values()]
+    .filter((s) => s.kind === "nea" && s.latest != null)
+    .map((s) => s.latest).sort((a, b) => a - b);
+  const median = neaVals.length ? neaVals[neaVals.length >> 1] : null;
+  let added = 0;
+  for (const e of latest.values()) {
+    if (median != null && Math.abs(e.v - median) > 4) continue; // implausible vs island
+    const s = upsertStation({
+      id: e.id, name: `Community sensor ${e.id.slice(4)}`, lat: e.lat, lon: e.lon, kind: "civ",
+    });
+    s.series.set(e.t, e.v);
+    added++;
+  }
+  if (added) { rebuild(); renderAll(); }
+}
+
 // ---------- Open-Meteo model grid ----------
 
 // One request fetches hourly 2m-temperature for the whole sample grid,
@@ -201,7 +249,7 @@ function computeResiduals(obsPts, grid) {
   const out = [];
   for (const p of obsPts) {
     const m = gridSample(grid, p.lat, p.lon);
-    if (m != null) out.push({ lat: p.lat, lon: p.lon, r: p.v - m });
+    if (m != null) out.push({ lat: p.lat, lon: p.lon, r: p.v - m, wt: p.wt ?? 1 });
   }
   return out;
 }
@@ -213,7 +261,7 @@ function fieldAt(lat, lon, grid, residuals) {
   for (const p of residuals) {
     const dx = (lon - p.lon) * Math.cos((1.35 * Math.PI) / 180) * KM_PER_DEG;
     const dy = (lat - p.lat) * KM_PER_DEG;
-    const w = 1 / (dx * dx + dy * dy + 0.05);
+    const w = (p.wt ?? 1) / (dx * dx + dy * dy + 0.05);
     wSum += w;
     rSum += w * p.r;
   }
@@ -246,7 +294,11 @@ let scaleInit = false;
 
 function updateScale(values, grid) {
   let lo = Infinity, hi = -Infinity;
-  for (const v of values.values()) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  for (const [id, v] of values) {
+    if (stations.get(id)?.kind === "civ") continue; // scale anchored to official data
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
   if (grid) for (const g of grid) {
     if (!Number.isNaN(g)) { if (g < lo) lo = g; if (g > hi) hi = g; }
   }
@@ -274,7 +326,7 @@ function updateScale(values, grid) {
 function upsertStation(info) {
   let s = stations.get(info.id);
   if (!s) {
-    s = { ...info, series: new Map(), history: [], latest: null, marker: null, listEl: null };
+    s = { kind: "nea", ...info, series: new Map(), history: [], latest: null, marker: null, listEl: null };
     stations.set(info.id, s);
     if (Number.isFinite(s.lat) && Number.isFinite(s.lon)) {
       s.marker = L.marker([s.lat, s.lon], {
@@ -386,8 +438,9 @@ function renderMarker(s, v) {
   if (!s.marker) return;
   if (v == null) { s.marker.setIcon(L.divIcon({ className: "", html: "", iconSize: [0, 0] })); return; }
   let cls = "temp-pill";
+  if (s.kind === "civ") cls += " civ";
   if (s.id === selectedId) cls += " selected";
-  if (displayedT === null) cls += " live"; // gentle pulse on current readings
+  if (displayedT === null && s.kind !== "civ") cls += " live"; // gentle pulse on current readings
   s.marker.setIcon(L.divIcon({
     className: "",
     html: `<span class="${cls}" style="--pill:${tempColor(v)}">${fmt(v)}</span>`,
@@ -415,9 +468,11 @@ function sparkPoints(history, w, h, pad = 2, maxPts = 240) {
 function renderList(values) {
   const ul = document.getElementById("station-list");
   const sorted = [...stations.values()]
-    .filter((s) => values.has(s.id))
+    .filter((s) => s.kind === "nea" && values.has(s.id))
     .sort((a, b) => values.get(b.id) - values.get(a.id));
-  document.getElementById("station-count").textContent = `(${sorted.length})`;
+  const civCount = [...stations.values()].filter((s) => s.kind === "civ" && values.has(s.id)).length;
+  document.getElementById("station-count").textContent =
+    civCount ? `(${sorted.length} + ${civCount} community)` : `(${sorted.length})`;
 
   for (const s of sorted) {
     if (!s.listEl) {
@@ -444,8 +499,12 @@ function renderList(values) {
   }
 }
 
+// Headline stats stay official-only so one sun-baked balcony sensor can't
+// become the island's "hottest".
 function renderSummary(values) {
-  const vals = [...values.values()];
+  const vals = [...stations.values()]
+    .filter((s) => s.kind === "nea" && values.has(s.id))
+    .map((s) => values.get(s.id));
   if (!vals.length) return;
   const el = (id) => document.getElementById(id);
   el("stat-min").textContent = fmt(Math.min(...vals));
@@ -502,7 +561,10 @@ function extremeness(val) {
 function renderOverlay(values, grid) {
   const pts = [...stations.values()]
     .filter((s) => values.has(s.id) && Number.isFinite(s.lat) && Number.isFinite(s.lon))
-    .map((s) => ({ lat: s.lat, lon: s.lon, v: values.get(s.id) }));
+    .map((s) => ({
+      lat: s.lat, lon: s.lon, v: values.get(s.id),
+      wt: s.kind === "civ" ? CIV_RESIDUAL_WT : 1,
+    }));
   if (!grid && pts.length < 3) return;
   const residuals = grid ? computeResiduals(pts, grid) : [];
 
@@ -512,8 +574,11 @@ function renderOverlay(values, grid) {
     overlayCanvas.height = OVERLAY.h;
   }
   if (typeof overlayCanvas.getContext !== "function") return;
-  const ctx = overlayCanvas.getContext("2d");
-  const img = ctx.createImageData(OVERLAY.w, OVERLAY.h);
+  const n = OVERLAY.w * OVERLAY.h;
+  if (!fieldCache) {
+    fieldCache = new Float32Array(n);
+    fadeCache = new Float32Array(n);
+  }
   const cosLat = Math.cos((1.35 * Math.PI) / 180);
   const edgePx = Math.round(OVERLAY.w * 0.05);
 
@@ -521,34 +586,55 @@ function renderOverlay(values, grid) {
     const lat = OVERLAY.latMax - ((py + 0.5) / OVERLAY.h) * (OVERLAY.latMax - OVERLAY.latMin);
     for (let px = 0; px < OVERLAY.w; px++) {
       const lon = OVERLAY.lonMin + ((px + 0.5) / OVERLAY.w) * (OVERLAY.lonMax - OVERLAY.lonMin);
-      let val, alpha;
+      const i = py * OVERLAY.w + px;
       if (grid) {
-        val = fieldAt(lat, lon, grid, residuals);
-        if (val == null) continue;
+        const val = fieldAt(lat, lon, grid, residuals);
+        if (val == null) { fieldCache[i] = NaN; continue; }
+        fieldCache[i] = val;
         // soft fade only at the raster's outer edges
         const edge = Math.min(px, OVERLAY.w - 1 - px, py, OVERLAY.h - 1 - py) / edgePx;
-        alpha = OVERLAY_MAX_ALPHA * extremeness(val) * Math.min(1, edge);
+        fadeCache[i] = Math.min(1, edge);
       } else {
         let wSum = 0, vSum = 0, nearest = Infinity;
         for (const p of pts) {
           const dx = (lon - p.lon) * cosLat * KM_PER_DEG;
           const dy = (lat - p.lat) * KM_PER_DEG;
           const d2 = dx * dx + dy * dy + 0.05;
-          const w = 1 / d2; // IDW, power 2
+          const w = p.wt / d2; // IDW, power 2
           wSum += w;
           vSum += w * p.v;
           if (d2 < nearest) nearest = d2;
         }
-        val = vSum / wSum;
+        fieldCache[i] = vSum / wSum;
         // full shade within 8 km of a station, gone past 18 km
-        alpha = OVERLAY_MAX_ALPHA * extremeness(val)
-          * Math.min(1, Math.max(0, (18 - Math.sqrt(nearest)) / 10));
+        fadeCache[i] = Math.min(1, Math.max(0, (18 - Math.sqrt(nearest)) / 10));
       }
-      if (alpha <= 0) continue;
-      const [r, g, b] = tempRGB(val);
-      const i = (py * OVERLAY.w + px) * 4;
-      img.data[i] = r; img.data[i + 1] = g; img.data[i + 2] = b;
-      img.data[i + 3] = Math.round(alpha * 255);
+    }
+  }
+  paintOverlay(typeof performance !== "undefined" ? performance.now() : 0);
+}
+
+/* Colour pass over the cached field. Cheap enough to re-run on a timer: a
+   faint travelling ripple (a few hundredths of a degree) makes the shading
+   breathe while the page is otherwise idle. */
+function paintOverlay(nowMs) {
+  if (!fieldCache || !overlayCanvas || typeof overlayCanvas.getContext !== "function") return;
+  const ctx = overlayCanvas.getContext("2d");
+  const img = ctx.createImageData(OVERLAY.w, OVERLAY.h);
+  const ripple = 0.05 * (scaleHi - scaleLo);
+  for (let py = 0; py < OVERLAY.h; py++) {
+    const rowWob = Math.cos(py * 0.38 + nowMs * 0.00055);
+    for (let px = 0; px < OVERLAY.w; px++) {
+      const i = py * OVERLAY.w + px;
+      const v = fieldCache[i];
+      if (Number.isNaN(v)) continue;
+      const vv = v + ripple * Math.sin(px * 0.45 + nowMs * 0.0008) * rowWob;
+      const alpha = OVERLAY_MAX_ALPHA * extremeness(vv) * fadeCache[i];
+      if (alpha <= 0.004) continue;
+      const [r, g, b] = tempRGB(vv);
+      const o = i * 4;
+      img.data[o] = r; img.data[o + 1] = g; img.data[o + 2] = b;
+      img.data[o + 3] = Math.round(alpha * 255);
     }
   }
   ctx.putImageData(img, 0, 0);
@@ -589,7 +675,16 @@ function renderAll() {
   const values = displayedValues(t);
   const grid = buildBlendedGrid(t ?? Date.now());
   updateScale(values, grid); // normalize colours before anything draws
-  if (dayTiles) dayTiles.setOpacity(DAY_MAX_OPACITY * dayFactor(t ?? Date.now()));
+  if (dayTiles) {
+    const op = DAY_MAX_OPACITY * dayFactor(t ?? Date.now());
+    if (op > 0.02) {
+      if (!dayTilesOn) { dayTiles.addTo(map); dayTilesOn = true; }
+      dayTiles.setOpacity(op);
+    } else if (dayTilesOn) {
+      dayTiles.remove();
+      dayTilesOn = false;
+    }
+  }
   for (const s of stations.values()) renderMarker(s, values.get(s.id));
   renderList(values);
   renderSummary(values);
@@ -641,7 +736,9 @@ function initDecor() {
 
 function setStatus(text, pinned = false) {
   statusPinned = pinned;
-  document.getElementById("refresh-status").textContent = text;
+  const el = document.getElementById("refresh-status");
+  el.textContent = text;
+  el.classList.toggle("loading", pinned);
 }
 
 // ticks once a second so the header feels alive between polls
@@ -674,17 +771,17 @@ async function refresh() {
   }
 }
 
-// Bulk-load the 24h window: yesterday + today, each one day-sized request.
+// Bulk-load the 24h window: yesterday + today fetched in parallel, each
+// rendered as soon as it lands so the scrubber becomes usable immediately.
 async function loadHistory() {
   const now = Date.now();
-  const days = [sgtDate(new Date(now - 24 * 3600_000)), sgtDate(new Date(now))];
-  let loaded = 0;
-  for (const day of days) {
-    setStatus(`loading history ${++loaded}/${days.length}…`, true);
-    try {
-      ingest(await fetchDay(day));
-    } catch { /* a missing day just shortens the scrubber range */ }
-  }
+  const days = [sgtDate(new Date(now)), sgtDate(new Date(now - 24 * 3600_000))];
+  setStatus("loading 24h history…", true);
+  await Promise.all(days.map((day) =>
+    fetchDay(day)
+      .then((r) => { ingest(r); rebuild(); renderAll(); })
+      .catch(() => { /* a missing day just shortens the scrubber range */ })
+  ));
   rebuild(now);
   renderAll();
   latestReadingT = timeline[timeline.length - 1] ?? null;
@@ -715,10 +812,11 @@ function initMap() {
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
     maxZoom: 18,
   };
-  // night base + day layer crossfaded by the sun at the displayed time
+  // night base + day layer crossfaded by the sun at the displayed time;
+  // the day layer is only attached while visible so it doesn't cost tile
+  // downloads at night (or during initial load after dark)
   L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", tileOpts).addTo(map);
-  dayTiles = L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", tileOpts).addTo(map);
-  dayTiles.setOpacity(0);
+  dayTiles = L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", tileOpts);
 }
 
 document.getElementById("detail-close").addEventListener("click", () => selectStation(selectedId));
@@ -736,8 +834,14 @@ document.getElementById("live-btn").addEventListener("click", () => {
 
 initMap();
 initDecor();
-refresh().then(loadHistory);
+refresh().then(loadHistory).then(() => fetchCommunity().catch(() => {}));
 refreshModel();
 setInterval(refresh, POLL_MS);
 setInterval(refreshModel, MODEL_REFRESH_MS);
 setInterval(tickStatus, 1000);
+setInterval(() => fetchCommunity().catch(() => {}), CIV_POLL_MS);
+// idle shimmer: repaint the cached field with a drifting ripple
+setInterval(() => {
+  if (typeof document !== "undefined" && document.hidden) return;
+  if (fieldCache) paintOverlay(performance.now());
+}, 160);

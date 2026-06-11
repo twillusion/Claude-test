@@ -39,6 +39,7 @@ body { display: flex; flex-direction: column; }
 .stat-label { font-size: 0.65rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
 
 .refresh { font-size: 0.7rem; color: var(--muted); min-width: 7rem; text-align: right; }
+.refresh.loading { color: var(--accent); animation: blink 1.4s ease-in-out infinite; }
 
 .banner {
   padding: 0.5rem 1rem;
@@ -237,6 +238,13 @@ body { display: flex; flex-direction: column; }
 }
 .temp-pill.selected { outline: 2px solid #fff; }
 .temp-pill.live { animation: pill-pulse 3.5s ease-in-out infinite; }
+.temp-pill.civ {
+  font-size: 0.6rem;
+  padding: 1px 5px;
+  opacity: 0.85;
+  border-width: 1px;
+  border-style: dashed;
+}
 
 .leaflet-container { font: inherit; }
 
