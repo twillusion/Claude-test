@@ -37,6 +37,15 @@ static page, no backend, no hosting costs.
   it falls back to station-only IDW shading that fades out away from
   sensors. The model grid refreshes every 30 minutes (the models themselves
   update hourly) and covers the full 24h scrubber window.
+- Forecast: the slider extends ~24 hours past LIVE in hourly steps. Future
+  pills show the Open-Meteo model field at each station, bias-corrected by
+  the station's current offset from the model, and render dashed with a
+  "≈" time label to mark them as forecast; the shading, wind socks, and
+  particles all follow the model into the future, and radar shows
+  RainViewer's ~30-minute nowcast. The model is fetched primarily from
+  `data/model.json`, committed every 3 hours by a GitHub Action
+  (`scripts/fetch-model.mjs`) so the page reads it same-origin — run the
+  "Refresh forecast model" workflow once manually after merging to seed it.
 - The time slider scrubs the 24-hour window in 5-minute steps
   (`SLIDER_STEP_MIN` in `assets/app.js`); the LIVE button snaps back to the
   newest reading. Displayed series use a centered 15-minute rolling mean so

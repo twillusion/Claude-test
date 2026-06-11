@@ -41,7 +41,9 @@ const CIV_RESIDUAL_WT = 0.7; // vs 1.0 for official stations
 
 const stations = new Map(); // id -> {id, name, lat, lon, marker, listEl, series: Map t->v, history: [{t,v}], latest}
 let timeline = [];    // sorted unique reading timestamps (ms) within the 24h window
-let sliderTicks = []; // timeline thinned to SLIDER_STEP_MIN buckets
+let sliderTicks = []; // timeline thinned to SLIDER_STEP_MIN buckets, + forecast hours
+let sliderLiveIdx = -1; // tick index that means "live"
+const FORECAST_HOURS = 24;
 let displayedT = null; // null = live (latest reading)
 let selectedId = null;
 let map, overlayLayer, overlayCanvas;
@@ -199,33 +201,9 @@ function pollCommunity() {
 
 // ---------- Open-Meteo model grid ----------
 
-// One request fetches hourly 2m-temperature for the whole sample grid,
-// covering yesterday through today (so the scrubber window is fully covered).
-async function fetchModel() {
-  const lats = [], lons = [];
-  for (let iy = 0; iy < GRID_NLAT; iy++) {
-    for (let ix = 0; ix < GRID_NLON; ix++) {
-      lats.push((OVERLAY.latMin + (iy * (OVERLAY.latMax - OVERLAY.latMin)) / (GRID_NLAT - 1)).toFixed(4));
-      lons.push((OVERLAY.lonMin + (ix * (OVERLAY.lonMax - OVERLAY.lonMin)) / (GRID_NLON - 1)).toFixed(4));
-    }
-  }
-  // chunked: long multi-location URLs / heavy requests are what get refused
-  const CHUNK = 27;
-  const requests = [];
-  for (let i = 0; i < lats.length; i += CHUNK) {
-    const url = `${OM_URL}?latitude=${lats.slice(i, i + CHUNK).join(",")}` +
-      `&longitude=${lons.slice(i, i + CHUNK).join(",")}` +
-      `&hourly=temperature_2m,wind_speed_10m,wind_direction_10m` +
-      `&past_days=1&forecast_days=1&timeformat=unixtime&timezone=UTC`;
-    requests.push(fetch(url).then(async (res) => {
-      if (!res.ok) throw new Error(`open-meteo HTTP ${res.status}`);
-      const j = await res.json();
-      return Array.isArray(j) ? j : [j];
-    }));
-  }
-  const results = (await Promise.all(requests)).flat();
-  if (results.length !== lats.length) throw new Error("open-meteo result count mismatch");
-
+// Hourly 2m-temperature + 10m wind for the whole sample grid, yesterday
+// through tomorrow — the scrubber's past window plus the forecast horizon.
+function buildModelFromResults(results) {
   const times = results[0].hourly.time.map((s) => s * 1000);
   const grids = [], uGrids = [], vGrids = [];
   times.forEach((_, k) => {
@@ -246,6 +224,46 @@ async function fetchModel() {
     grids.push(g); uGrids.push(gu); vGrids.push(gv);
   });
   model = { times, grids, uGrids, vGrids };
+}
+
+// Primary source: data/model.json, committed by the scheduled GitHub Action
+// (scripts/fetch-model.mjs) — same-origin, so browser-side blocks and rate
+// limits on Open-Meteo can't touch it.
+async function fetchModelLocal() {
+  const res = await fetch(`data/model.json?t=${Math.floor(Date.now() / 600_000)}`);
+  if (!res.ok) throw new Error(`local model HTTP ${res.status}`);
+  const j = await res.json();
+  if (!j.results?.length) throw new Error("empty model file");
+  if (Date.now() - (j.generated ?? 0) > 12 * 3600_000) throw new Error("stale model file");
+  buildModelFromResults(j.results);
+}
+
+// Fallback: fetch Open-Meteo directly from the browser.
+async function fetchModel() {
+  const lats = [], lons = [];
+  for (let iy = 0; iy < GRID_NLAT; iy++) {
+    for (let ix = 0; ix < GRID_NLON; ix++) {
+      lats.push((OVERLAY.latMin + (iy * (OVERLAY.latMax - OVERLAY.latMin)) / (GRID_NLAT - 1)).toFixed(4));
+      lons.push((OVERLAY.lonMin + (ix * (OVERLAY.lonMax - OVERLAY.lonMin)) / (GRID_NLON - 1)).toFixed(4));
+    }
+  }
+  // chunked: long multi-location URLs / heavy requests are what get refused
+  const CHUNK = 27;
+  const requests = [];
+  for (let i = 0; i < lats.length; i += CHUNK) {
+    const url = `${OM_URL}?latitude=${lats.slice(i, i + CHUNK).join(",")}` +
+      `&longitude=${lons.slice(i, i + CHUNK).join(",")}` +
+      `&hourly=temperature_2m,wind_speed_10m,wind_direction_10m` +
+      `&past_days=1&forecast_days=2&timeformat=unixtime&timezone=UTC`;
+    requests.push(fetch(url).then(async (res) => {
+      if (!res.ok) throw new Error(`open-meteo HTTP ${res.status}`);
+      const j = await res.json();
+      return Array.isArray(j) ? j : [j];
+    }));
+  }
+  const results = (await Promise.all(requests)).flat();
+  if (results.length !== lats.length) throw new Error("open-meteo result count mismatch");
+  buildModelFromResults(results);
 }
 
 // Cache the model in localStorage so page reloads within the refresh window
@@ -279,17 +297,28 @@ function setShadeMode(text) {
   document.getElementById("shade-mode").textContent = text;
 }
 
+function modelLoaded(source) {
+  if (typeof localStorage !== "undefined") saveModelCache();
+  setShadeMode(`Open-Meteo model + station correction (${source})`);
+  rebuild(); // the slider grows its forecast ticks from the model times
+  scheduleRender();
+}
+
 async function refreshModel() {
+  try {
+    await fetchModelLocal();
+    modelLoaded("via repo");
+    return;
+  } catch { /* no data file yet, or stale — fall through */ }
   if (!model && typeof localStorage !== "undefined" && loadModelCache()) {
-    setShadeMode("Open-Meteo model + station correction");
+    setShadeMode("Open-Meteo model + station correction (cached)");
+    rebuild();
     scheduleRender();
     return; // fresh enough; the next interval tick refetches
   }
   try {
     await fetchModel();
-    if (typeof localStorage !== "undefined") saveModelCache();
-    setShadeMode("Open-Meteo model + station correction");
-    scheduleRender();
+    modelLoaded("direct");
   } catch (e) {
     // keep whatever model we had; surface the real error in the footer
     if (!model) {
@@ -745,7 +774,9 @@ async function fetchSatellite() {
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const json = await res.json();
   radarHost = json.host;
-  radarFrames = json.radar?.past ?? [];
+  // past ~2h plus RainViewer's ~30-minute nowcast, so the slider's first
+  // forecast steps still show projected rain
+  radarFrames = [...(json.radar?.past ?? []), ...(json.radar?.nowcast ?? [])];
   if (!radarFrames.length) { setSatStatus("no radar frames"); return; }
   if (!satLayer) {
     satLayer = L.tileLayer(radarUrl(radarFrames[radarFrames.length - 1].path), {
@@ -1148,6 +1179,15 @@ function rebuild(now = Date.now()) {
     const b = Math.floor(t / (SLIDER_STEP_MIN * 60_000));
     if (b !== lastBucket) { sliderTicks.push(t); lastBucket = b; }
   }
+  // LIVE sits at the end of the observed past; beyond it, hourly forecast
+  // ticks from the model (when we have one) extend the slider up to +24h
+  sliderLiveIdx = sliderTicks.length - 1;
+  if (model) {
+    const horizon = now + FORECAST_HOURS * 3600_000;
+    for (const mt of model.times) {
+      if (mt > now + 30 * 60_000 && mt <= horizon) sliderTicks.push(mt);
+    }
+  }
 }
 
 // Largest reading at or before t (binary search), within a 30-minute tolerance.
@@ -1166,6 +1206,10 @@ function displayedTime() {
   return displayedT ?? (timeline.length ? timeline[timeline.length - 1] : null);
 }
 
+function isFutureView() {
+  return displayedT !== null && timeline.length > 0 && displayedT > timeline[timeline.length - 1];
+}
+
 /* Live view shows each station's last known reading (within 2h) rather than
    filtering against the single newest timestamp — the latest 1-minute
    snapshot can be sparse (one station reporting alone), and anchoring on it
@@ -1175,6 +1219,25 @@ function displayedValues(t, wobbleMs = null) {
   const out = new Map();
   if (t == null) return out;
   const live = displayedT === null;
+  if (isFutureView()) {
+    // forecast: model field at t, nudged by each station's current bias
+    // against the model (a station that runs hot now likely stays hot)
+    const gridT = buildBlendedGrid(t);
+    if (!gridT) return out;
+    const gridNow = buildBlendedGrid(Date.now());
+    for (const s of stations.values()) {
+      if (s.kind !== "nea" || !Number.isFinite(s.lat)) continue;
+      const m = gridSample(gridT, s.lat, s.lon);
+      if (m == null) continue;
+      let bias = 0;
+      const mNow = gridNow ? gridSample(gridNow, s.lat, s.lon) : null;
+      if (s.latest != null && mNow != null) {
+        bias = Math.max(-2, Math.min(2, s.latest - mNow));
+      }
+      out.set(s.id, m + bias);
+    }
+    return out;
+  }
   for (const s of stations.values()) {
     let v = null;
     if (live) {
@@ -1263,8 +1326,11 @@ function renderMarker(s, v) {
       `<span class="civ-temp">${fmt(v)}</span>` +
       `<span class="civ-dot" style="--pill:${tempColor(v)}"></span></span>`;
   } else {
-    const cls = s.id === selectedId ? "temp-pill selected" : "temp-pill";
-    const wv = windVectorsById.get(s.id); // hybrid: this station also reports wind
+    let cls = s.id === selectedId ? "temp-pill selected" : "temp-pill";
+    if (isFutureView()) cls += " fc"; // dashed = forecast, not observation
+    // hybrid: observed wind, or the model wind when viewing the future
+    const wv = windVectorsById.get(s.id) ??
+      (isFutureView() ? windVecAt(s.lat, s.lon) : null);
     key = cls + (wv ? "+wind" : "");
     html = `${wv ? windSockHtml(wv, 22, 9, tempColor(v)) : ""}` +
       `<span class="${cls}" style="--pill:${tempColor(v)}">${fmt(v)}</span>`;
@@ -1278,7 +1344,8 @@ function renderMarker(s, v) {
       text.textContent = fmt(v);
       tinted.style.setProperty("--pill", tempColor(v));
       if (s.kind !== "civ") {
-        const wv = windVectorsById.get(s.id);
+        const wv = windVectorsById.get(s.id) ??
+          (isFutureView() ? windVecAt(s.lat, s.lon) : null);
         const sock = root.querySelector(".wind-sock");
         if (wv && sock && sock.style) applySock(sock, wv, 22, 9, tempColor(v));
       }
@@ -1549,9 +1616,8 @@ function renderTimebar(t) {
   const liveBtn = document.getElementById("live-btn");
   slider.max = Math.max(0, sliderTicks.length - 1);
   if (displayedT === null) {
-    slider.value = slider.max;
+    slider.value = Math.max(0, sliderLiveIdx);
   } else {
-    // keep the handle tracking the displayed time (it moves during playback)
     let lo = 0, hi = sliderTicks.length - 1, idx = 0;
     while (lo <= hi) {
       const mid = (lo + hi) >> 1;
@@ -1559,7 +1625,9 @@ function renderTimebar(t) {
     }
     slider.value = idx;
   }
-  label.textContent = t ? fmtTime(t) : "–";
+  const future = isFutureView();
+  label.textContent = t ? (future ? `≈ ${fmtTime(t)}` : fmtTime(t)) : "–";
+  if (label.classList) label.classList.toggle("future", future);
   const f = dayFactor(t ?? Date.now());
   document.getElementById("sky-icon").textContent = f > 0.8 ? "☀️" : f < 0.2 ? "🌙" : "🌅";
   liveBtn.classList.toggle("active", displayedT === null);
@@ -1986,7 +2054,7 @@ document.getElementById("detail-close").addEventListener("click", () => selectSt
 
 document.getElementById("time-slider").addEventListener("input", (e) => {
   const idx = Number(e.target.value);
-  displayedT = idx >= sliderTicks.length - 1 ? null : sliderTicks[idx];
+  displayedT = idx === sliderLiveIdx ? null : sliderTicks[idx];
   scheduleRender();
 });
 
