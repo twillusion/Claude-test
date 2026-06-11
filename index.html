@@ -34,11 +34,17 @@
         <span id="legend-hi">–</span>
       </div>
       <div class="timebar">
-        <button id="play-btn" title="Replay the last 24 hours">▶</button>
         <button id="live-btn" title="Jump to latest reading">LIVE</button>
         <input type="range" id="time-slider" min="0" max="0" step="1" value="0"
                aria-label="Time scrubber for the last 24 hours">
+        <span id="sky-icon" aria-hidden="true"></span>
         <span id="time-label">–</span>
+      </div>
+      <div id="bird" aria-hidden="true">
+        <svg viewBox="0 0 24 12" width="26" height="13">
+          <path d="M1 9 Q6 2 12 8 Q18 2 23 9" fill="none"
+                stroke="rgba(255,255,255,0.85)" stroke-width="1.6" stroke-linecap="round"/>
+        </svg>
       </div>
     </div>
 

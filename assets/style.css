@@ -94,7 +94,7 @@ body { display: flex; flex-direction: column; }
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
 }
 
-#live-btn, #play-btn {
+#live-btn {
   background: var(--panel-2);
   color: var(--muted);
   border: 1px solid var(--border);
@@ -111,8 +111,8 @@ body { display: flex; flex-direction: column; }
   margin-right: 4px;
   animation: blink 2s ease-in-out infinite;
 }
-#play-btn { min-width: 2rem; }
-#play-btn.active { background: #1d3a5c; color: var(--accent); border-color: #2c5a8e; }
+
+#sky-icon { font-size: 0.85rem; line-height: 1; }
 
 @keyframes blink {
   0%, 100% { opacity: 1; }
@@ -122,6 +122,34 @@ body { display: flex; flex-direction: column; }
 @keyframes pill-pulse {
   0%, 100% { box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5); }
   50% { box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5), 0 0 10px 2px var(--pill); }
+}
+
+/* ambient decorations */
+.wave-deco {
+  transform: translate(-50%, -50%);
+  animation: wave-bob 5s ease-in-out infinite;
+  pointer-events: none;
+}
+
+@keyframes wave-bob {
+  0%, 100% { opacity: 0.3; translate: 0 0; }
+  50% { opacity: 0.55; translate: 0 -2px; }
+}
+
+#bird {
+  position: absolute;
+  z-index: 650;
+  left: -8%;
+  top: 30%;
+  opacity: 0;
+  pointer-events: none;
+}
+#bird.flying { opacity: 0.9; }
+#bird svg { animation: flap 0.9s ease-in-out infinite; }
+
+@keyframes flap {
+  0%, 100% { transform: scaleY(1); }
+  50% { transform: scaleY(0.55) translateY(2px); }
 }
 
 #time-slider { flex: 1; accent-color: var(--accent); min-width: 0; }

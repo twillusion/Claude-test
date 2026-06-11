@@ -29,11 +29,14 @@ static page, no backend, no hosting costs.
   update hourly) and covers the full 24h scrubber window.
 - The time slider scrubs the 24-hour window in 5-minute steps
   (`SLIDER_STEP_MIN` in `assets/app.js`); the LIVE button snaps back to the
-  newest reading, and the play button replays the whole window as a ~30s
-  looping timelapse.
-- The basemap follows the sun: a day layer crossfades over the night layer
-  through dawn/dusk at the displayed time, so scrubbing or replaying shifts
-  the map between light and dark.
+  newest reading. Displayed series use a centered 15-minute rolling mean so
+  per-minute sensor jitter doesn't flash colours while scrubbing, and the
+  colour scale eases toward its target rather than jumping.
+- The basemap follows the sun: a day layer (capped at 60% so it stays easy
+  on the eyes) crossfades over the night layer through two-hour dawn/dusk
+  ramps at the displayed time, with a sun/moon icon next to the clock.
+- Ambient touches: stylized waves bob on open water, and a gull
+  occasionally crosses the map during daytime hours.
 
 ## Setting it up
 

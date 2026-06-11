@@ -14,10 +14,11 @@ const HISTORY_HOURS = 24;
 const SLIDER_STEP_MIN = 5; // scrubber granularity; underlying data is per-minute
 
 // Geographic window and raster size for the shading overlay; the Open-Meteo
-// sample grid shares the same bounds so the raster never extrapolates.
-const OVERLAY = { latMin: 1.16, latMax: 1.495, lonMin: 103.55, lonMax: 104.15, w: 240, h: 140 };
-const GRID_NLAT = 8;
-const GRID_NLON = 12;
+// sample grid shares the same bounds so the raster never extrapolates, and
+// the map is hard-locked to this exact window.
+const OVERLAY = { latMin: 1.09, latMax: 1.56, lonMin: 103.48, lonMax: 104.22, w: 240, h: 152 };
+const GRID_NLAT = 9;
+const GRID_NLON = 13;
 const KM_PER_DEG = 111.32;
 // Station residuals shrink toward zero away from stations; at ~12 km the
 // correction is halved, so the model field dominates where there's no sensor.
@@ -31,7 +32,6 @@ let selectedId = null;
 let map, overlayLayer, overlayCanvas, dayTiles;
 let renderQueued = false;
 let model = null; // {times: [ms], grids: [Float32Array(GRID_NLAT*GRID_NLON)]}
-let playing = false, lastFrameTs = null;
 let latestReadingT = null, statusPinned = false;
 
 // ---------- API ----------
@@ -242,6 +242,8 @@ function tempColor(v) {
   return `rgb(${tempRGB(v).join(",")})`;
 }
 
+let scaleInit = false;
+
 function updateScale(values, grid) {
   let lo = Infinity, hi = -Infinity;
   for (const v of values.values()) { if (v < lo) lo = v; if (v > hi) hi = v; }
@@ -254,10 +256,17 @@ function updateScale(values, grid) {
     lo = mid - MIN_SPAN / 2;
     hi = mid + MIN_SPAN / 2;
   }
-  scaleLo = lo;
-  scaleHi = hi;
-  document.getElementById("legend-lo").textContent = fmt(lo);
-  document.getElementById("legend-hi").textContent = fmt(hi);
+  if (!scaleInit) {
+    scaleLo = lo;
+    scaleHi = hi;
+    scaleInit = true;
+  } else {
+    // ease toward the target so the palette doesn't jump while scrubbing
+    scaleLo += (lo - scaleLo) * 0.4;
+    scaleHi += (hi - scaleHi) * 0.4;
+  }
+  document.getElementById("legend-lo").textContent = fmt(scaleLo);
+  document.getElementById("legend-hi").textContent = fmt(scaleHi);
 }
 
 // ---------- data flow ----------
@@ -288,6 +297,10 @@ function ingest(result) {
 }
 
 // Prune to the 24h window and rebuild the sorted views the renderers use.
+// Displayed series are smoothed with a centered rolling mean so per-minute
+// sensor jitter (a few 0.1°) doesn't flash colours while scrubbing.
+const SMOOTH_HALF_MS = 7.5 * 60_000; // 15-minute window
+
 function rebuild(now = Date.now()) {
   const cutoff = now - HISTORY_HOURS * 3600_000;
   const times = new Set();
@@ -296,7 +309,13 @@ function rebuild(now = Date.now()) {
       if (t < cutoff) s.series.delete(t);
       else times.add(t);
     }
-    s.history = [...s.series].map(([t, v]) => ({ t, v })).sort((a, b) => a.t - b.t);
+    const raw = [...s.series].map(([t, v]) => ({ t, v })).sort((a, b) => a.t - b.t);
+    let a = 0, b = 0, sum = 0;
+    s.history = raw.map((p) => {
+      while (b < raw.length && raw[b].t <= p.t + SMOOTH_HALF_MS) sum += raw[b++].v;
+      while (raw[a].t < p.t - SMOOTH_HALF_MS) sum -= raw[a++].v;
+      return { t: p.t, v: sum / (b - a) };
+    });
     s.latest = s.history.length ? s.history[s.history.length - 1].v : null;
   }
   timeline = [...times].sort((a, b) => a - b);
@@ -348,6 +367,10 @@ function fmtTime(t) {
 
 // 0 = night, 1 = day, smooth ramps through twilight. Singapore sits on the
 // equator, so sunrise/sunset barely move all year (~07:00 / ~19:10 SGT).
+// The ramps span two hours so the shift never feels like a switch, and the
+// day layer is capped well below full so daytime stays easy on the eyes.
+const DAY_MAX_OPACITY = 0.6;
+
 function smooth01(x) {
   x = Math.min(1, Math.max(0, x));
   return x * x * (3 - 2 * x);
@@ -356,7 +379,7 @@ function smooth01(x) {
 function dayFactor(t) {
   const d = new Date(t + 8 * 3600_000); // SGT wall clock via UTC getters
   const h = d.getUTCHours() + d.getUTCMinutes() / 60 + d.getUTCSeconds() / 3600;
-  return Math.min(smooth01((h - 6.5) / 1.1), 1 - smooth01((h - 18.6) / 1.1));
+  return Math.min(smooth01((h - 6.0) / 2.0), 1 - smooth01((h - 18.2) / 2.0));
 }
 
 function renderMarker(s, v) {
@@ -546,6 +569,8 @@ function renderTimebar(t) {
     slider.value = idx;
   }
   label.textContent = t ? fmtTime(t) : "–";
+  const f = dayFactor(t ?? Date.now());
+  document.getElementById("sky-icon").textContent = f > 0.8 ? "☀️" : f < 0.2 ? "🌙" : "🌅";
   liveBtn.classList.toggle("active", displayedT === null);
 }
 
@@ -554,7 +579,7 @@ function renderAll() {
   const values = displayedValues(t);
   const grid = buildBlendedGrid(t ?? Date.now());
   updateScale(values, grid); // normalize colours before anything draws
-  if (dayTiles) dayTiles.setOpacity(dayFactor(t ?? Date.now()));
+  if (dayTiles) dayTiles.setOpacity(DAY_MAX_OPACITY * dayFactor(t ?? Date.now()));
   for (const s of stations.values()) renderMarker(s, values.get(s.id));
   renderList(values);
   renderSummary(values);
@@ -577,38 +602,52 @@ function selectStation(id) {
   renderAll();
 }
 
-// ---------- playback (timelapse of the 24h window) ----------
+// ---------- ambient decorations ----------
 
-const PLAY_SPEED = (HISTORY_HOURS * 3600_000) / 30_000; // whole window in ~30s
+// Stylized waves bobbing on open water (coordinates chosen on sea, clear of land).
+const WAVE_SPOTS = [
+  [1.155, 103.62], [1.125, 103.78], [1.15, 103.95], [1.20, 104.10],
+  [1.255, 103.55], [1.115, 104.16], [1.445, 103.715],
+];
+const WAVE_SVG = `<svg viewBox="0 0 28 10" width="26" height="9">
+  <path d="M1 4 Q4.5 1 8 4 T15 4" fill="none" stroke="#9fd0ff" stroke-width="1.4" stroke-linecap="round"/>
+  <path d="M13 8 Q16.5 5 20 8 T27 8" fill="none" stroke="#9fd0ff" stroke-width="1.4" stroke-linecap="round"/>
+</svg>`;
 
-function stepPlayback(dtMs) {
-  if (timeline.length < 2) return;
-  const start = timeline[0], end = timeline[timeline.length - 1];
-  let t = (displayedT ?? start) + dtMs * PLAY_SPEED;
-  if (t >= end) t = start; // loop
-  displayedT = t;
+function initDecor() {
+  WAVE_SPOTS.forEach(([lat, lon], i) => {
+    L.marker([lat, lon], {
+      interactive: false,
+      icon: L.divIcon({
+        className: "",
+        html: `<div class="wave-deco" style="animation-delay:-${(i * 0.9).toFixed(1)}s">${WAVE_SVG}</div>`,
+        iconSize: [0, 0],
+      }),
+    }).addTo(map);
+  });
+  if (typeof window === "undefined") return;
+  scheduleBird();
 }
 
-function playFrame(ts) {
-  if (!playing) return;
-  const dt = lastFrameTs == null ? 16 : Math.min(100, ts - lastFrameTs);
-  lastFrameTs = ts;
-  stepPlayback(dt);
-  renderAll();
-  requestAnimationFrame(playFrame);
+// A gull drifts across the map now and then — daytime only, birds sleep.
+function scheduleBird() {
+  setTimeout(flyBird, 12_000 + Math.random() * 40_000);
 }
 
-function setPlaying(on) {
-  if (playing === on) return;
-  playing = on;
-  lastFrameTs = null;
-  const btn = document.getElementById("play-btn");
-  btn.textContent = on ? "❚❚" : "▶";
-  btn.classList.toggle("active", on);
-  if (on) {
-    if (displayedT === null) displayedT = timeline[0] ?? null; // start at -24h
-    requestAnimationFrame(playFrame);
-  }
+function flyBird() {
+  if (dayFactor(displayedTime() ?? Date.now()) < 0.25) { scheduleBird(); return; }
+  const bird = document.getElementById("bird");
+  const fromLeft = Math.random() < 0.5;
+  const dur = 14_000 + Math.random() * 8_000;
+  bird.style.transition = "none";
+  bird.style.top = `${12 + Math.random() * 45}%`;
+  bird.style.left = fromLeft ? "-8%" : "104%";
+  bird.style.transform = fromLeft ? "scaleX(1)" : "scaleX(-1)";
+  bird.classList.add("flying");
+  void bird.offsetWidth; // commit the start position before animating
+  bird.style.transition = `left ${dur}ms linear`;
+  bird.style.left = fromLeft ? "104%" : "-8%";
+  setTimeout(() => { bird.classList.remove("flying"); scheduleBird(); }, dur);
 }
 
 // ---------- status ----------
@@ -676,6 +715,7 @@ function initMap() {
     zoomControl: true,
     maxBounds: dataBounds,
     maxBoundsViscosity: 1.0, // hard wall when panning
+    zoomSnap: 0, // fractional zoom, so min zoom can match the bounds exactly
   });
   map.fitBounds(dataBounds);
   // can't zoom out past the point where the data window fills the screen
@@ -693,24 +733,18 @@ function initMap() {
 document.getElementById("detail-close").addEventListener("click", () => selectStation(selectedId));
 
 document.getElementById("time-slider").addEventListener("input", (e) => {
-  setPlaying(false);
   const idx = Number(e.target.value);
   displayedT = idx >= sliderTicks.length - 1 ? null : sliderTicks[idx];
   scheduleRender();
 });
 
 document.getElementById("live-btn").addEventListener("click", () => {
-  setPlaying(false);
   displayedT = null;
   renderAll();
 });
 
-document.getElementById("play-btn").addEventListener("click", () => {
-  setPlaying(!playing);
-  if (!playing) renderAll();
-});
-
 initMap();
+initDecor();
 refresh().then(loadHistory);
 refreshModel();
 setInterval(refresh, POLL_MS);
