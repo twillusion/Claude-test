@@ -686,9 +686,11 @@ function upsertStation(info) {
 }
 
 function ingest(result) {
+  const maxT = Date.now() + 10 * 60_000; // guard against bogus future stamps
   for (const info of result.stations) upsertStation(info);
   for (const item of result.items) {
     const t = new Date(item.timestamp).getTime();
+    if (!Number.isFinite(t) || t > maxT) continue;
     for (const [id, value] of item.readings) {
       stations.get(id)?.series.set(t, value);
     }
@@ -743,11 +745,23 @@ function displayedTime() {
   return displayedT ?? (timeline.length ? timeline[timeline.length - 1] : null);
 }
 
+/* Live view shows each station's last known reading (within 2h) rather than
+   filtering against the single newest timestamp — the latest 1-minute
+   snapshot can be sparse (one station reporting alone), and anchoring on it
+   used to blank every other pill. Scrubbed times keep the strict 30-minute
+   tolerance: history should be honest about gaps. */
 function displayedValues(t, wobbleMs = null) {
   const out = new Map();
   if (t == null) return out;
+  const live = displayedT === null;
   for (const s of stations.values()) {
-    const v = valueAt(s, t);
+    let v = null;
+    if (live) {
+      const last = s.history[s.history.length - 1];
+      if (last && Date.now() - last.t < 2 * 3600_000) v = last.v;
+    } else {
+      v = valueAt(s, t);
+    }
     if (v != null) out.set(s.id, wobbleMs == null ? v : v + liveWobble(s.id, wobbleMs));
   }
   return out;
