@@ -459,20 +459,41 @@ function recomputeWet() {
   wetGauges = rainReadings.filter((g) => g.mm > 0.05 || g.recent > 0.2);
 }
 
-async function fetchRain() {
-  const res = await fetch429(RAIN_URL);
+async function fetchRainSnap(dt) {
+  const q = dt ? `?date_time=${encodeURIComponent(sgtStamp(dt))}` : "";
+  const res = await fetch429(RAIN_URL + q);
   if (!res.ok) throw new Error(`rain HTTP ${res.status}`);
   const json = await res.json();
-  const locs = new Map(json.metadata.stations.map((s) => [s.id, s.location]));
-  const t = new Date(json.items[0].timestamp).getTime() || Date.now();
-  rainReadings = [];
-  for (const r of json.items[0].readings) {
-    const loc = locs.get(r.station_id);
-    if (!loc || r.value == null || r.value < 0) continue;
-    rainReadings.push({ id: r.station_id, lat: loc.latitude, lon: loc.longitude, mm: r.value });
-    if (r.value > 0) pushRainHist(r.station_id, t, r.value);
+  const item = json.items?.[0] ?? { readings: [] };
+  return {
+    locs: new Map((json.metadata?.stations ?? []).map((s) => [s.id, s.location])),
+    t: new Date(item.timestamp).getTime() || Date.now(),
+    readings: item.readings ?? [],
+  };
+}
+
+async function fetchRain() {
+  // like every realtime feed here, the latest snapshot can be sparse — top
+  // up from the previous 5-minute mark when it looks thin
+  const snaps = [await fetchRainSnap()];
+  if (snaps[0].readings.length < 10) {
+    const m = new Date(Date.now() - 5 * 60_000);
+    m.setSeconds(0, 0);
+    m.setMinutes(Math.floor(m.getMinutes() / 5) * 5);
+    try { snaps.push(await fetchRainSnap(m)); } catch { /* best-effort */ }
   }
+  const byId = new Map();
+  for (const snap of snaps) {
+    for (const r of snap.readings) {
+      const loc = snap.locs.get(r.station_id);
+      if (!loc || r.value == null || r.value < 0 || byId.has(r.station_id)) continue;
+      byId.set(r.station_id, { id: r.station_id, lat: loc.latitude, lon: loc.longitude, mm: r.value });
+      if (r.value > 0) pushRainHist(r.station_id, snap.t, r.value);
+    }
+  }
+  rainReadings = [...byId.values()];
   recomputeWet();
+  console.info(`[sgtemp] rain: ${rainReadings.length} gauges reporting, ${wetGauges.length} wet`);
   renderRain();
   renderRainStatus();
 }
@@ -581,8 +602,11 @@ function pollRain() {
 function renderRainStatus() {
   const el = document.getElementById("rain-status");
   if (!el) return;
-  if (!rainReadings.length) { el.textContent = "–"; return; }
-  if (!wetGauges.length) { el.textContent = "none in last 30 min"; return; }
+  if (!rainReadings.length) { el.textContent = "no gauges reporting"; return; }
+  if (!wetGauges.length) {
+    el.textContent = `dry 30 min (${rainReadings.length} gauges)`;
+    return;
+  }
   const max = Math.max(...wetGauges.map((g) => Math.max(g.mm, (g.recent ?? 0) / 3)));
   el.textContent = `${wetGauges.length} gauge${wetGauges.length > 1 ? "s" : ""} wet · up to ${max.toFixed(1)} mm`;
 }
@@ -597,7 +621,8 @@ function renderRainStatus() {
    blending, so the IR's bright cloud tops glow over the dark map while the
    warm dark ground stays invisible. */
 const GIBS_LAYER = "Himawari_AHI_Band13_Clean_Infrared";
-let satLayer = null, satErrors = 0, satBackoff = 0;
+const SAT_MATRICES = ["GoogleMapsCompatible_Level7", "GoogleMapsCompatible_Level8", "GoogleMapsCompatible_Level6"];
+let satLayer = null, satErrors = 0, satBackoff = 0, satMatrix = null;
 
 function setSatStatus(text) {
   const el = document.getElementById("sat-status");
@@ -610,16 +635,45 @@ function satFrameIso(stepsBack) {
   return t.toISOString().slice(0, 19) + "Z";
 }
 
+function satTileUrl(matrix, iso, z, y, x) {
+  return "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/" +
+    `${GIBS_LAYER}/default/${iso}/${matrix}/${z}/${y}/${x}.png`;
+}
+
+function probeImage(url) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve(true);
+    img.onerror = () => resolve(false);
+    img.src = url;
+  });
+}
+
+// Self-discover the working tile format: probe candidate matrices against a
+// 2-hour-old frame (safely published) with bare Image() requests, then build
+// the layer with whichever answered. z6/y31/x50 covers Singapore.
+async function satInit() {
+  if (typeof Image === "undefined") return; // browser only
+  const iso = satFrameIso(9);
+  for (const m of SAT_MATRICES) {
+    setSatStatus(`probing ${m.replace("GoogleMapsCompatible_", "")}…`);
+    if (await probeImage(satTileUrl(m, iso, 6, 31, 50))) { satMatrix = m; break; }
+  }
+  if (!satMatrix) { setSatStatus("unavailable (all probes failed)"); return; }
+  fetchSatellite();
+  setInterval(pollSatellite, SAT_POLL_MS);
+}
+
 function fetchSatellite() {
   const iso = satFrameIso(satBackoff);
-  const url = "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/" +
-    `${GIBS_LAYER}/default/${iso}/GoogleMapsCompatible_Level7/{z}/{y}/{x}.png`;
+  const level = Number((satMatrix ?? "GoogleMapsCompatible_Level7").match(/\d+$/)[0]);
+  const url = satTileUrl(satMatrix ?? SAT_MATRICES[0], iso, "{z}", "{y}", "{x}");
   satErrors = 0;
   if (!satLayer) {
     satLayer = L.tileLayer(url, {
       pane: "clouds",
       opacity: 0.6,
-      maxNativeZoom: 7, // Band-13 is ~2km/px; Leaflet upscales beyond this
+      maxNativeZoom: level, // IR is coarse; Leaflet upscales beyond this
       maxZoom: 18,
       attribution: 'Clouds: <a href="https://earthdata.nasa.gov/gibs">NASA GIBS</a> / Himawari',
     });
@@ -628,40 +682,22 @@ function fetchSatellite() {
       satLayer.on("tileerror", (e) => {
         if (satErrors === 0 && e?.tile?.src) console.warn("[sgtemp] sat tile failed:", e.tile.src);
         satErrors++;
-        // frame likely not published yet — step back 10 min and retry
-        if (satErrors >= 4 && satBackoff < 9) {
+        // the viewport only spans a couple of tiles at this zoom, so even
+        // two failures means the frame isn't there — step back 10 minutes
+        if (satErrors >= 2 && satBackoff < 9) {
           satBackoff++;
           setSatStatus(`seeking frame (-${30 + satBackoff * 10}min)…`);
           fetchSatellite();
         } else if (satBackoff >= 9) {
           setSatStatus("tiles failing");
-        } else {
-          setSatStatus(`tile errors (${satErrors})`);
         }
       });
     }
     satLayer.addTo(map);
     setSatStatus("loading tiles…");
-    startSatProbe(iso);
   } else {
     satLayer.setUrl(url);
   }
-}
-
-// If neither tileload nor tileerror fires within 8s, the requests are being
-// stalled or blocked silently. A bare Image() probe against one known tile
-// tells us whether the host is reachable at all.
-function startSatProbe(iso) {
-  if (typeof Image === "undefined") return;
-  setTimeout(() => {
-    const el = document.getElementById("sat-status");
-    if (!el || !/loading tiles/.test(el.textContent)) return; // events arrived
-    const img = new Image();
-    img.onload = () => setSatStatus("probe ok — layer silent?");
-    img.onerror = () => setSatStatus("probe failed — host blocked?");
-    img.src = "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/" +
-      `${GIBS_LAYER}/default/${iso}/GoogleMapsCompatible_Level7/6/31/50.png`;
-  }, 8000);
 }
 
 function pollSatellite() {
@@ -1911,14 +1947,13 @@ startWind();
 refresh().then(loadHistory).then(() => {
   pollCommunity();
   pollRain();
-  pollSatellite();
+  satInit(); // probes the tile format, then starts its own refresh cycle
   // archives matter only for scrubbing/recency — let the visible stuff win
   setTimeout(() => loadWindHistory().catch(() => {}), 1500);
   if (!TEST_RAIN) setTimeout(() => seedRainRecent().catch(() => {}), 3000);
 });
 pollWind();
 setInterval(pollRain, RAIN_POLL_MS);
-setInterval(pollSatellite, SAT_POLL_MS);
 setInterval(pollWind, POLL_MS);
 refreshModel();
 setInterval(refresh, POLL_MS);
