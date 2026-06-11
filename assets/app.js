@@ -697,20 +697,58 @@ function setSatStatus(text) {
   if (el) el.textContent = text;
 }
 
+let radarFrames = []; // [{time: sec, path}] \u2014 RainViewer keeps ~2h of past frames
+let radarHost = "";
+let radarPath = null;
+
+function radarUrl(path) {
+  // colour scheme 6 = NEXRAD green/yellow/red; options 1_1 = smoothed
+  return `${radarHost}${path}/256/{z}/{x}/{y}/6/1_1.png`;
+}
+
+function radarFrameFor(tMs) {
+  let best = null, bestD = Infinity;
+  for (const f of radarFrames) {
+    const d = Math.abs(f.time * 1000 - tMs);
+    if (d < bestD) { bestD = d; best = f; }
+  }
+  return bestD <= 15 * 60_000 ? best : null;
+}
+
+// Show the frame matching the displayed time: latest when live, the nearest
+// archive frame when scrubbing the last ~2h, hidden (with an honest status)
+// beyond the archive.
+function applyRadarFrame() {
+  if (!satLayer || !radarOn || !radarFrames.length) return;
+  const pane = map.getPane && map.getPane("clouds");
+  const f = displayedT === null
+    ? radarFrames[radarFrames.length - 1]
+    : radarFrameFor(displayedTime() ?? Date.now());
+  if (!f) {
+    if (pane) pane.style.display = "none";
+    setSatStatus("no archive at this time");
+    return;
+  }
+  if (pane) pane.style.display = "";
+  if (f.path !== radarPath) {
+    radarPath = f.path;
+    satLabel = new Date(f.time * 1000).toLocaleTimeString("en-SG",
+      { timeZone: "Asia/Singapore", hour: "2-digit", minute: "2-digit" });
+    satLayer.setUrl(radarUrl(f.path));
+    setSatStatus(`radar ${satLabel}`);
+  }
+}
+
 async function fetchSatellite() {
   if (!radarOn) { setSatStatus("off"); return; }
   const res = await fetch429(RV_META_URL);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const json = await res.json();
-  const frames = json.radar?.past ?? [];
-  if (!frames.length) { setSatStatus("no radar frames"); return; }
-  const f = frames[frames.length - 1];
-  // colour scheme 6 = NEXRAD green/yellow/red; options 1_1 = smoothed
-  const url = `${json.host}${f.path}/256/{z}/{x}/{y}/6/1_1.png`;
-  satLabel = new Date((f.time ?? 0) * 1000).toLocaleTimeString("en-SG",
-    { timeZone: "Asia/Singapore", hour: "2-digit", minute: "2-digit" });
+  radarHost = json.host;
+  radarFrames = json.radar?.past ?? [];
+  if (!radarFrames.length) { setSatStatus("no radar frames"); return; }
   if (!satLayer) {
-    satLayer = L.tileLayer(url, {
+    satLayer = L.tileLayer(radarUrl(radarFrames[radarFrames.length - 1].path), {
       pane: "clouds",
       opacity: 0.7,
       // RainViewer's free tiles stop here; beyond it they serve a literal
@@ -720,14 +758,14 @@ async function fetchSatellite() {
       attribution: 'Radar: <a href="https://www.rainviewer.com/">RainViewer</a>',
     });
     if (satLayer.on) {
-      satLayer.on("tileload", () => setSatStatus(`live radar (${satLabel})`));
+      satLayer.on("tileload", () => setSatStatus(`radar ${satLabel}`));
       satLayer.on("tileerror", () => setSatStatus("tiles failing"));
     }
     satLayer.addTo(map);
     setSatStatus("loading radar\u2026");
-  } else {
-    satLayer.setUrl(url);
   }
+  radarPath = null; // force re-apply with the fresh frame list
+  applyRadarFrame();
 }
 
 function pollSatellite() {
@@ -1547,11 +1585,7 @@ function renderAll() {
   renderWindStatus();
   renderWindPins();
   renderRain(); // rain follows the scrubber (24h series)
-  // the radar layer describes "now" — only honest on the live view
-  if (map && map.getPane) {
-    const el = map.getPane("clouds");
-    if (el) el.style.display = displayedT === null ? "" : "none";
-  }
+  applyRadarFrame(); // radar follows it too, within RainViewer's ~2h archive
 }
 
 // Coalesce slider-drag renders to animation frames.
@@ -1981,7 +2015,8 @@ document.getElementById("radar-btn").addEventListener("click", () => {
     setSatStatus("off");
   } else if (satLayer) {
     satLayer.addTo(map);
-    setSatStatus(satLabel ? `live radar (${satLabel})` : "loading radar…");
+    radarPath = null;
+    applyRadarFrame();
   } else {
     pollSatellite();
   }
