@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SG Temp — Live Singapore Temperature</title>
+  <meta name="description" content="Live air temperature across Singapore's weather stations, with a 24-hour rolling view. Data from NEA via data.gov.sg.">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <h1>SG Temp</h1>
+      <span class="subtitle">live island temperature</span>
+    </div>
+    <div class="summary" id="summary">
+      <div class="stat"><span class="stat-value" id="stat-min">–</span><span class="stat-label">coolest</span></div>
+      <div class="stat"><span class="stat-value" id="stat-mean">–</span><span class="stat-label">average</span></div>
+      <div class="stat"><span class="stat-value" id="stat-max">–</span><span class="stat-label">hottest</span></div>
+    </div>
+    <div class="refresh" id="refresh-status">loading…</div>
+  </header>
+
+  <div class="banner hidden" id="error-banner"></div>
+
+  <main class="layout">
+    <div id="map" aria-label="Map of Singapore weather stations"></div>
+
+    <aside class="panel">
+      <section class="detail hidden" id="detail">
+        <div class="detail-head">
+          <h2 id="detail-name"></h2>
+          <button id="detail-close" aria-label="Close detail">×</button>
+        </div>
+        <div class="detail-now"><span id="detail-temp"></span><span class="detail-when" id="detail-when"></span></div>
+        <svg id="detail-spark" viewBox="0 0 320 80" preserveAspectRatio="none"></svg>
+        <div class="detail-range">
+          <span>24h low <strong id="detail-low">–</strong></span>
+          <span>24h high <strong id="detail-high">–</strong></span>
+        </div>
+      </section>
+
+      <section class="stations">
+        <h2 class="panel-title">Stations <span id="station-count"></span></h2>
+        <ul id="station-list"></ul>
+      </section>
+    </aside>
+  </main>
+
+  <footer class="footer">
+    Data: <a href="https://data.gov.sg" target="_blank" rel="noopener">NEA via data.gov.sg</a>
+    (<a href="https://data.gov.sg/open-data-licence" target="_blank" rel="noopener">Singapore Open Data Licence</a>)
+    · refreshes every minute
+  </footer>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script src="assets/app.js"></script>
+</body>
+</html>
