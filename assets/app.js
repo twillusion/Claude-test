@@ -454,19 +454,27 @@ async function fetchRain() {
 
 const rainLayer = new Map(); // gauge id -> {circle, icon}
 
+// Light drizzle = light blue, downpour = deep blue.
+function rainColor(mm) {
+  const t = Math.min(1, Math.max(0, (mm - 0.2) / 8));
+  const c0 = [158, 212, 255], c1 = [16, 86, 200];
+  return `rgb(${c0.map((v, i) => Math.round(v + (c1[i] - v) * t)).join(",")})`;
+}
+
 function renderRain() {
   if (typeof L === "undefined" || !map) return;
   const seen = new Set();
   for (const g of wetGauges) {
     seen.add(g.id);
     const radius = 1200 + Math.min(8, g.mm) * 350; // metres — a rough splash zone
+    const col = rainColor(g.mm);
     let e = rainLayer.get(g.id);
     if (!e) {
       e = {
         circle: L.circle([g.lat, g.lon], {
           pane: "rain", radius,
-          color: "#5ec1ff", weight: 1, opacity: 0.35,
-          fillColor: "#5ec1ff", fillOpacity: 0.12,
+          color: col, weight: 1, opacity: 0.4,
+          fillColor: col, fillOpacity: 0.14,
           interactive: false,
         }).addTo(map),
         icon: L.marker([g.lat, g.lon], { pane: "rain", keyboard: false }).addTo(map),
@@ -474,6 +482,7 @@ function renderRain() {
       rainLayer.set(g.id, e);
     }
     e.circle.setRadius(radius);
+    if (e.circle.setStyle) e.circle.setStyle({ color: col, fillColor: col });
     e.icon.setIcon(L.divIcon({
       className: "",
       html: `<span class="rain-icon">🌧️</span>`,
@@ -527,12 +536,17 @@ function renderRainStatus() {
    map tiles the browser caches like any basemap. */
 let satLayer = null;
 
+function setSatStatus(text) {
+  const el = document.getElementById("sat-status");
+  if (el) el.textContent = text;
+}
+
 async function fetchSatellite() {
   const res = await fetch429(RV_META_URL);
-  if (!res.ok) throw new Error(`rainviewer HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const json = await res.json();
   const frames = json.satellite?.infrared ?? [];
-  if (!frames.length) return;
+  if (!frames.length) { setSatStatus("no frames"); return; }
   const url = `${json.host}${frames[frames.length - 1].path}/256/{z}/{x}/{y}/0/0_0.png`;
   if (!satLayer) {
     satLayer = L.tileLayer(url, {
@@ -541,13 +555,18 @@ async function fetchSatellite() {
       maxZoom: 18,
       attribution: '<a href="https://www.rainviewer.com/">RainViewer</a>',
     }).addTo(map);
+    if (satLayer.on) {
+      satLayer.on("tileload", () => setSatStatus("live IR"));
+      satLayer.on("tileerror", () => setSatStatus("tiles failing"));
+    }
+    setSatStatus("loading tiles…");
   } else {
     satLayer.setUrl(url);
   }
 }
 
 function pollSatellite() {
-  fetchSatellite().catch(() => {});
+  fetchSatellite().catch((e) => setSatStatus(`unreachable (${e.message})`));
 }
 
 // Bilinear sample over a WGRID-shaped array (row 0 = north); null on NaN.
@@ -1487,20 +1506,21 @@ function startWind() {
 
   windParts = Array.from({ length: WIND_N }, () => spawnPart());
   const cosLat = Math.cos((1.35 * Math.PI) / 180);
-  let last = 0, tick = 0, wasReady = false;
+  let last = 0, tick = 0, spawnedFor = -1;
 
   // Until the anemometer set is in, the coverage mask is one small circle
   // around whichever station reported first — all 400 particles would swarm
   // it. Hold rendering until the archive lands (or enough stations join),
-  // then scatter the particles across the full coverage in one go.
+  // and re-scatter whenever the network grows meaningfully so the swarm
+  // can never persist.
   const windReady = () => windDayLoaded || windStations.size >= 8;
 
   function frame(ts) {
     requestAnimationFrame(frame);
     if (!windOn || document.hidden) { last = ts; return; }
     if (!windReady()) { last = ts; return; }
-    if (!wasReady) {
-      wasReady = true;
+    if (spawnedFor < 0 || windStations.size >= spawnedFor + 3) {
+      spawnedFor = windStations.size;
       windParts.forEach((p) => spawnPart(p));
     }
     if (ts - last < WIND_TICK_MS) return;
@@ -1649,7 +1669,11 @@ function loadHistCache() {
         });
       }
     }
-    if (c.wind?.length) windDayLoaded = true; // wind archive already covered
+    // Only trust the cached wind set if it's the full network — a cache
+    // saved during a rate-limited session can hold 1-2 stations, and
+    // marking the archive "done" then locks in the degraded set (particles
+    // swarm the one covered circle).
+    if ((c.wind?.length ?? 0) >= 8) windDayLoaded = true;
     return (c.stations ?? []).length > 0;
   } catch {
     return false;
