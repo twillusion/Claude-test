@@ -948,12 +948,28 @@ function selectStation(id) {
    brighter dash flowing along it. Deterministic full-map coverage (it cannot
    be invisible the way sparse particles can), low-key transparency, and the
    only animation is the slow dash drift. Toggled by the WIND button. */
-const WIND_SEED_PX = 34;  // grid spacing between streamline seeds
+const WIND_SEED_PX = 46;  // grid spacing between streamline seeds
 const WIND_STEPS = 8;     // integration steps per streamline
 const WIND_STEP_PX = 6.5; // pixels per step (line length ≈ steps × step)
 const WIND_FLOW_PX_S = 20; // dash drift speed along the line
+const WIND_COVER_KM = 12; // no streaks farther than this from a real sensor
 
-let windOn = true, windCanvas = null, windCtx = null, windLines = [];
+let windOn = true, windCanvas = null, windCtx = null, windLines = [], windHidden = false;
+
+// Streaks only where there's actual wind data nearby — the IDW field happily
+// extrapolates over Malaysia, but that's invention, not data.
+function windCovered(lat, lon) {
+  const pts = neaWind ||
+    [...stations.values()].filter((s) => s.kind === "nea" && Number.isFinite(s.lat));
+  if (!pts.length) return false;
+  const cosLat = Math.cos((1.35 * Math.PI) / 180);
+  for (const p of pts) {
+    const dx = (lon - p.lon) * cosLat * KM_PER_DEG;
+    const dy = (lat - p.lat) * KM_PER_DEG;
+    if (dx * dx + dy * dy < WIND_COVER_KM * WIND_COVER_KM) return true;
+  }
+  return false;
+}
 
 function rebuildStreamlines() {
   if (!windCtx || !map || !map.getSize) return;
@@ -962,6 +978,8 @@ function rebuildStreamlines() {
   const size = map.getSize();
   for (let y = WIND_SEED_PX / 2; y < size.y; y += WIND_SEED_PX) {
     for (let x = WIND_SEED_PX / 2; x < size.x; x += WIND_SEED_PX) {
+      const seed = map.containerPointToLatLng([x, y]);
+      if (!windCovered(seed.lat, seed.lng)) continue;
       const pts = [[x, y]];
       let px = x, py = y;
       let speedSum = 0;
@@ -1004,24 +1022,25 @@ function startWind() {
     rebuildStreamlines();
   };
   fit();
-  map.on("resize zoomend moveend", fit);
-  // seeds are in screen space; mid-pan frames would be misaligned
-  map.on("move zoomstart", () => windCtx.clearRect(0, 0, windCanvas.width, windCanvas.height));
+  // seeds live in screen space and can't follow the map mid-gesture, so the
+  // layer fades out during pan/zoom and fades back in once the view settles
+  map.on("movestart zoomstart", () => { windHidden = true; windCanvas.style.opacity = "0"; });
+  map.on("moveend zoomend resize", () => { fit(); windHidden = false; windCanvas.style.opacity = "1"; });
 
   let lastT = 0;
   function frame(ts) {
     requestAnimationFrame(frame);
-    if (!windOn || document.hidden || !windLines.length) return;
+    if (!windOn || windHidden || document.hidden || !windLines.length) return;
     if (ts - lastT < 33) return; // ~30fps is plenty for a slow drift
     lastT = ts;
     windCtx.clearRect(0, 0, windCanvas.width, windCanvas.height);
     // the static "vector map": faint hairlines everywhere
     windCtx.setLineDash([]);
-    windCtx.strokeStyle = "rgba(214, 233, 255, 0.13)";
+    windCtx.strokeStyle = "rgba(214, 233, 255, 0.09)";
     windCtx.lineWidth = 1;
     for (const l of windLines) { tracePath(windCtx, l.pts); windCtx.stroke(); }
     // flow: a brighter dash drifting along each line, faster in faster wind
-    windCtx.strokeStyle = "rgba(222, 240, 255, 0.38)";
+    windCtx.strokeStyle = "rgba(222, 240, 255, 0.28)";
     windCtx.lineWidth = 1.4;
     windCtx.lineCap = "round";
     windCtx.setLineDash([3, 17]);
