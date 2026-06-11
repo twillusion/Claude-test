@@ -165,7 +165,16 @@ async function fetchCommunity() {
     s.series.set(e.t, e.v);
     added++;
   }
+  const total = [...stations.values()].filter((s) => s.kind === "civ").length;
+  document.getElementById("civ-status").textContent =
+    total ? `${total} sensor${total > 1 ? "s" : ""}` : "none in range";
   if (added) { rebuild(); renderAll(); }
+}
+
+function pollCommunity() {
+  fetchCommunity().catch(() => {
+    document.getElementById("civ-status").textContent = "unreachable";
+  });
 }
 
 // ---------- Open-Meteo model grid ----------
@@ -256,6 +265,25 @@ function windVecAt(lat, lon) {
   const u = gridSample(windU, lat, lon);
   const v = gridSample(windV, lat, lon);
   return u == null || v == null ? null : { u, v };
+}
+
+// Island-average wind in the footer — doubles as a diagnostic that wind
+// data is actually flowing (shows "–" if the model has no wind field).
+const COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+  "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
+
+function renderWindStatus() {
+  const el = document.getElementById("wind-status");
+  if (!windU) { el.textContent = "–"; return; }
+  let su = 0, sv = 0, n = 0;
+  for (let i = 0; i < windU.length; i++) {
+    if (!Number.isNaN(windU[i]) && !Number.isNaN(windV[i])) { su += windU[i]; sv += windV[i]; n++; }
+  }
+  if (!n) { el.textContent = "–"; return; }
+  const u = su / n, v = sv / n;
+  const speed = Math.hypot(u, v);
+  const from = (Math.atan2(-u, -v) * 180 / Math.PI + 360) % 360;
+  el.textContent = `${speed.toFixed(0)} km/h from ${COMPASS[Math.round(from / 22.5) % 16]}`;
 }
 
 // Bilinear sample of a blended grid at a coordinate.
@@ -747,6 +775,7 @@ function renderAll() {
   renderDetail(values, t);
   renderOverlay(values, grid);
   renderTimebar(t);
+  renderWindStatus();
 }
 
 // Coalesce slider-drag renders to animation frames.
@@ -769,11 +798,11 @@ function selectStation(id) {
 // the map. Particles live in geographic space and are re-projected every
 // frame, so panning and zooming stay correct; trails fade via destination-out.
 // ~170 particles is far cheaper than one overlay rasterization per frame.
-const WIND_N = 170;
+const WIND_N = 150;
 // visual exaggeration: °lat per second per km/h. Too low and per-frame
 // segments go sub-pixel — the fade erases them before they read as streaks.
-const WIND_DEG_PER_S = 0.0028;
-const WIND_LOOKAHEAD_S = 0.07; // segment length: a beat ahead of the particle
+const WIND_DEG_PER_S = 0.004;
+const WIND_LOOKAHEAD_S = 0.12; // segment length: a beat ahead of the particle
 
 function startWind() {
   if (typeof window === "undefined") return;
@@ -807,11 +836,12 @@ function startWind() {
     last = ts;
 
     ctx.globalCompositeOperation = "destination-out";
-    ctx.fillStyle = "rgba(0,0,0,0.05)";
+    ctx.fillStyle = "rgba(0,0,0,0.04)";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.globalCompositeOperation = "source-over";
-    ctx.strokeStyle = "rgba(214, 233, 255, 0.55)";
-    ctx.lineWidth = 1.3;
+    ctx.strokeStyle = "rgba(220, 237, 255, 0.7)";
+    ctx.lineWidth = 2;
+    ctx.lineCap = "round";
     ctx.beginPath();
     for (const p of parts) {
       const w = windVecAt(p.lat, p.lon);
@@ -938,10 +968,10 @@ document.getElementById("live-btn").addEventListener("click", () => {
 
 initMap();
 startWind();
-refresh().then(loadHistory).then(() => fetchCommunity().catch(() => {}));
+refresh().then(loadHistory).then(pollCommunity);
 refreshModel();
 setInterval(refresh, POLL_MS);
 setInterval(refreshModel, MODEL_REFRESH_MS);
 setInterval(tickStatus, 1000);
-setInterval(() => fetchCommunity().catch(() => {}), CIV_POLL_MS);
+setInterval(pollCommunity, CIV_POLL_MS);
 setInterval(renderLive, 1500); // live numbers drift slightly between polls
