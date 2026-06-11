@@ -28,6 +28,11 @@
   <main class="layout">
     <div class="map-wrap">
       <div id="map" aria-label="Map of Singapore weather stations"></div>
+      <div class="legend" title="Colour scale, normalized to the temperatures currently shown">
+        <span id="legend-lo">–</span>
+        <div class="legend-bar"></div>
+        <span id="legend-hi">–</span>
+      </div>
       <div class="timebar">
         <button id="live-btn" title="Jump to latest reading">LIVE</button>
         <input type="range" id="time-slider" min="0" max="0" step="1" value="0"

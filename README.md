@@ -14,6 +14,10 @@ static page, no backend, no hosting costs.
   (the API returns a whole calendar day per request), then polls for the
   latest reading every minute. History older than 24 hours is dropped
   client-side — the API is the database, so nothing is stored in this repo.
+- Colours are normalized to the temperatures currently on screen (the legend
+  shows what the ramp endpoints mean at that moment), with a minimum 2°C
+  span so sensor noise can't masquerade as contrast. The map is locked to
+  the data window: panning is bounded and you can't zoom out past Singapore.
 - The map shading (light blue = cool, orange = hot) blends two sources: a
   ~5 km grid of hourly 2m-temperature from the
   [Open-Meteo](https://open-meteo.com) forecast API (free, CC-BY, no key)

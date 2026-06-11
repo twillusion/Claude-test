@@ -220,26 +220,42 @@ function fieldAt(lat, lon, grid, residuals) {
 
 // ---------- temperature colour scale (light blue = cool -> orange = hot) ----------
 
-const SCALE = [
-  [25, [124, 199, 255]],
-  [30, [255, 224, 138]],
-  [35, [255, 122, 26]],
-];
+// The ramp is normalized each render to the temperatures actually on screen,
+// so the full blue->orange range is always in use (the legend shows what the
+// endpoints currently mean). MIN_SPAN stops sensor noise from exploding into
+// rainbow colours when the island is uniformly warm.
+const RAMP = [[124, 199, 255], [255, 224, 138], [255, 122, 26]];
+const MIN_SPAN = 2;
+let scaleLo = 25, scaleHi = 35;
 
 function tempRGB(v) {
-  if (v <= SCALE[0][0]) return SCALE[0][1];
-  for (let i = 1; i < SCALE.length; i++) {
-    if (v <= SCALE[i][0]) {
-      const [t0, c0] = SCALE[i - 1], [t1, c1] = SCALE[i];
-      const f = (v - t0) / (t1 - t0);
-      return c0.map((c, k) => Math.round(c + (c1[k] - c) * f));
-    }
-  }
-  return SCALE[SCALE.length - 1][1];
+  const f = Math.min(1, Math.max(0, (v - scaleLo) / (scaleHi - scaleLo || 1)));
+  const pos = f * (RAMP.length - 1);
+  const i = Math.min(RAMP.length - 2, Math.floor(pos));
+  const t = pos - i;
+  return RAMP[i].map((c, k) => Math.round(c + (RAMP[i + 1][k] - c) * t));
 }
 
 function tempColor(v) {
   return `rgb(${tempRGB(v).join(",")})`;
+}
+
+function updateScale(values, grid) {
+  let lo = Infinity, hi = -Infinity;
+  for (const v of values.values()) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  if (grid) for (const g of grid) {
+    if (!Number.isNaN(g)) { if (g < lo) lo = g; if (g > hi) hi = g; }
+  }
+  if (!Number.isFinite(lo)) return;
+  if (hi - lo < MIN_SPAN) {
+    const mid = (hi + lo) / 2;
+    lo = mid - MIN_SPAN / 2;
+    hi = mid + MIN_SPAN / 2;
+  }
+  scaleLo = lo;
+  scaleHi = hi;
+  document.getElementById("legend-lo").textContent = fmt(lo);
+  document.getElementById("legend-hi").textContent = fmt(hi);
 }
 
 // ---------- data flow ----------
@@ -434,11 +450,10 @@ function renderDetail(values, t) {
    model field corrected by nearby station residuals (smooth everywhere, exact
    at the sensors). Without it, falls back to station-only IDW with alpha
    fading away from stations, since values far from any sensor are guesswork. */
-function renderOverlay(values, t) {
+function renderOverlay(values, grid) {
   const pts = [...stations.values()]
     .filter((s) => values.has(s.id) && Number.isFinite(s.lat) && Number.isFinite(s.lon))
     .map((s) => ({ lat: s.lat, lon: s.lon, v: values.get(s.id) }));
-  const grid = buildBlendedGrid(t ?? Date.now());
   if (!grid && pts.length < 3) return;
   const residuals = grid ? computeResiduals(pts, grid) : [];
 
@@ -514,11 +529,13 @@ function renderTimebar(t) {
 function renderAll() {
   const t = displayedTime();
   const values = displayedValues(t);
+  const grid = buildBlendedGrid(t ?? Date.now());
+  updateScale(values, grid); // normalize colours before anything draws
   for (const s of stations.values()) renderMarker(s, values.get(s.id));
   renderList(values);
   renderSummary(values);
   renderDetail(values, t);
-  renderOverlay(values, t);
+  renderOverlay(values, grid);
   renderTimebar(t);
 }
 
@@ -583,7 +600,16 @@ async function loadHistory() {
 // ---------- init ----------
 
 function initMap() {
-  map = L.map("map", { zoomControl: true }).setView([1.3521, 103.8198], 12);
+  const dataBounds = L.latLngBounds(
+    [OVERLAY.latMin, OVERLAY.lonMin], [OVERLAY.latMax, OVERLAY.lonMax]);
+  map = L.map("map", {
+    zoomControl: true,
+    maxBounds: dataBounds.pad(0.05),
+    maxBoundsViscosity: 1.0, // hard wall when panning
+  });
+  map.fitBounds(dataBounds);
+  // can't zoom out past the point where the data window fills the screen
+  map.setMinZoom(map.getBoundsZoom(dataBounds));
   L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
     maxZoom: 18,

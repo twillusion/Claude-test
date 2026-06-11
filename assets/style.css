@@ -54,6 +54,29 @@ body { display: flex; flex-direction: column; }
 
 #map { flex: 1; min-height: 0; background: #0a0e18; }
 
+.legend {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 800;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.3rem 0.6rem;
+  background: rgba(22, 29, 46, 0.92);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.7rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.legend-bar {
+  width: 84px;
+  height: 8px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, rgb(124, 199, 255), rgb(255, 224, 138), rgb(255, 122, 26));
+}
+
 .timebar {
   position: absolute;
   left: 50%;
