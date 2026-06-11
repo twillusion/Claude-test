@@ -1306,11 +1306,22 @@ function startWind() {
 
   windParts = Array.from({ length: WIND_N }, () => spawnPart());
   const cosLat = Math.cos((1.35 * Math.PI) / 180);
-  let last = 0, tick = 0;
+  let last = 0, tick = 0, wasReady = false;
+
+  // Until the anemometer set is in, the coverage mask is one small circle
+  // around whichever station reported first — all 400 particles would swarm
+  // it. Hold rendering until the archive lands (or enough stations join),
+  // then scatter the particles across the full coverage in one go.
+  const windReady = () => windDayLoaded || windStations.size >= 8;
 
   function frame(ts) {
     requestAnimationFrame(frame);
     if (!windOn || document.hidden) { last = ts; return; }
+    if (!windReady()) { last = ts; return; }
+    if (!wasReady) {
+      wasReady = true;
+      windParts.forEach((p) => spawnPart(p));
+    }
     if (ts - last < WIND_TICK_MS) return;
     const dt = Math.min(0.1, (ts - last) / 1000);
     last = ts;
