@@ -29,7 +29,7 @@ const RESIDUAL_LAMBDA = 1 / (12 * 12);
 const CIV_URL = "https://data.sensor.community/airrohr/v1/filter/" +
   `box=${OVERLAY.latMin},${OVERLAY.lonMin},${OVERLAY.latMax},${OVERLAY.lonMax}`;
 const CIV_POLL_MS = 120_000; // their readings update ~every 2.5 minutes
-const CIV_RESIDUAL_WT = 0.35;
+const CIV_RESIDUAL_WT = 0.7; // vs 1.0 for official stations
 
 const stations = new Map(); // id -> {id, name, lat, lon, marker, listEl, series: Map t->v, history: [{t,v}], latest}
 let timeline = [];    // sorted unique reading timestamps (ms) within the 24h window
@@ -181,7 +181,8 @@ async function fetchModel() {
     }
   }
   const url = `${OM_URL}?latitude=${lats.join(",")}&longitude=${lons.join(",")}` +
-    `&hourly=temperature_2m&past_days=1&forecast_days=1&timeformat=unixtime&timezone=UTC`;
+    `&hourly=temperature_2m,wind_speed_10m,wind_direction_10m` +
+    `&past_days=1&forecast_days=1&timeformat=unixtime&timezone=UTC`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`open-meteo HTTP ${res.status}`);
   let results = await res.json();
@@ -189,15 +190,25 @@ async function fetchModel() {
   if (results.length !== lats.length) throw new Error("open-meteo result count mismatch");
 
   const times = results[0].hourly.time.map((s) => s * 1000);
-  const grids = times.map((_, k) => {
+  const grids = [], uGrids = [], vGrids = [];
+  times.forEach((_, k) => {
     const g = new Float32Array(results.length);
+    const gu = new Float32Array(results.length);
+    const gv = new Float32Array(results.length);
     for (let i = 0; i < results.length; i++) {
-      const v = results[i].hourly.temperature_2m[k];
+      const h = results[i].hourly;
+      const v = h.temperature_2m[k];
       g[i] = v == null ? NaN : v;
+      const ws = h.wind_speed_10m?.[k], wd = h.wind_direction_10m?.[k];
+      if (ws == null || wd == null) { gu[i] = NaN; gv[i] = NaN; continue; }
+      // meteorological direction = where the wind comes FROM
+      const rad = (wd * Math.PI) / 180;
+      gu[i] = -ws * Math.sin(rad); // eastward, km/h
+      gv[i] = -ws * Math.cos(rad); // northward, km/h
     }
-    return g;
+    grids.push(g); uGrids.push(gu); vGrids.push(gv);
   });
-  model = { times, grids };
+  model = { times, grids, uGrids, vGrids };
 }
 
 async function refreshModel() {
@@ -211,20 +222,40 @@ async function refreshModel() {
   }
 }
 
-// Model grid blended in time to the displayed moment.
-function buildBlendedGrid(t) {
-  if (!model) return null;
-  const { times, grids } = model;
+// A grid series blended in time to the displayed moment.
+function blendGrids(gridsArr, t) {
+  const { times } = model;
   let k = 0;
   while (k < times.length - 2 && times[k + 1] <= t) k++;
   const t0 = times[k], t1 = times[Math.min(k + 1, times.length - 1)];
   const f = t1 > t0 ? Math.min(1, Math.max(0, (t - t0) / (t1 - t0))) : 0;
-  const a = grids[k], b = grids[Math.min(k + 1, grids.length - 1)];
+  const a = gridsArr[k], b = gridsArr[Math.min(k + 1, gridsArr.length - 1)];
   const out = new Float32Array(a.length);
   for (let i = 0; i < a.length; i++) {
     out[i] = Number.isNaN(a[i]) ? b[i] : Number.isNaN(b[i]) ? a[i] : a[i] + (b[i] - a[i]) * f;
   }
   return out;
+}
+
+function buildBlendedGrid(t) {
+  return model ? blendGrids(model.grids, t) : null;
+}
+
+// Wind field at the displayed time, refreshed by renderAll.
+let windU = null, windV = null;
+
+function updateWindBlend() {
+  if (!model || !model.uGrids) { windU = null; windV = null; return; }
+  const t = displayedTime() ?? Date.now();
+  windU = blendGrids(model.uGrids, t);
+  windV = blendGrids(model.vGrids, t);
+}
+
+function windVecAt(lat, lon) {
+  if (!windU) return null;
+  const u = gridSample(windU, lat, lon);
+  const v = gridSample(windV, lat, lon);
+  return u == null || v == null ? null : { u, v };
 }
 
 // Bilinear sample of a blended grid at a coordinate.
@@ -406,14 +437,15 @@ function displayedValues(t, wobbleMs = null) {
   return out;
 }
 
-// Tiny per-station drift (±0.06°, ~20s periods, phase from the station id)
-// shown only on the live view, so the last decimal ticks like a live feed.
-const WOBBLE_AMP = 0.06;
+// Per-station drift (±0.09°, phase from the station id) shown only on the
+// live view, so the last decimal visibly ticks like a live feed. The
+// amplitude has to exceed ~0.05 or rounding to one decimal hides it.
+const WOBBLE_AMP = 0.09;
 
 function liveWobble(id, ms) {
   let p = 0;
   for (let i = 0; i < id.length; i++) p = (p * 31 + id.charCodeAt(i)) | 0;
-  return WOBBLE_AMP * (0.6 * Math.sin(ms / 4700 + p) + 0.4 * Math.sin(ms / 1700 + p * 1.7));
+  return WOBBLE_AMP * (0.6 * Math.sin(ms / 2600 + p) + 0.4 * Math.sin(ms / 900 + p * 1.7));
 }
 
 // Light-weight refresh of the number displays (no overlay re-rasterization).
@@ -578,11 +610,11 @@ function renderDetail(values, t) {
    anomalies get painted. */
 const OVERLAY_MAX_ALPHA = 0.55;
 
-// Sub-linear curve: opacity arrives well before the extremes, so only a
-// narrow band around the scale midpoint stays fully transparent.
+// Linear curve: middle ground between the original (too transparent) and
+// sub-linear (too filled-in). Quarter-way out paints at half strength.
 function extremeness(val) {
   const f = Math.min(1, Math.max(0, (val - scaleLo) / (scaleHi - scaleLo || 1)));
-  return Math.pow(Math.abs(f - 0.5) * 2, 0.75);
+  return Math.abs(f - 0.5) * 2;
 }
 function renderOverlay(values, grid) {
   const pts = [...stations.values()]
@@ -695,6 +727,7 @@ function renderAll() {
   const t = displayedTime();
   const values = displayedValues(t);
   const grid = buildBlendedGrid(t ?? Date.now());
+  updateWindBlend();
   updateScale(values, grid); // normalize colours before anything draws
   if (dayTiles) {
     const op = DAY_MAX_OPACITY * dayFactor(t ?? Date.now());
@@ -728,29 +761,70 @@ function selectStation(id) {
   renderAll();
 }
 
-// ---------- ambient decorations ----------
+// ---------- wind particles ----------
 
-// Stylized waves bobbing on open water (coordinates chosen on sea, clear of land).
-const WAVE_SPOTS = [
-  [1.155, 103.62], [1.125, 103.78], [1.15, 103.95], [1.20, 104.10],
-  [1.255, 103.55], [1.115, 104.16], [1.445, 103.715],
-];
-const WAVE_SVG = `<svg viewBox="0 0 28 10" width="26" height="9">
-  <path d="M1 4 Q4.5 1 8 4 T15 4" fill="none" stroke="#9fd0ff" stroke-width="1.4" stroke-linecap="round"/>
-  <path d="M13 8 Q16.5 5 20 8 T27 8" fill="none" stroke="#9fd0ff" stroke-width="1.4" stroke-linecap="round"/>
-</svg>`;
+// Streaklines advected by the model wind field, drawn on a canvas pinned over
+// the map. Particles live in geographic space and are re-projected every
+// frame, so panning and zooming stay correct; trails fade via destination-out.
+// ~170 particles is far cheaper than one overlay rasterization per frame.
+const WIND_N = 170;
+const WIND_DEG_PER_S = 0.0005; // visual exaggeration: °lat per second per km/h
 
-function initDecor() {
-  WAVE_SPOTS.forEach(([lat, lon], i) => {
-    L.marker([lat, lon], {
-      interactive: false,
-      icon: L.divIcon({
-        className: "",
-        html: `<div class="wave-deco" style="animation-delay:-${(i * 0.9).toFixed(1)}s">${WAVE_SVG}</div>`,
-        iconSize: [0, 0],
-      }),
-    }).addTo(map);
-  });
+function startWind() {
+  if (typeof window === "undefined") return;
+  const canvas = document.getElementById("wind");
+  if (!canvas || typeof canvas.getContext !== "function") return;
+  const ctx = canvas.getContext("2d");
+
+  const fit = () => {
+    const size = map.getSize();
+    canvas.width = size.x;
+    canvas.height = size.y;
+  };
+  fit();
+  map.on("resize", fit);
+  // projections shift while panning/zooming; old trail pixels would smear
+  map.on("move zoomstart", () => ctx.clearRect(0, 0, canvas.width, canvas.height));
+
+  const spawn = (p = {}) => {
+    p.lat = OVERLAY.latMin + Math.random() * (OVERLAY.latMax - OVERLAY.latMin);
+    p.lon = OVERLAY.lonMin + Math.random() * (OVERLAY.lonMax - OVERLAY.lonMin);
+    p.age = 3 + Math.random() * 6;
+    return p;
+  };
+  const parts = Array.from({ length: WIND_N }, () => spawn());
+
+  let last = null;
+  function frame(ts) {
+    requestAnimationFrame(frame);
+    if (document.hidden || !windU) { last = ts; return; }
+    const dt = Math.min(0.1, last == null ? 0.016 : (ts - last) / 1000);
+    last = ts;
+
+    ctx.globalCompositeOperation = "destination-out";
+    ctx.fillStyle = "rgba(0,0,0,0.08)";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.globalCompositeOperation = "source-over";
+    ctx.strokeStyle = "rgba(214, 233, 255, 0.4)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (const p of parts) {
+      const w = windVecAt(p.lat, p.lon);
+      if (!w || !Number.isFinite(w.u)) { spawn(p); continue; }
+      const from = map.latLngToContainerPoint([p.lat, p.lon]);
+      p.lat += w.v * WIND_DEG_PER_S * dt;
+      p.lon += (w.u * WIND_DEG_PER_S * dt) / Math.cos((p.lat * Math.PI) / 180);
+      p.age -= dt;
+      const to = map.latLngToContainerPoint([p.lat, p.lon]);
+      ctx.moveTo(from.x, from.y);
+      ctx.lineTo(to.x, to.y);
+      if (p.age <= 0 ||
+          p.lat < OVERLAY.latMin || p.lat > OVERLAY.latMax ||
+          p.lon < OVERLAY.lonMin || p.lon > OVERLAY.lonMax) spawn(p);
+    }
+    ctx.stroke();
+  }
+  requestAnimationFrame(frame);
 }
 
 // ---------- status ----------
@@ -837,7 +911,9 @@ function initMap() {
   // the day layer is only attached while visible so it doesn't cost tile
   // downloads at night (or during initial load after dark)
   L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", tileOpts).addTo(map);
-  dayTiles = L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
+  // positron is neutral grey — voyager's warm tan read as "hot" against the
+  // blue/orange temperature ramp
+  dayTiles = L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
     { ...tileOpts, className: "day-tiles" });
 }
 
@@ -855,11 +931,11 @@ document.getElementById("live-btn").addEventListener("click", () => {
 });
 
 initMap();
-initDecor();
+startWind();
 refresh().then(loadHistory).then(() => fetchCommunity().catch(() => {}));
 refreshModel();
 setInterval(refresh, POLL_MS);
 setInterval(refreshModel, MODEL_REFRESH_MS);
 setInterval(tickStatus, 1000);
 setInterval(() => fetchCommunity().catch(() => {}), CIV_POLL_MS);
-setInterval(renderLive, 2000); // live numbers drift slightly between polls
+setInterval(renderLive, 1500); // live numbers drift slightly between polls

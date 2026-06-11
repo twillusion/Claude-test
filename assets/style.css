@@ -130,16 +130,12 @@ body { display: flex; flex-direction: column; }
   50% { box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5), 0 0 10px 2px var(--pill); }
 }
 
-/* ambient decorations */
-.wave-deco {
-  transform: translate(-50%, -50%);
-  animation: wave-bob 5s ease-in-out infinite;
+/* wind streaklines: above tiles and shading (z 200/400), below markers (600) */
+#wind {
+  position: absolute;
+  inset: 0;
+  z-index: 450;
   pointer-events: none;
-}
-
-@keyframes wave-bob {
-  0%, 100% { opacity: 0.3; translate: 0 0; }
-  50% { opacity: 0.55; translate: 0 -2px; }
 }
 
 
@@ -248,8 +244,9 @@ body { display: flex; flex-direction: column; }
 
 .leaflet-container { font: inherit; }
 
-/* day basemap is dimmed so daylight doesn't wash out the overlay */
-.day-tiles { filter: brightness(0.72) saturate(0.8); }
+/* day basemap is dimmed and desaturated so daylight doesn't wash out the
+   overlay or pull toward the temperature ramp's colours */
+.day-tiles { filter: brightness(0.78) saturate(0.4); }
 
 @media (max-width: 760px) {
   .layout { flex-direction: column; }

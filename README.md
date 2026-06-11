@@ -32,15 +32,19 @@ static page, no backend, no hosting costs.
   newest reading. Displayed series use a centered 15-minute rolling mean so
   per-minute sensor jitter doesn't flash colours while scrubbing, and the
   colour scale eases toward its target rather than jumping.
-- The basemap follows the sun: a dimmed day layer (45% opacity cap plus a
-  brightness filter) crossfades over the night layer through two-hour
-  dawn/dusk ramps at the displayed time, with a sun/moon icon next to the
-  clock.
-- Ambient touches: stylized waves bob on open water, and on the live view
-  each station's displayed value drifts by up to ±0.06° on ~20-second
-  cycles, so the numbers tick like a real-time feed between the actual
-  per-minute polls. Only the number displays refresh (no overlay
-  re-rasterization), and it pauses when the tab is hidden.
+- The basemap follows the sun: a dimmed neutral-grey day layer (45%
+  opacity cap plus brightness/saturation filters, chosen so it doesn't
+  share hues with the temperature ramp) crossfades over the night layer
+  through two-hour dawn/dusk ramps at the displayed time, with a sun/moon
+  icon next to the clock.
+- Wind streaklines: ~170 particles advected by the Open-Meteo wind field
+  (fetched in the same request as temperature) drift across the map with
+  fading trails, and follow the time scrubber. Particles live in
+  geographic space and re-project each frame, so pan/zoom stay correct.
+- On the live view each station's displayed value drifts by up to ±0.09°
+  so the numbers tick like a real-time feed between the actual per-minute
+  polls. Only the number displays refresh (no overlay re-rasterization),
+  and it pauses when the tab is hidden.
 - Citizen sensors from [Sensor.Community](https://sensor.community) (open
   API, no key) appear as smaller dashed pills and sharpen the shading via
   reduced-weight residuals. They're sanity-filtered (range check, plus a
