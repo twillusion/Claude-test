@@ -156,6 +156,13 @@ body { display: flex; flex-direction: column; }
   flex-direction: column;
 }
 
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-right: 1rem;
+}
+
 .panel-title {
   font-size: 0.8rem;
   text-transform: uppercase;
@@ -165,6 +172,26 @@ body { display: flex; flex-direction: column; }
   padding: 0.8rem 1rem 0.4rem;
 }
 .panel-title span { font-weight: 400; }
+
+#list-filter {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.7rem;
+  padding: 2px 4px;
+}
+
+.wind-row .wind-row-arrow {
+  display: inline-block;
+  color: var(--accent);
+  font-size: 0.7rem;
+  width: 70px;
+  text-align: center;
+  flex-shrink: 0;
+}
+.wind-row .wind-speed { color: var(--accent); font-weight: 600; }
+.civ-row .station-name { color: var(--muted); }
 
 #station-list { list-style: none; margin: 0; padding: 0 0 0.5rem; }
 

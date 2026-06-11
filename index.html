@@ -60,7 +60,15 @@
       </section>
 
       <section class="stations">
-        <h2 class="panel-title">Stations <span id="station-count"></span></h2>
+        <div class="panel-head">
+          <h2 class="panel-title">Stations <span id="station-count"></span></h2>
+          <select id="list-filter" aria-label="Filter station list">
+            <option value="all">All</option>
+            <option value="temp">Temperature</option>
+            <option value="wind">Wind</option>
+            <option value="civ">Community</option>
+          </select>
+        </div>
         <ul id="station-list"></ul>
       </section>
     </aside>

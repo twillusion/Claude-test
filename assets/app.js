@@ -384,15 +384,17 @@ function renderWindPins() {
 }
 
 async function fetchWind() {
-  // The latest 1-minute snapshot is often sparse (stations report at
-  // different cadences); top up from a 10-minute-old snapshot if needed.
+  // The 1-minute snapshots are sparse (stations report on different
+  // cadences) — NEA runs ~14 anemometers but any single minute may carry
+  // only a couple. Merge progressively older snapshots (newest reading per
+  // station wins) until the set fills out.
   const snaps = [await fetchWindAt()];
   let out = joinWind(snaps);
-  if (out.length < 4) {
+  for (let back = 5; back <= 20 && out.length < 10; back += 5) {
     try {
-      snaps.push(await fetchWindAt(new Date(Date.now() - 10 * 60_000)));
+      snaps.push(await fetchWindAt(new Date(Date.now() - back * 60_000)));
       out = joinWind(snaps);
-    } catch { /* keep what we have */ }
+    } catch { break; }
   }
   neaWind = out.length ? out : null;
   renderWindStatus();
@@ -736,38 +738,94 @@ function sparkPoints(history, w, h, pad = 2, maxPts = 240) {
   }).join(" ");
 }
 
+let listFilter = "all";
+const windListEls = new Map();
+let lastListRows = new Set();
+
+function tempRow(s, values) {
+  if (!s.listEl) {
+    s.listEl = document.createElement("li");
+    s.listEl.innerHTML = `
+      <span class="station-name"></span>
+      <svg class="station-spark" viewBox="0 0 70 24" preserveAspectRatio="none"><polyline points=""/></svg>
+      <span class="station-temp"></span>`;
+    s.listEl.addEventListener("click", () => selectStation(s.id));
+  }
+  const v = values.get(s.id);
+  s.listEl.querySelector(".station-name").textContent = s.name;
+  const temp = s.listEl.querySelector(".station-temp");
+  temp.textContent = fmt(v);
+  temp.style.color = tempColor(v);
+  const line = s.listEl.querySelector("polyline");
+  const pts = sparkPoints(s.history, 70, 24, 2, 120);
+  if (pts) {
+    line.setAttribute("points", pts);
+    line.setAttribute("stroke", tempColor(v));
+  }
+  s.listEl.classList.toggle("selected", s.id === selectedId);
+  return s.listEl;
+}
+
+function windRow(p) {
+  let el = windListEls.get(p.id);
+  if (!el) {
+    el = document.createElement("li");
+    el.className = "wind-row";
+    el.innerHTML = `
+      <span class="station-name"></span>
+      <span class="wind-row-arrow">▲</span>
+      <span class="station-temp wind-speed"></span>`;
+    el.addEventListener("click", () => { if (map && map.panTo) map.panTo([p.lat, p.lon]); });
+    windListEls.set(p.id, el);
+  }
+  const kmh = Math.hypot(p.u, p.v);
+  const toward = (Math.atan2(p.u, p.v) * 180 / Math.PI + 360) % 360;
+  el.querySelector(".station-name").textContent = p.name;
+  el.querySelector(".wind-row-arrow").style.transform = `rotate(${toward.toFixed(0)}deg)`;
+  el.querySelector(".wind-speed").textContent = `${kmh.toFixed(0)} km/h`;
+  return el;
+}
+
+function civRow(s, values) {
+  if (!s.listEl) {
+    s.listEl = document.createElement("li");
+    s.listEl.className = "civ-row";
+    s.listEl.innerHTML = `<span class="station-name"></span><span class="station-temp"></span>`;
+    s.listEl.addEventListener("click", () => selectStation(s.id));
+  }
+  const v = values.get(s.id);
+  s.listEl.querySelector(".station-name").textContent = s.name;
+  const temp = s.listEl.querySelector(".station-temp");
+  temp.textContent = fmt(v);
+  temp.style.color = tempColor(v);
+  s.listEl.classList.toggle("selected", s.id === selectedId);
+  return s.listEl;
+}
+
 function renderList(values) {
   const ul = document.getElementById("station-list");
-  const sorted = [...stations.values()]
-    .filter((s) => s.kind === "nea" && values.has(s.id))
-    .sort((a, b) => values.get(b.id) - values.get(a.id));
-  const civCount = [...stations.values()].filter((s) => s.kind === "civ" && values.has(s.id)).length;
-  document.getElementById("station-count").textContent =
-    civCount ? `(${sorted.length} + ${civCount} community)` : `(${sorted.length})`;
-
-  for (const s of sorted) {
-    if (!s.listEl) {
-      s.listEl = document.createElement("li");
-      s.listEl.innerHTML = `
-        <span class="station-name"></span>
-        <svg class="station-spark" viewBox="0 0 70 24" preserveAspectRatio="none"><polyline points=""/></svg>
-        <span class="station-temp"></span>`;
-      s.listEl.addEventListener("click", () => selectStation(s.id));
-    }
-    const v = values.get(s.id);
-    s.listEl.querySelector(".station-name").textContent = s.name;
-    const temp = s.listEl.querySelector(".station-temp");
-    temp.textContent = fmt(v);
-    temp.style.color = tempColor(v);
-    const line = s.listEl.querySelector("polyline");
-    const pts = sparkPoints(s.history, 70, 24, 2, 120);
-    if (pts) {
-      line.setAttribute("points", pts);
-      line.setAttribute("stroke", tempColor(v));
-    }
-    s.listEl.classList.toggle("selected", s.id === selectedId);
-    ul.appendChild(s.listEl); // re-appending keeps the list in sorted order
+  const rows = [];
+  if (listFilter === "all" || listFilter === "temp") {
+    const temp = [...stations.values()]
+      .filter((s) => s.kind === "nea" && values.has(s.id))
+      .sort((a, b) => values.get(b.id) - values.get(a.id));
+    for (const s of temp) rows.push(tempRow(s, values));
   }
+  if (listFilter === "all" || listFilter === "wind") {
+    const wind = (neaWind ?? []).slice().sort((a, b) => (a.name < b.name ? -1 : 1));
+    for (const p of wind) rows.push(windRow(p));
+  }
+  if (listFilter === "all" || listFilter === "civ") {
+    const civ = [...stations.values()].filter((s) => s.kind === "civ" && values.has(s.id));
+    for (const s of civ) rows.push(civRow(s, values));
+  }
+  document.getElementById("station-count").textContent = `(${rows.length})`;
+  const current = new Set(rows);
+  for (const el of lastListRows) {
+    if (!current.has(el) && el.remove) el.remove(); // filtered out since last render
+  }
+  lastListRows = current;
+  for (const el of rows) ul.appendChild(el); // re-appending keeps order
 }
 
 // Headline stats stay official-only so one sun-baked balcony sensor can't
@@ -987,7 +1045,7 @@ const WIND_DEG_PER_S = 0.0018; // visual exaggeration: °lat per second per km/h
 const WIND_AGE_S = [8, 20];    // particle lifetime range
 const WIND_COVER_KM = 12;      // no particles farther than this from a real sensor
 
-let windOn = true, windCanvas = null, windCtx = null, windHidden = false;
+let windOn = true, windCanvas = null, windCtx = null;
 let windParts = [];
 
 // Particles only where there's actual wind data nearby — the IDW field happily
@@ -1035,10 +1093,9 @@ function startWind() {
     windCanvas.height = size.y;
   };
   fit();
-  // tails are geographic and redraw every frame, so panning needs no special
-  // handling; only the zoom animation gets a fade while projections settle
-  map.on("zoomstart", () => { windHidden = true; windCanvas.style.opacity = "0"; });
-  map.on("zoomend resize", () => { fit(); windHidden = false; windCanvas.style.opacity = "1"; });
+  // tails are geographic and redraw every frame, so pan/zoom need no
+  // special handling beyond keeping the canvas sized to the container
+  map.on("resize", fit);
 
   windParts = Array.from({ length: WIND_N }, () => spawnPart());
   const cosLat = Math.cos((1.35 * Math.PI) / 180);
@@ -1046,7 +1103,7 @@ function startWind() {
 
   function frame(ts) {
     requestAnimationFrame(frame);
-    if (!windOn || windHidden || document.hidden) { last = ts; return; }
+    if (!windOn || document.hidden) { last = ts; return; }
     if (ts - last < WIND_TICK_MS) return;
     const dt = Math.min(0.1, (ts - last) / 1000);
     last = ts;
@@ -1198,6 +1255,17 @@ document.getElementById("time-slider").addEventListener("input", (e) => {
 
 document.getElementById("live-btn").addEventListener("click", () => {
   displayedT = null;
+  renderAll();
+});
+
+const filterSel = document.getElementById("list-filter");
+try {
+  listFilter = localStorage.getItem("sgtemp-filter") || "all";
+  filterSel.value = listFilter;
+} catch { /* default */ }
+filterSel.addEventListener("change", () => {
+  listFilter = filterSel.value;
+  try { localStorage.setItem("sgtemp-filter", listFilter); } catch { /* fine */ }
   renderAll();
 });
 
