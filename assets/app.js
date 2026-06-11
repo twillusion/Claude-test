@@ -320,26 +320,51 @@ function updateWindBlend() {
 // Open-Meteo field when it's available.
 let neaWind = null; // [{lat, lon, u, v}] in km/h
 
-async function fetchWind() {
-  const [spd, dir] = await Promise.all([WIND_SPEED_URL, WIND_DIR_URL].map(async (url) => {
+async function fetchWindAt(dt) {
+  const q = dt ? `?date_time=${encodeURIComponent(sgtStamp(dt))}` : "";
+  const [spd, dir] = await Promise.all([WIND_SPEED_URL + q, WIND_DIR_URL + q].map(async (url) => {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`wind HTTP ${res.status}`);
     return res.json();
   }));
   const locs = new Map();
   for (const s of [...spd.metadata.stations, ...dir.metadata.stations]) locs.set(s.id, s.location);
-  const speeds = new Map(spd.items[0].readings.map((r) => [r.station_id, r.value]));
-  const out = [];
-  for (const r of dir.items[0].readings) {
-    const kn = speeds.get(r.station_id);
-    const loc = locs.get(r.station_id);
-    if (kn == null || !loc) continue;
-    const kmh = kn * KNOTS_TO_KMH;
-    const rad = (r.value * Math.PI) / 180; // direction the wind comes FROM
-    out.push({ lat: loc.latitude, lon: loc.longitude, u: -kmh * Math.sin(rad), v: -kmh * Math.cos(rad) });
+  return {
+    locs,
+    speeds: new Map(spd.items[0].readings.map((r) => [r.station_id, r.value])),
+    dirs: new Map(dir.items[0].readings.map((r) => [r.station_id, r.value])),
+  };
+}
+
+function joinWind(snaps) {
+  const merged = new Map();
+  for (const s of snaps) {
+    for (const [id, kn] of s.speeds) {
+      const deg = s.dirs.get(id);
+      const loc = s.locs.get(id);
+      if (kn == null || deg == null || !loc || merged.has(id)) continue;
+      const kmh = kn * KNOTS_TO_KMH;
+      const rad = (deg * Math.PI) / 180; // direction the wind comes FROM
+      merged.set(id, { lat: loc.latitude, lon: loc.longitude, u: -kmh * Math.sin(rad), v: -kmh * Math.cos(rad) });
+    }
+  }
+  return [...merged.values()];
+}
+
+async function fetchWind() {
+  // The latest 1-minute snapshot is often sparse (stations report at
+  // different cadences); top up from a 10-minute-old snapshot if needed.
+  const snaps = [await fetchWindAt()];
+  let out = joinWind(snaps);
+  if (out.length < 4) {
+    try {
+      snaps.push(await fetchWindAt(new Date(Date.now() - 10 * 60_000)));
+      out = joinWind(snaps);
+    } catch { /* keep what we have */ }
   }
   neaWind = out.length ? out : null;
   renderWindStatus();
+  rebuildStreamlines();
 }
 
 function pollWind() {
@@ -899,6 +924,7 @@ function renderAll() {
   renderOverlay(values, grid);
   renderTimebar(t);
   renderWindStatus();
+  rebuildStreamlines(); // wind source can differ per displayed time
 }
 
 // Coalesce slider-drag renders to animation frames.
@@ -915,82 +941,104 @@ function selectStation(id) {
   renderAll();
 }
 
-// ---------- wind particles ----------
+// ---------- wind vector map ----------
 
-// Streaklines advected by the model wind field, drawn on a canvas pinned over
-// the map. Particles live in geographic space and are re-projected every
-// frame, so panning and zooming stay correct; trails fade via destination-out.
-// ~170 particles is far cheaper than one overlay rasterization per frame.
-// Star-trail look: many slow particles whose trails persist for seconds
-// before fading, so the wind reads as long delicate streaks rather than
-// darting sparks.
-const WIND_N = 240;
-const WIND_DEG_PER_S = 0.0015; // visual exaggeration: °lat per second per km/h
-const WIND_LOOKAHEAD_S = 0.05; // small lead keeps slow segments above sub-pixel
-const WIND_FADE = 0.009; // per-frame trail fade (lower = longer trails)
-const WIND_AGE_S = [12, 30]; // particle lifetime range
+/* Short streamlines seeded on a fixed screen grid: each integrates a few
+   steps through the wind field and is drawn as a faint hairline with a
+   brighter dash flowing along it. Deterministic full-map coverage (it cannot
+   be invisible the way sparse particles can), low-key transparency, and the
+   only animation is the slow dash drift. Toggled by the WIND button. */
+const WIND_SEED_PX = 34;  // grid spacing between streamline seeds
+const WIND_STEPS = 8;     // integration steps per streamline
+const WIND_STEP_PX = 6.5; // pixels per step (line length ≈ steps × step)
+const WIND_FLOW_PX_S = 20; // dash drift speed along the line
+
+let windOn = true, windCanvas = null, windCtx = null, windLines = [];
+
+function rebuildStreamlines() {
+  if (!windCtx || !map || !map.getSize) return;
+  windLines = [];
+  if (!windOn) return;
+  const size = map.getSize();
+  for (let y = WIND_SEED_PX / 2; y < size.y; y += WIND_SEED_PX) {
+    for (let x = WIND_SEED_PX / 2; x < size.x; x += WIND_SEED_PX) {
+      const pts = [[x, y]];
+      let px = x, py = y;
+      let speedSum = 0;
+      for (let s = 0; s < WIND_STEPS; s++) {
+        const ll = map.containerPointToLatLng([px, py]);
+        const w = windVecAt(ll.lat, ll.lng);
+        if (!w || !Number.isFinite(w.u)) { pts.length = 1; break; }
+        const sp = Math.hypot(w.u, w.v);
+        if (sp < 0.1) break;
+        speedSum += sp;
+        px += (w.u / sp) * WIND_STEP_PX;
+        py -= (w.v / sp) * WIND_STEP_PX; // screen y grows southward
+        pts.push([px, py]);
+      }
+      if (pts.length > 2) {
+        windLines.push({ pts, speed: speedSum / (pts.length - 1), phase: Math.random() * 100 });
+      }
+    }
+  }
+}
+
+function tracePath(ctx, pts) {
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+}
 
 function startWind() {
   if (typeof window === "undefined") return;
-  const canvas = document.getElementById("wind");
-  if (!canvas || typeof canvas.getContext !== "function") return;
-  const ctx = canvas.getContext("2d");
+  windCanvas = document.getElementById("wind");
+  if (!windCanvas || typeof windCanvas.getContext !== "function") return;
+  windCtx = windCanvas.getContext("2d");
+  try { windOn = localStorage.getItem("sgtemp-wind") !== "off"; } catch { /* default on */ }
+  updateWindBtn();
 
   const fit = () => {
     const size = map.getSize();
-    canvas.width = size.x;
-    canvas.height = size.y;
+    windCanvas.width = size.x;
+    windCanvas.height = size.y;
+    rebuildStreamlines();
   };
   fit();
-  map.on("resize", fit);
-  // projections shift while panning/zooming; old trail pixels would smear
-  map.on("move zoomstart", () => ctx.clearRect(0, 0, canvas.width, canvas.height));
+  map.on("resize zoomend moveend", fit);
+  // seeds are in screen space; mid-pan frames would be misaligned
+  map.on("move zoomstart", () => windCtx.clearRect(0, 0, windCanvas.width, windCanvas.height));
 
-  const spawn = (p = {}) => {
-    p.lat = OVERLAY.latMin + Math.random() * (OVERLAY.latMax - OVERLAY.latMin);
-    p.lon = OVERLAY.lonMin + Math.random() * (OVERLAY.lonMax - OVERLAY.lonMin);
-    p.age = WIND_AGE_S[0] + Math.random() * (WIND_AGE_S[1] - WIND_AGE_S[0]);
-    return p;
-  };
-  const parts = Array.from({ length: WIND_N }, () => spawn());
-
-  let last = null;
+  let lastT = 0;
   function frame(ts) {
     requestAnimationFrame(frame);
-    if (document.hidden || !windU) { last = ts; return; }
-    const dt = Math.min(0.1, last == null ? 0.016 : (ts - last) / 1000);
-    last = ts;
-
-    ctx.globalCompositeOperation = "destination-out";
-    ctx.fillStyle = `rgba(0,0,0,${WIND_FADE})`;
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.globalCompositeOperation = "source-over";
-    ctx.strokeStyle = "rgba(220, 237, 255, 0.32)";
-    ctx.lineWidth = 1.2;
-    ctx.lineCap = "round";
-    ctx.beginPath();
-    for (const p of parts) {
-      const w = windVecAt(p.lat, p.lon);
-      if (!w || !Number.isFinite(w.u)) { spawn(p); continue; }
-      const dLat = w.v * WIND_DEG_PER_S;
-      const dLon = (w.u * WIND_DEG_PER_S) / Math.cos((p.lat * Math.PI) / 180);
-      const from = map.latLngToContainerPoint([p.lat, p.lon]);
-      // draw a fixed lookahead segment so streaks stay visible even when a
-      // frame's own travel is sub-pixel
-      const to = map.latLngToContainerPoint(
-        [p.lat + dLat * WIND_LOOKAHEAD_S, p.lon + dLon * WIND_LOOKAHEAD_S]);
-      p.lat += dLat * dt;
-      p.lon += dLon * dt;
-      p.age -= dt;
-      ctx.moveTo(from.x, from.y);
-      ctx.lineTo(to.x, to.y);
-      if (p.age <= 0 ||
-          p.lat < OVERLAY.latMin || p.lat > OVERLAY.latMax ||
-          p.lon < OVERLAY.lonMin || p.lon > OVERLAY.lonMax) spawn(p);
+    if (!windOn || document.hidden || !windLines.length) return;
+    if (ts - lastT < 33) return; // ~30fps is plenty for a slow drift
+    lastT = ts;
+    windCtx.clearRect(0, 0, windCanvas.width, windCanvas.height);
+    // the static "vector map": faint hairlines everywhere
+    windCtx.setLineDash([]);
+    windCtx.strokeStyle = "rgba(214, 233, 255, 0.13)";
+    windCtx.lineWidth = 1;
+    for (const l of windLines) { tracePath(windCtx, l.pts); windCtx.stroke(); }
+    // flow: a brighter dash drifting along each line, faster in faster wind
+    windCtx.strokeStyle = "rgba(222, 240, 255, 0.38)";
+    windCtx.lineWidth = 1.4;
+    windCtx.lineCap = "round";
+    windCtx.setLineDash([3, 17]);
+    const t = ts / 1000;
+    for (const l of windLines) {
+      windCtx.lineDashOffset = -(t * WIND_FLOW_PX_S * (0.5 + l.speed / 12) + l.phase);
+      tracePath(windCtx, l.pts);
+      windCtx.stroke();
     }
-    ctx.stroke();
+    windCtx.setLineDash([]);
   }
   requestAnimationFrame(frame);
+}
+
+function updateWindBtn() {
+  const b = document.getElementById("wind-btn");
+  if (b && b.classList) b.classList.toggle("active", windOn);
 }
 
 // ---------- status ----------
@@ -1090,6 +1138,14 @@ document.getElementById("time-slider").addEventListener("input", (e) => {
 document.getElementById("live-btn").addEventListener("click", () => {
   displayedT = null;
   renderAll();
+});
+
+document.getElementById("wind-btn").addEventListener("click", () => {
+  windOn = !windOn;
+  try { localStorage.setItem("sgtemp-wind", windOn ? "on" : "off"); } catch { /* fine */ }
+  if (windCtx) windCtx.clearRect(0, 0, windCanvas.width, windCanvas.height);
+  rebuildStreamlines();
+  updateWindBtn();
 });
 
 initMap();

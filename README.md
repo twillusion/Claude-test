@@ -41,12 +41,14 @@ static page, no backend, no hosting costs.
   brightness by up to 40% (a CSS filter on the tile pane — no second tile
   set, no hue clash with the temperature ramp) through two-hour dawn/dusk
   ramps at the displayed time, with a sun/moon icon next to the clock.
-- Wind streaklines: ~150 particles drift across the map with fading
-  trails. On the live view they're advected by NEA's observed wind
-  stations (data.gov.sg wind-speed/wind-direction, IDW-interpolated);
-  scrubbed times fall back to the Open-Meteo wind field when available.
-  Particles live in geographic space and re-project each frame, so
-  pan/zoom stay correct. The footer shows the island-average wind.
+- Wind vector map (WIND button toggles it, remembered in localStorage):
+  short streamlines seeded on a screen grid cover the whole map as faint
+  hairlines, with brighter dashes drifting along them — faster in faster
+  wind. Live data comes from NEA's observed wind stations (data.gov.sg
+  wind-speed/wind-direction; sparse latest snapshots are topped up from a
+  10-minute-old one); scrubbed times fall back to the Open-Meteo wind
+  field when available. The footer shows the island-average wind and the
+  station count feeding it.
 - On the live view each station's displayed value drifts by up to ±0.09°
   so the numbers tick like a real-time feed between the actual per-minute
   polls. Only the number displays refresh (no overlay re-rasterization),
