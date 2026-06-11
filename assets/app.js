@@ -57,6 +57,18 @@ function sgtDate(date) {
   return sgtStamp(date).slice(0, 10);
 }
 
+// fetch with a single retry on 429: the data APIs rate-limit bursts, and the
+// archive downloads at startup are exactly such a burst.
+async function fetch429(url) {
+  let res = await fetch(url);
+  if (res.status === 429) {
+    const wait = Number(res.headers?.get?.("Retry-After")) * 1000 || 4000;
+    await new Promise((r) => setTimeout(r, Math.min(wait, 15_000)));
+    res = await fetch(url);
+  }
+  return res;
+}
+
 function normalizeStationsV2(list) {
   return list.map((s) => {
     const loc = s.location || s.labelLocation || {};
@@ -69,7 +81,7 @@ async function fetchReadings(atDate) {
   const errors = [];
   try {
     const url = atDate ? `${V2_URL}?date=${encodeURIComponent(sgtStamp(atDate))}` : V2_URL;
-    const res = await fetch(url);
+    const res = await fetch429(url);
     if (!res.ok) throw new Error(`v2 HTTP ${res.status}`);
     const d = (await res.json()).data;
     const reading = d.readings[d.readings.length - 1];
@@ -83,7 +95,7 @@ async function fetchReadings(atDate) {
   }
   try {
     const url = atDate ? `${V1_URL}?date_time=${encodeURIComponent(sgtStamp(atDate))}` : V1_URL;
-    const res = await fetch(url);
+    const res = await fetch429(url);
     if (!res.ok) throw new Error(`v1 HTTP ${res.status}`);
     const json = await res.json();
     const item = json.items[json.items.length - 1];
@@ -103,7 +115,7 @@ async function fetchReadings(atDate) {
 // A whole calendar day of per-minute readings in one go.
 async function fetchDay(dateStr) {
   try {
-    const res = await fetch(`${V1_URL}?date=${dateStr}`);
+    const res = await fetch429(`${V1_URL}?date=${dateStr}`);
     if (!res.ok) throw new Error(`v1 HTTP ${res.status}`);
     const json = await res.json();
     return {
@@ -120,7 +132,7 @@ async function fetchDay(dateStr) {
   let token = null, stationsOut = [], items = [];
   do {
     const url = `${V2_URL}?date=${dateStr}` + (token ? `&paginationToken=${encodeURIComponent(token)}` : "");
-    const res = await fetch(url);
+    const res = await fetch429(url);
     if (!res.ok) throw new Error(`v2 HTTP ${res.status}`);
     const d = (await res.json()).data;
     stationsOut = normalizeStationsV2(d.stations);
@@ -141,7 +153,7 @@ async function fetchDay(dateStr) {
 // official stations only. Obvious junk (out-of-range, or wildly off the NEA
 // median — a sensor on a sunny balcony) is dropped.
 async function fetchCommunity() {
-  const res = await fetch(CIV_URL);
+  const res = await fetch429(CIV_URL);
   if (!res.ok) throw new Error(`sensor.community HTTP ${res.status}`);
   const arr = await res.json();
   const latest = new Map();
@@ -383,7 +395,7 @@ function ensureWindField() {
 async function fetchWindAt(dt) {
   const q = dt ? `?date_time=${encodeURIComponent(sgtStamp(dt))}` : "";
   const [spd, dir] = await Promise.all([WIND_SPEED_URL + q, WIND_DIR_URL + q].map(async (url) => {
-    const res = await fetch(url);
+    const res = await fetch429(url);
     if (!res.ok) throw new Error(`wind HTTP ${res.status}`);
     return res.json();
   }));
@@ -402,7 +414,7 @@ async function fetchWindAt(dt) {
 async function fetchWindDayRaw(dayStr) {
   const [spd, dir] = await Promise.all(
     [`${WIND_SPEED_URL}?date=${dayStr}`, `${WIND_DIR_URL}?date=${dayStr}`].map(async (url) => {
-      const res = await fetch(url);
+      const res = await fetch429(url);
       if (!res.ok) throw new Error(`wind day HTTP ${res.status}`);
       return res.json();
     }));
