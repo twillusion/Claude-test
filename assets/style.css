@@ -94,7 +94,7 @@ body { display: flex; flex-direction: column; }
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
 }
 
-#live-btn {
+#live-btn, #play-btn {
   background: var(--panel-2);
   color: var(--muted);
   border: 1px solid var(--border);
@@ -106,6 +106,23 @@ body { display: flex; flex-direction: column; }
   cursor: pointer;
 }
 #live-btn.active { background: #1d4a2c; color: #7fe6a0; border-color: #2c6e42; }
+#live-btn.active::before {
+  content: "●";
+  margin-right: 4px;
+  animation: blink 2s ease-in-out infinite;
+}
+#play-btn { min-width: 2rem; }
+#play-btn.active { background: #1d3a5c; color: var(--accent); border-color: #2c5a8e; }
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+@keyframes pill-pulse {
+  0%, 100% { box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5); }
+  50% { box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5), 0 0 10px 2px var(--pill); }
+}
 
 #time-slider { flex: 1; accent-color: var(--accent); min-width: 0; }
 
@@ -201,6 +218,7 @@ body { display: flex; flex-direction: column; }
   transform: translate(-50%, -50%);
 }
 .temp-pill.selected { outline: 2px solid #fff; }
+.temp-pill.live { animation: pill-pulse 3.5s ease-in-out infinite; }
 
 .leaflet-container { font: inherit; }
 

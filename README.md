@@ -29,7 +29,11 @@ static page, no backend, no hosting costs.
   update hourly) and covers the full 24h scrubber window.
 - The time slider scrubs the 24-hour window in 5-minute steps
   (`SLIDER_STEP_MIN` in `assets/app.js`); the LIVE button snaps back to the
-  newest reading.
+  newest reading, and the play button replays the whole window as a ~30s
+  looping timelapse.
+- The basemap follows the sun: a day layer crossfades over the night layer
+  through dawn/dusk at the displayed time, so scrubbing or replaying shifts
+  the map between light and dark.
 
 ## Setting it up
 

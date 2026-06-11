@@ -28,9 +28,11 @@ let timeline = [];    // sorted unique reading timestamps (ms) within the 24h wi
 let sliderTicks = []; // timeline thinned to SLIDER_STEP_MIN buckets
 let displayedT = null; // null = live (latest reading)
 let selectedId = null;
-let map, overlayLayer, overlayCanvas;
+let map, overlayLayer, overlayCanvas, dayTiles;
 let renderQueued = false;
 let model = null; // {times: [ms], grids: [Float32Array(GRID_NLAT*GRID_NLON)]}
+let playing = false, lastFrameTs = null;
+let latestReadingT = null, statusPinned = false;
 
 // ---------- API ----------
 
@@ -344,10 +346,25 @@ function fmtTime(t) {
     { timeZone: "Asia/Singapore", weekday: "short", hour: "2-digit", minute: "2-digit" });
 }
 
+// 0 = night, 1 = day, smooth ramps through twilight. Singapore sits on the
+// equator, so sunrise/sunset barely move all year (~07:00 / ~19:10 SGT).
+function smooth01(x) {
+  x = Math.min(1, Math.max(0, x));
+  return x * x * (3 - 2 * x);
+}
+
+function dayFactor(t) {
+  const d = new Date(t + 8 * 3600_000); // SGT wall clock via UTC getters
+  const h = d.getUTCHours() + d.getUTCMinutes() / 60 + d.getUTCSeconds() / 3600;
+  return Math.min(smooth01((h - 6.5) / 1.1), 1 - smooth01((h - 18.6) / 1.1));
+}
+
 function renderMarker(s, v) {
   if (!s.marker) return;
   if (v == null) { s.marker.setIcon(L.divIcon({ className: "", html: "", iconSize: [0, 0] })); return; }
-  const cls = s.id === selectedId ? "temp-pill selected" : "temp-pill";
+  let cls = "temp-pill";
+  if (s.id === selectedId) cls += " selected";
+  if (displayedT === null) cls += " live"; // gentle pulse on current readings
   s.marker.setIcon(L.divIcon({
     className: "",
     html: `<span class="${cls}" style="--pill:${tempColor(v)}">${fmt(v)}</span>`,
@@ -519,10 +536,16 @@ function renderTimebar(t) {
   slider.max = Math.max(0, sliderTicks.length - 1);
   if (displayedT === null) {
     slider.value = slider.max;
-    label.textContent = t ? fmtTime(t) : "–";
   } else {
-    label.textContent = t ? fmtTime(t) : "–";
+    // keep the handle tracking the displayed time (it moves during playback)
+    let lo = 0, hi = sliderTicks.length - 1, idx = 0;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (sliderTicks[mid] <= displayedT) { idx = mid; lo = mid + 1; } else hi = mid - 1;
+    }
+    slider.value = idx;
   }
+  label.textContent = t ? fmtTime(t) : "–";
   liveBtn.classList.toggle("active", displayedT === null);
 }
 
@@ -531,6 +554,7 @@ function renderAll() {
   const values = displayedValues(t);
   const grid = buildBlendedGrid(t ?? Date.now());
   updateScale(values, grid); // normalize colours before anything draws
+  if (dayTiles) dayTiles.setOpacity(dayFactor(t ?? Date.now()));
   for (const s of stations.values()) renderMarker(s, values.get(s.id));
   renderList(values);
   renderSummary(values);
@@ -553,8 +577,52 @@ function selectStation(id) {
   renderAll();
 }
 
-function setStatus(text) {
+// ---------- playback (timelapse of the 24h window) ----------
+
+const PLAY_SPEED = (HISTORY_HOURS * 3600_000) / 30_000; // whole window in ~30s
+
+function stepPlayback(dtMs) {
+  if (timeline.length < 2) return;
+  const start = timeline[0], end = timeline[timeline.length - 1];
+  let t = (displayedT ?? start) + dtMs * PLAY_SPEED;
+  if (t >= end) t = start; // loop
+  displayedT = t;
+}
+
+function playFrame(ts) {
+  if (!playing) return;
+  const dt = lastFrameTs == null ? 16 : Math.min(100, ts - lastFrameTs);
+  lastFrameTs = ts;
+  stepPlayback(dt);
+  renderAll();
+  requestAnimationFrame(playFrame);
+}
+
+function setPlaying(on) {
+  if (playing === on) return;
+  playing = on;
+  lastFrameTs = null;
+  const btn = document.getElementById("play-btn");
+  btn.textContent = on ? "❚❚" : "▶";
+  btn.classList.toggle("active", on);
+  if (on) {
+    if (displayedT === null) displayedT = timeline[0] ?? null; // start at -24h
+    requestAnimationFrame(playFrame);
+  }
+}
+
+// ---------- status ----------
+
+function setStatus(text, pinned = false) {
+  statusPinned = pinned;
   document.getElementById("refresh-status").textContent = text;
+}
+
+// ticks once a second so the header feels alive between polls
+function tickStatus() {
+  if (statusPinned || latestReadingT == null) return;
+  const secs = Math.max(0, Math.round((Date.now() - latestReadingT) / 1000));
+  setStatus(`live · reading ${secs}s old`);
 }
 
 function showError(msg) {
@@ -572,11 +640,11 @@ async function refresh() {
     rebuild();
     renderAll();
     showError(null);
-    const t = timeline[timeline.length - 1];
-    setStatus(t ? `updated ${fmtTime(t)} SGT` : "no data");
+    latestReadingT = timeline[timeline.length - 1] ?? null;
+    tickStatus();
   } catch (e) {
     showError(`Could not reach data.gov.sg (${e.message}). Retrying in a minute…`);
-    setStatus("retrying…");
+    setStatus("retrying…", true);
   }
 }
 
@@ -586,47 +654,60 @@ async function loadHistory() {
   const days = [sgtDate(new Date(now - 24 * 3600_000)), sgtDate(new Date(now))];
   let loaded = 0;
   for (const day of days) {
-    setStatus(`loading history ${++loaded}/${days.length}…`);
+    setStatus(`loading history ${++loaded}/${days.length}…`, true);
     try {
       ingest(await fetchDay(day));
     } catch { /* a missing day just shortens the scrubber range */ }
   }
   rebuild(now);
   renderAll();
-  const t = timeline[timeline.length - 1];
-  setStatus(t ? `updated ${fmtTime(t)} SGT` : "no data");
+  latestReadingT = timeline[timeline.length - 1] ?? null;
+  statusPinned = false;
+  tickStatus();
 }
 
 // ---------- init ----------
 
 function initMap() {
+  // hard-locked to the Open-Meteo grid window — no padding, no drifting off it
   const dataBounds = L.latLngBounds(
     [OVERLAY.latMin, OVERLAY.lonMin], [OVERLAY.latMax, OVERLAY.lonMax]);
   map = L.map("map", {
     zoomControl: true,
-    maxBounds: dataBounds.pad(0.05),
+    maxBounds: dataBounds,
     maxBoundsViscosity: 1.0, // hard wall when panning
   });
   map.fitBounds(dataBounds);
   // can't zoom out past the point where the data window fills the screen
   map.setMinZoom(map.getBoundsZoom(dataBounds));
-  L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+  const tileOpts = {
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
     maxZoom: 18,
-  }).addTo(map);
+  };
+  // night base + day layer crossfaded by the sun at the displayed time
+  L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", tileOpts).addTo(map);
+  dayTiles = L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", tileOpts).addTo(map);
+  dayTiles.setOpacity(0);
 }
 
 document.getElementById("detail-close").addEventListener("click", () => selectStation(selectedId));
 
 document.getElementById("time-slider").addEventListener("input", (e) => {
+  setPlaying(false);
   const idx = Number(e.target.value);
   displayedT = idx >= sliderTicks.length - 1 ? null : sliderTicks[idx];
   scheduleRender();
 });
 
 document.getElementById("live-btn").addEventListener("click", () => {
+  setPlaying(false);
   displayedT = null;
   renderAll();
+});
+
+document.getElementById("play-btn").addEventListener("click", () => {
+  setPlaying(!playing);
+  if (!playing) renderAll();
 });
 
 initMap();
@@ -634,3 +715,4 @@ refresh().then(loadHistory);
 refreshModel();
 setInterval(refresh, POLL_MS);
 setInterval(refreshModel, MODEL_REFRESH_MS);
+setInterval(tickStatus, 1000);
