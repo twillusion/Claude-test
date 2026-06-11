@@ -17,8 +17,10 @@ const SLIDER_STEP_MIN = 5; // scrubber granularity; underlying data is per-minut
 // sample grid shares the same bounds so the raster never extrapolates, and
 // the map is hard-locked to this exact window.
 const OVERLAY = { latMin: 1.09, latMax: 1.56, lonMin: 103.48, lonMax: 104.22, w: 240, h: 152 };
-const GRID_NLAT = 9;
-const GRID_NLON = 13;
+// ~10km sample spacing — matches the model's native resolution, so a denser
+// grid adds API weight without adding information
+const GRID_NLAT = 6;
+const GRID_NLON = 9;
 const KM_PER_DEG = 111.32;
 // Station residuals shrink toward zero away from stations; at ~12 km the
 // correction is halved, so the model field dominates where there's no sensor.
@@ -189,13 +191,21 @@ async function fetchModel() {
       lons.push((OVERLAY.lonMin + (ix * (OVERLAY.lonMax - OVERLAY.lonMin)) / (GRID_NLON - 1)).toFixed(4));
     }
   }
-  const url = `${OM_URL}?latitude=${lats.join(",")}&longitude=${lons.join(",")}` +
-    `&hourly=temperature_2m,wind_speed_10m,wind_direction_10m` +
-    `&past_days=1&forecast_days=1&timeformat=unixtime&timezone=UTC`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`open-meteo HTTP ${res.status}`);
-  let results = await res.json();
-  if (!Array.isArray(results)) results = [results];
+  // chunked: long multi-location URLs / heavy requests are what get refused
+  const CHUNK = 27;
+  const requests = [];
+  for (let i = 0; i < lats.length; i += CHUNK) {
+    const url = `${OM_URL}?latitude=${lats.slice(i, i + CHUNK).join(",")}` +
+      `&longitude=${lons.slice(i, i + CHUNK).join(",")}` +
+      `&hourly=temperature_2m,wind_speed_10m,wind_direction_10m` +
+      `&past_days=1&forecast_days=1&timeformat=unixtime&timezone=UTC`;
+    requests.push(fetch(url).then(async (res) => {
+      if (!res.ok) throw new Error(`open-meteo HTTP ${res.status}`);
+      const j = await res.json();
+      return Array.isArray(j) ? j : [j];
+    }));
+  }
+  const results = (await Promise.all(requests)).flat();
   if (results.length !== lats.length) throw new Error("open-meteo result count mismatch");
 
   const times = results[0].hourly.time.map((s) => s * 1000);
@@ -220,14 +230,54 @@ async function fetchModel() {
   model = { times, grids, uGrids, vGrids };
 }
 
+// Cache the model in localStorage so page reloads within the refresh window
+// don't re-hit Open-Meteo — rapid reloads are how free-tier rate limits get
+// burned, which then takes the model (and wind) down for everyone-you.
+const MODEL_CACHE_KEY = "sgtemp-model-v1";
+
+function loadModelCache() {
+  try {
+    const c = JSON.parse(localStorage.getItem(MODEL_CACHE_KEY));
+    if (!c || Date.now() - c.at > MODEL_REFRESH_MS) return false;
+    const revive = (arr) => arr.map((g) => Float32Array.from(g, (x) => (x == null ? NaN : x)));
+    model = { times: c.times, grids: revive(c.grids), uGrids: revive(c.uGrids), vGrids: revive(c.vGrids) };
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function saveModelCache() {
+  try {
+    const pack = (arr) => arr.map((g) => Array.from(g, (x) => (Number.isNaN(x) ? null : x)));
+    localStorage.setItem(MODEL_CACHE_KEY, JSON.stringify({
+      at: Date.now(), times: model.times,
+      grids: pack(model.grids), uGrids: pack(model.uGrids), vGrids: pack(model.vGrids),
+    }));
+  } catch { /* storage full or unavailable — not worth failing over */ }
+}
+
+function setShadeMode(text) {
+  document.getElementById("shade-mode").textContent = text;
+}
+
 async function refreshModel() {
+  if (!model && typeof localStorage !== "undefined" && loadModelCache()) {
+    setShadeMode("Open-Meteo model + station correction");
+    scheduleRender();
+    return; // fresh enough; the next interval tick refetches
+  }
   try {
     await fetchModel();
-    document.getElementById("shade-mode").textContent = "Open-Meteo model + station correction";
+    if (typeof localStorage !== "undefined") saveModelCache();
+    setShadeMode("Open-Meteo model + station correction");
     scheduleRender();
-  } catch {
-    // keep whatever model we had; station-only IDW covers the gap
-    if (!model) setTimeout(refreshModel, 3 * 60_000);
+  } catch (e) {
+    // keep whatever model we had; surface the real error in the footer
+    if (!model) {
+      setShadeMode(`stations only (model: ${e.message})`);
+      setTimeout(refreshModel, 3 * 60_000);
+    }
   }
 }
 

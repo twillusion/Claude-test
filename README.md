@@ -10,6 +10,11 @@ static page, no backend, no hosting costs.
   [data.gov.sg real-time air temperature API](https://data.gov.sg) (NEA
   weather stations, updated every minute, no API key, CORS-enabled). The v2
   API is used first with automatic fallback to v1.
+- Open-Meteo is queried as a ~10km grid (matching the model's native
+  resolution) in small chunked requests, and the result is cached in
+  localStorage for 30 minutes — reloads don't re-hit the API, which
+  protects the free-tier rate limit. If the model fetch fails, the footer
+  shows the error and shading falls back to station-only.
 - On load, the page bulk-fetches the last 24 hours at per-minute resolution
   (the API returns a whole calendar day per request), then polls for the
   latest reading every minute. History older than 24 hours is dropped
