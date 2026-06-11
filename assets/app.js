@@ -454,7 +454,24 @@ async function fetchRain() {
   renderRainStatus();
 }
 
+// Open the page with ?testrain to verify the rain rendering on a dry day:
+// synthetic wet gauges replace the real poll.
+const TEST_RAIN = typeof location !== "undefined" && /testrain/.test(location.search);
+
+function injectTestRain() {
+  rainReadings = [
+    { lat: 1.34, lon: 103.78, mm: 6 },
+    { lat: 1.36, lon: 103.95, mm: 2.5 },
+    { lat: 1.29, lon: 103.85, mm: 9 },
+  ];
+  wetGauges = rainReadings.slice();
+  buildRainGrid();
+  const el = document.getElementById("rain-status");
+  if (el) el.textContent = "TEST MODE — synthetic rain";
+}
+
 function pollRain() {
+  if (TEST_RAIN) { injectTestRain(); return; }
   fetchRain().catch(() => {
     const el = document.getElementById("rain-status");
     if (el) el.textContent = "unreachable";
@@ -544,6 +561,35 @@ function cloudClass(forecast) {
   return null; // fair / clear / sunny / windy
 }
 
+// Each area's cloud is 2–3 overlapping puffs with sizes, offsets, drift
+// rhythms, and opacity all seeded from the area name — every cloud unique
+// but stable across refreshes.
+const CLOUD_BASE_OPACITY = { light: 0.4, cloudy: 0.65, rainy: 0.7, storm: 0.78 };
+
+function cloudIconHtml(area, cls) {
+  let h = hashStr(area) || 1;
+  const rnd = () => {
+    h = (h * 1103515245 + 12345) | 0;
+    return ((h >>> 8) % 1000) / 1000;
+  };
+  const baseW = 85 + rnd() * 80;
+  const n = 2 + (rnd() > 0.45 ? 1 : 0);
+  const puffs = [];
+  for (let i = 0; i < n; i++) {
+    const w = Math.round(baseW * (0.55 + rnd() * 0.6));
+    const ht = Math.round(w * (0.3 + rnd() * 0.2));
+    const dx = Math.round((rnd() - 0.5) * baseW * 0.75);
+    const dy = Math.round((rnd() - 0.5) * 28);
+    const dur = Math.round(34 + rnd() * 30);
+    const delay = -Math.round(rnd() * 40);
+    const op = Math.min(0.85, CLOUD_BASE_OPACITY[cls] * (0.75 + rnd() * 0.5));
+    puffs.push(`<span class="cloud-puff ${cls}" style="width:${w}px;height:${ht}px;` +
+      `margin-left:${dx}px;margin-top:${dy}px;opacity:${op.toFixed(2)};` +
+      `animation-duration:${dur}s;animation-delay:${delay}s"></span>`);
+  }
+  return puffs.join("");
+}
+
 async function fetchForecast() {
   const res = await fetch429(FORECAST_URL);
   if (!res.ok) throw new Error(`forecast HTTP ${res.status}`);
@@ -561,10 +607,9 @@ async function fetchForecast() {
         { pane: "clouds", keyboard: false, interactive: false }).addTo(map);
       cloudMarkers.set(f.area, m);
     }
-    const delay = -(Math.abs(hashStr(f.area)) % 40);
     m.setIcon(L.divIcon({
       className: "",
-      html: `<span class="cloud-puff ${cls}" style="animation-delay:${delay}s"></span>`,
+      html: cloudIconHtml(f.area, cls),
       iconSize: [0, 0],
     }));
   }

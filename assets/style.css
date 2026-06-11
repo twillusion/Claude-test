@@ -291,33 +291,26 @@ body { display: flex; flex-direction: column; }
    Leaflet owns the transform), GPU-composited, zero per-frame JS */
 .cloud-puff {
   position: absolute;
-  width: 120px;
-  height: 50px;
   transform: translate(-50%, -50%);
   border-radius: 50%;
   background: radial-gradient(ellipse at center, rgba(222, 230, 242, 0.5), rgba(222, 230, 242, 0) 70%);
   filter: blur(7px);
   pointer-events: none;
+  /* size, offset (margins), opacity, and timing come inline, seeded from
+     the area name; the drift animates the translate property so it never
+     fights the centering transform or the margin offsets */
   animation: cloud-drift 46s ease-in-out infinite alternate;
 }
-.cloud-puff.light { opacity: 0.4; }
-.cloud-puff.cloudy { opacity: 0.65; width: 150px; height: 60px; }
 .cloud-puff.rainy {
-  opacity: 0.7;
-  width: 150px;
-  height: 60px;
   background: radial-gradient(ellipse at center, rgba(150, 165, 190, 0.6), rgba(150, 165, 190, 0) 70%);
 }
 .cloud-puff.storm {
-  opacity: 0.78;
-  width: 165px;
-  height: 66px;
   background: radial-gradient(ellipse at center, rgba(108, 120, 145, 0.7), rgba(108, 120, 145, 0) 70%);
 }
 
 @keyframes cloud-drift {
-  from { margin-left: -9px; }
-  to { margin-left: 9px; }
+  from { translate: -10px 0; }
+  to { translate: 10px 0; }
 }
 
 /* wind direction: a windsock wedge growing out from under the marker,
