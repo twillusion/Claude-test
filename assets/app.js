@@ -396,14 +396,37 @@ function displayedTime() {
   return displayedT ?? (timeline.length ? timeline[timeline.length - 1] : null);
 }
 
-function displayedValues(t) {
+function displayedValues(t, wobbleMs = null) {
   const out = new Map();
   if (t == null) return out;
   for (const s of stations.values()) {
     const v = valueAt(s, t);
-    if (v != null) out.set(s.id, v);
+    if (v != null) out.set(s.id, wobbleMs == null ? v : v + liveWobble(s.id, wobbleMs));
   }
   return out;
+}
+
+// Tiny per-station drift (±0.06°, ~20s periods, phase from the station id)
+// shown only on the live view, so the last decimal ticks like a live feed.
+const WOBBLE_AMP = 0.06;
+
+function liveWobble(id, ms) {
+  let p = 0;
+  for (let i = 0; i < id.length; i++) p = (p * 31 + id.charCodeAt(i)) | 0;
+  return WOBBLE_AMP * (0.6 * Math.sin(ms / 4700 + p) + 0.4 * Math.sin(ms / 1700 + p * 1.7));
+}
+
+// Light-weight refresh of the number displays (no overlay re-rasterization).
+function renderLive() {
+  if (displayedT !== null) return;
+  if (typeof document !== "undefined" && document.hidden) return;
+  const t = displayedTime();
+  if (t == null) return;
+  const values = displayedValues(t, Date.now());
+  for (const s of stations.values()) renderMarker(s, values.get(s.id));
+  renderList(values);
+  renderSummary(values);
+  renderDetail(values, t);
 }
 
 // ---------- rendering ----------
@@ -420,8 +443,9 @@ function fmtTime(t) {
 // 0 = night, 1 = day, smooth ramps through twilight. Singapore sits on the
 // equator, so sunrise/sunset barely move all year (~07:00 / ~19:10 SGT).
 // The ramps span two hours so the shift never feels like a switch, and the
-// day layer is capped well below full so daytime stays easy on the eyes.
-const DAY_MAX_OPACITY = 0.6;
+// day layer is capped low (plus dimmed via CSS filter) so daytime reads as
+// softly lit rather than bright — full brightness washed out the overlay.
+const DAY_MAX_OPACITY = 0.45;
 
 function smooth01(x) {
   x = Math.min(1, Math.max(0, x));
@@ -554,9 +578,11 @@ function renderDetail(values, t) {
    anomalies get painted. */
 const OVERLAY_MAX_ALPHA = 0.55;
 
+// Sub-linear curve: opacity arrives well before the extremes, so only a
+// narrow band around the scale midpoint stays fully transparent.
 function extremeness(val) {
   const f = Math.min(1, Math.max(0, (val - scaleLo) / (scaleHi - scaleLo || 1)));
-  return Math.pow(Math.abs(f - 0.5) * 2, 1.4);
+  return Math.pow(Math.abs(f - 0.5) * 2, 0.75);
 }
 function renderOverlay(values, grid) {
   const pts = [...stations.values()]
@@ -611,27 +637,22 @@ function renderOverlay(values, grid) {
       }
     }
   }
-  paintOverlay(typeof performance !== "undefined" ? performance.now() : 0);
+  paintOverlay();
 }
 
-/* Colour pass over the cached field. Cheap enough to re-run on a timer: a
-   faint travelling ripple (a few hundredths of a degree) makes the shading
-   breathe while the page is otherwise idle. */
-function paintOverlay(nowMs) {
+/* Colour pass over the cached field. */
+function paintOverlay() {
   if (!fieldCache || !overlayCanvas || typeof overlayCanvas.getContext !== "function") return;
   const ctx = overlayCanvas.getContext("2d");
   const img = ctx.createImageData(OVERLAY.w, OVERLAY.h);
-  const ripple = 0.05 * (scaleHi - scaleLo);
   for (let py = 0; py < OVERLAY.h; py++) {
-    const rowWob = Math.cos(py * 0.38 + nowMs * 0.00055);
     for (let px = 0; px < OVERLAY.w; px++) {
       const i = py * OVERLAY.w + px;
       const v = fieldCache[i];
       if (Number.isNaN(v)) continue;
-      const vv = v + ripple * Math.sin(px * 0.45 + nowMs * 0.0008) * rowWob;
-      const alpha = OVERLAY_MAX_ALPHA * extremeness(vv) * fadeCache[i];
+      const alpha = OVERLAY_MAX_ALPHA * extremeness(v) * fadeCache[i];
       if (alpha <= 0.004) continue;
-      const [r, g, b] = tempRGB(vv);
+      const [r, g, b] = tempRGB(v);
       const o = i * 4;
       img.data[o] = r; img.data[o + 1] = g; img.data[o + 2] = b;
       img.data[o + 3] = Math.round(alpha * 255);
@@ -816,7 +837,8 @@ function initMap() {
   // the day layer is only attached while visible so it doesn't cost tile
   // downloads at night (or during initial load after dark)
   L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", tileOpts).addTo(map);
-  dayTiles = L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", tileOpts);
+  dayTiles = L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
+    { ...tileOpts, className: "day-tiles" });
 }
 
 document.getElementById("detail-close").addEventListener("click", () => selectStation(selectedId));
@@ -840,8 +862,4 @@ setInterval(refresh, POLL_MS);
 setInterval(refreshModel, MODEL_REFRESH_MS);
 setInterval(tickStatus, 1000);
 setInterval(() => fetchCommunity().catch(() => {}), CIV_POLL_MS);
-// idle shimmer: repaint the cached field with a drifting ripple
-setInterval(() => {
-  if (typeof document !== "undefined" && document.hidden) return;
-  if (fieldCache) paintOverlay(performance.now());
-}, 160);
+setInterval(renderLive, 2000); // live numbers drift slightly between polls

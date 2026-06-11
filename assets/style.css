@@ -248,6 +248,9 @@ body { display: flex; flex-direction: column; }
 
 .leaflet-container { font: inherit; }
 
+/* day basemap is dimmed so daylight doesn't wash out the overlay */
+.day-tiles { filter: brightness(0.72) saturate(0.8); }
+
 @media (max-width: 760px) {
   .layout { flex-direction: column; }
   #map { height: 48vh; flex: none; }
