@@ -234,19 +234,43 @@ body { display: flex; flex-direction: column; }
 }
 .temp-pill.selected { outline: 2px solid #fff; }
 .temp-pill.live { animation: pill-pulse 3.5s ease-in-out infinite; }
-.temp-pill.civ {
-  font-size: 0.6rem;
-  padding: 1px 5px;
-  opacity: 0.85;
-  border-width: 1px;
-  border-style: dashed;
+
+/* civilian sensors: small pin with a modest temperature chip above it */
+.civ-marker {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  transform: translate(-50%, -100%);
 }
+.civ-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50% 50% 50% 0;
+  transform: rotate(-45deg);
+  background: var(--pill, #888);
+  border: 1.5px solid rgba(255, 255, 255, 0.9);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+}
+.civ-temp {
+  font-size: 0.58rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  background: rgba(14, 19, 32, 0.8);
+  padding: 0 4px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+.civ-marker.selected .civ-dot { outline: 2px solid #fff; }
 
 .leaflet-container { font: inherit; }
 
-/* day basemap is dimmed and desaturated so daylight doesn't wash out the
-   overlay or pull toward the temperature ramp's colours */
-.day-tiles { filter: brightness(0.78) saturate(0.4); }
+/* daytime gently brightens the dark basemap (driven by --day-boost) */
+#map .leaflet-tile-pane {
+  filter: brightness(var(--day-boost, 1));
+  transition: filter 0.8s linear;
+}
 
 @media (max-width: 760px) {
   .layout { flex-direction: column; }

@@ -36,7 +36,7 @@ let timeline = [];    // sorted unique reading timestamps (ms) within the 24h wi
 let sliderTicks = []; // timeline thinned to SLIDER_STEP_MIN buckets
 let displayedT = null; // null = live (latest reading)
 let selectedId = null;
-let map, overlayLayer, overlayCanvas, dayTiles, dayTilesOn = false;
+let map, overlayLayer, overlayCanvas;
 let renderQueued = false;
 let model = null; // {times: [ms], grids: [Float32Array(GRID_NLAT*GRID_NLON)]}
 let latestReadingT = null, statusPinned = false;
@@ -474,10 +474,11 @@ function fmtTime(t) {
 
 // 0 = night, 1 = day, smooth ramps through twilight. Singapore sits on the
 // equator, so sunrise/sunset barely move all year (~07:00 / ~19:10 SGT).
-// The ramps span two hours so the shift never feels like a switch, and the
-// day layer is capped low (plus dimmed via CSS filter) so daytime reads as
-// softly lit rather than bright — full brightness washed out the overlay.
-const DAY_MAX_OPACITY = 0.45;
+// The ramps span two hours so the shift never feels like a switch. Daytime
+// just lifts the dark basemap's brightness a touch — "the dark theme,
+// slightly lighter" — so day never washes out contrast or clashes with the
+// temperature ramp's hues.
+const DAY_BRIGHT_BOOST = 0.4;
 
 function smooth01(x) {
   x = Math.min(1, Math.max(0, x));
@@ -493,15 +494,21 @@ function dayFactor(t) {
 function renderMarker(s, v) {
   if (!s.marker) return;
   if (v == null) { s.marker.setIcon(L.divIcon({ className: "", html: "", iconSize: [0, 0] })); return; }
-  let cls = "temp-pill";
-  if (s.kind === "civ") cls += " civ";
-  if (s.id === selectedId) cls += " selected";
-  if (displayedT === null && s.kind !== "civ") cls += " live"; // gentle pulse on current readings
-  s.marker.setIcon(L.divIcon({
-    className: "",
-    html: `<span class="${cls}" style="--pill:${tempColor(v)}">${fmt(v)}</span>`,
-    iconSize: [0, 0],
-  }));
+  let html;
+  if (s.kind === "civ") {
+    // small pin + a modest temperature chip, clearly subordinate to the
+    // official station pills
+    const sel = s.id === selectedId ? " selected" : "";
+    html = `<span class="civ-marker${sel}">` +
+      `<span class="civ-temp">${fmt(v)}</span>` +
+      `<span class="civ-dot" style="--pill:${tempColor(v)}"></span></span>`;
+  } else {
+    let cls = "temp-pill";
+    if (s.id === selectedId) cls += " selected";
+    if (displayedT === null) cls += " live"; // gentle pulse on current readings
+    html = `<span class="${cls}" style="--pill:${tempColor(v)}">${fmt(v)}</span>`;
+  }
+  s.marker.setIcon(L.divIcon({ className: "", html, iconSize: [0, 0] }));
   s.marker.bindTooltip(s.name);
 }
 
@@ -610,11 +617,12 @@ function renderDetail(values, t) {
    anomalies get painted. */
 const OVERLAY_MAX_ALPHA = 0.55;
 
-// Linear curve: middle ground between the original (too transparent) and
-// sub-linear (too filled-in). Quarter-way out paints at half strength.
+// Steep curve: fully transparent only in a thin band at the scale midpoint
+// (a wide band produced visible "transparency stripes" along the contour
+// where the field crosses the middle), full colour from ~25% out.
 function extremeness(val) {
   const f = Math.min(1, Math.max(0, (val - scaleLo) / (scaleHi - scaleLo || 1)));
-  return Math.abs(f - 0.5) * 2;
+  return smooth01(Math.abs(f - 0.5) * 4);
 }
 function renderOverlay(values, grid) {
   const pts = [...stations.values()]
@@ -729,15 +737,9 @@ function renderAll() {
   const grid = buildBlendedGrid(t ?? Date.now());
   updateWindBlend();
   updateScale(values, grid); // normalize colours before anything draws
-  if (dayTiles) {
-    const op = DAY_MAX_OPACITY * dayFactor(t ?? Date.now());
-    if (op > 0.02) {
-      if (!dayTilesOn) { dayTiles.addTo(map); dayTilesOn = true; }
-      dayTiles.setOpacity(op);
-    } else if (dayTilesOn) {
-      dayTiles.remove();
-      dayTilesOn = false;
-    }
+  if (map && map.getContainer) {
+    const boost = 1 + DAY_BRIGHT_BOOST * dayFactor(t ?? Date.now());
+    map.getContainer().style.setProperty("--day-boost", boost.toFixed(3));
   }
   for (const s of stations.values()) renderMarker(s, values.get(s.id));
   renderList(values);
@@ -768,7 +770,10 @@ function selectStation(id) {
 // frame, so panning and zooming stay correct; trails fade via destination-out.
 // ~170 particles is far cheaper than one overlay rasterization per frame.
 const WIND_N = 170;
-const WIND_DEG_PER_S = 0.0005; // visual exaggeration: °lat per second per km/h
+// visual exaggeration: °lat per second per km/h. Too low and per-frame
+// segments go sub-pixel — the fade erases them before they read as streaks.
+const WIND_DEG_PER_S = 0.0028;
+const WIND_LOOKAHEAD_S = 0.07; // segment length: a beat ahead of the particle
 
 function startWind() {
   if (typeof window === "undefined") return;
@@ -802,20 +807,25 @@ function startWind() {
     last = ts;
 
     ctx.globalCompositeOperation = "destination-out";
-    ctx.fillStyle = "rgba(0,0,0,0.08)";
+    ctx.fillStyle = "rgba(0,0,0,0.05)";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.globalCompositeOperation = "source-over";
-    ctx.strokeStyle = "rgba(214, 233, 255, 0.4)";
-    ctx.lineWidth = 1;
+    ctx.strokeStyle = "rgba(214, 233, 255, 0.55)";
+    ctx.lineWidth = 1.3;
     ctx.beginPath();
     for (const p of parts) {
       const w = windVecAt(p.lat, p.lon);
       if (!w || !Number.isFinite(w.u)) { spawn(p); continue; }
+      const dLat = w.v * WIND_DEG_PER_S;
+      const dLon = (w.u * WIND_DEG_PER_S) / Math.cos((p.lat * Math.PI) / 180);
       const from = map.latLngToContainerPoint([p.lat, p.lon]);
-      p.lat += w.v * WIND_DEG_PER_S * dt;
-      p.lon += (w.u * WIND_DEG_PER_S * dt) / Math.cos((p.lat * Math.PI) / 180);
+      // draw a fixed lookahead segment so streaks stay visible even when a
+      // frame's own travel is sub-pixel
+      const to = map.latLngToContainerPoint(
+        [p.lat + dLat * WIND_LOOKAHEAD_S, p.lon + dLon * WIND_LOOKAHEAD_S]);
+      p.lat += dLat * dt;
+      p.lon += dLon * dt;
       p.age -= dt;
-      const to = map.latLngToContainerPoint([p.lat, p.lon]);
       ctx.moveTo(from.x, from.y);
       ctx.lineTo(to.x, to.y);
       if (p.age <= 0 ||
@@ -907,14 +917,10 @@ function initMap() {
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
     maxZoom: 18,
   };
-  // night base + day layer crossfaded by the sun at the displayed time;
-  // the day layer is only attached while visible so it doesn't cost tile
-  // downloads at night (or during initial load after dark)
+  // single dark basemap; daytime just brightens it slightly via a CSS
+  // filter on the tile pane (no second tile set, no hue clash with the
+  // temperature ramp)
   L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", tileOpts).addTo(map);
-  // positron is neutral grey — voyager's warm tan read as "hot" against the
-  // blue/orange temperature ramp
-  dayTiles = L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
-    { ...tileOpts, className: "day-tiles" });
 }
 
 document.getElementById("detail-close").addEventListener("click", () => selectStation(selectedId));

@@ -32,11 +32,10 @@ static page, no backend, no hosting costs.
   newest reading. Displayed series use a centered 15-minute rolling mean so
   per-minute sensor jitter doesn't flash colours while scrubbing, and the
   colour scale eases toward its target rather than jumping.
-- The basemap follows the sun: a dimmed neutral-grey day layer (45%
-  opacity cap plus brightness/saturation filters, chosen so it doesn't
-  share hues with the temperature ramp) crossfades over the night layer
-  through two-hour dawn/dusk ramps at the displayed time, with a sun/moon
-  icon next to the clock.
+- The basemap follows the sun: daytime lifts the dark basemap's
+  brightness by up to 40% (a CSS filter on the tile pane — no second tile
+  set, no hue clash with the temperature ramp) through two-hour dawn/dusk
+  ramps at the displayed time, with a sun/moon icon next to the clock.
 - Wind streaklines: ~170 particles advected by the Open-Meteo wind field
   (fetched in the same request as temperature) drift across the map with
   fading trails, and follow the time scrubber. Particles live in
@@ -46,8 +45,8 @@ static page, no backend, no hosting costs.
   polls. Only the number displays refresh (no overlay re-rasterization),
   and it pauses when the tab is hidden.
 - Citizen sensors from [Sensor.Community](https://sensor.community) (open
-  API, no key) appear as smaller dashed pills and sharpen the shading via
-  reduced-weight residuals. They're sanity-filtered (range check, plus a
+  API, no key) appear as small pins with a modest temperature chip and
+  sharpen the shading via reduced-weight residuals. They're sanity-filtered (range check, plus a
   ±4°C check against the NEA median to drop sun-baked balcony sensors),
   kept out of the headline stats and colour scale, and live-only — there's
   no archive, so readings accumulate client-side while the page is open.
