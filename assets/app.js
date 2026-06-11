@@ -19,7 +19,7 @@ const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
 const HISTORY_HOURS = 24;
 // Shown in the footer; bump together with the ?v= stamps in index.html so a
 // glance settles "am I looking at the new build or a stale cache?"
-const APP_VERSION = "20260611t";
+const APP_VERSION = "20260611u";
 
 const SLIDER_STEP_MIN = 5; // scrubber granularity; underlying data is per-minute
 
