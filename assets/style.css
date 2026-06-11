@@ -74,7 +74,12 @@ body { display: flex; flex-direction: column; }
   width: 84px;
   height: 8px;
   border-radius: 4px;
-  background: linear-gradient(90deg, rgb(124, 199, 255), rgb(255, 224, 138), rgb(255, 122, 26));
+  /* mirrors the overlay: transparent middle, colour only at the extremes */
+  background:
+    linear-gradient(90deg,
+      rgb(124, 199, 255), rgba(124, 199, 255, 0) 42%,
+      rgba(255, 122, 26, 0) 58%, rgb(255, 122, 26)),
+    repeating-linear-gradient(45deg, #2a3450 0 3px, #1d2740 3px 6px);
 }
 
 .timebar {
@@ -136,21 +141,6 @@ body { display: flex; flex-direction: column; }
   50% { opacity: 0.55; translate: 0 -2px; }
 }
 
-#bird {
-  position: absolute;
-  z-index: 650;
-  left: -8%;
-  top: 30%;
-  opacity: 0;
-  pointer-events: none;
-}
-#bird.flying { opacity: 0.9; }
-#bird svg { animation: flap 0.9s ease-in-out infinite; }
-
-@keyframes flap {
-  0%, 100% { transform: scaleY(1); }
-  50% { transform: scaleY(0.55) translateY(2px); }
-}
 
 #time-slider { flex: 1; accent-color: var(--accent); min-width: 0; }
 

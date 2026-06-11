@@ -35,8 +35,10 @@ static page, no backend, no hosting costs.
 - The basemap follows the sun: a day layer (capped at 60% so it stays easy
   on the eyes) crossfades over the night layer through two-hour dawn/dusk
   ramps at the displayed time, with a sun/moon icon next to the clock.
-- Ambient touches: stylized waves bob on open water, and a gull
-  occasionally crosses the map during daytime hours.
+- Ambient touches: stylized waves bob on open water.
+- Overlay opacity scales with distance from the middle of the colour scale:
+  near-average areas stay transparent so the basemap reads clearly, and
+  only genuine hot/cold anomalies get painted.
 
 ## Setting it up
 

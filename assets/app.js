@@ -489,7 +489,16 @@ function renderDetail(values, t) {
    as an image layer. With the Open-Meteo model loaded, every pixel is the
    model field corrected by nearby station residuals (smooth everywhere, exact
    at the sensors). Without it, falls back to station-only IDW with alpha
-   fading away from stations, since values far from any sensor are guesswork. */
+   fading away from stations, since values far from any sensor are guesswork.
+   Opacity scales with distance from the middle of the colour scale: average
+   areas are transparent (map stays readable), only genuine hot and cold
+   anomalies get painted. */
+const OVERLAY_MAX_ALPHA = 0.55;
+
+function extremeness(val) {
+  const f = Math.min(1, Math.max(0, (val - scaleLo) / (scaleHi - scaleLo || 1)));
+  return Math.pow(Math.abs(f - 0.5) * 2, 1.4);
+}
 function renderOverlay(values, grid) {
   const pts = [...stations.values()]
     .filter((s) => values.has(s.id) && Number.isFinite(s.lat) && Number.isFinite(s.lon))
@@ -518,7 +527,7 @@ function renderOverlay(values, grid) {
         if (val == null) continue;
         // soft fade only at the raster's outer edges
         const edge = Math.min(px, OVERLAY.w - 1 - px, py, OVERLAY.h - 1 - py) / edgePx;
-        alpha = 0.5 * Math.min(1, edge);
+        alpha = OVERLAY_MAX_ALPHA * extremeness(val) * Math.min(1, edge);
       } else {
         let wSum = 0, vSum = 0, nearest = Infinity;
         for (const p of pts) {
@@ -532,7 +541,8 @@ function renderOverlay(values, grid) {
         }
         val = vSum / wSum;
         // full shade within 8 km of a station, gone past 18 km
-        alpha = 0.55 * Math.min(1, Math.max(0, (18 - Math.sqrt(nearest)) / 10));
+        alpha = OVERLAY_MAX_ALPHA * extremeness(val)
+          * Math.min(1, Math.max(0, (18 - Math.sqrt(nearest)) / 10));
       }
       if (alpha <= 0) continue;
       const [r, g, b] = tempRGB(val);
@@ -625,29 +635,6 @@ function initDecor() {
       }),
     }).addTo(map);
   });
-  if (typeof window === "undefined") return;
-  scheduleBird();
-}
-
-// A gull drifts across the map now and then — daytime only, birds sleep.
-function scheduleBird() {
-  setTimeout(flyBird, 12_000 + Math.random() * 40_000);
-}
-
-function flyBird() {
-  if (dayFactor(displayedTime() ?? Date.now()) < 0.25) { scheduleBird(); return; }
-  const bird = document.getElementById("bird");
-  const fromLeft = Math.random() < 0.5;
-  const dur = 14_000 + Math.random() * 8_000;
-  bird.style.transition = "none";
-  bird.style.top = `${12 + Math.random() * 45}%`;
-  bird.style.left = fromLeft ? "-8%" : "104%";
-  bird.style.transform = fromLeft ? "scaleX(1)" : "scaleX(-1)";
-  bird.classList.add("flying");
-  void bird.offsetWidth; // commit the start position before animating
-  bird.style.transition = `left ${dur}ms linear`;
-  bird.style.left = fromLeft ? "104%" : "-8%";
-  setTimeout(() => { bird.classList.remove("flying"); scheduleBird(); }, dur);
 }
 
 // ---------- status ----------
@@ -718,8 +705,12 @@ function initMap() {
     zoomSnap: 0, // fractional zoom, so min zoom can match the bounds exactly
   });
   map.fitBounds(dataBounds);
-  // can't zoom out past the point where the data window fills the screen
-  map.setMinZoom(map.getBoundsZoom(dataBounds));
+  // Fully zoomed out = screen completely filled by the data window
+  // (inside=true), so the map can never show past the data edge. Recompute
+  // when the container changes shape, or a resize would reopen the gap.
+  const lockMinZoom = () => map.setMinZoom(map.getBoundsZoom(dataBounds, true));
+  lockMinZoom();
+  map.on("resize", lockMinZoom);
   const tileOpts = {
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
     maxZoom: 18,
