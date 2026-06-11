@@ -13,7 +13,7 @@
   <link rel="stylesheet" href="assets/vendor/leaflet/leaflet.css">
   <!-- bump ?v= whenever style.css or app.js changes: stale cached assets
        under a fresh index.html render a broken hybrid of old and new -->
-  <link rel="stylesheet" href="assets/style.css?v=20260611c">
+  <link rel="stylesheet" href="assets/style.css?v=20260611p">
 </head>
 <body>
   <header class="topbar">
@@ -44,14 +44,16 @@
       <div class="timebar">
         <button id="live-btn" title="Jump to latest reading">LIVE</button>
         <button id="wind-btn" title="Toggle wind streaks">WIND</button>
+        <button id="radar-btn" title="Toggle precipitation radar">RADAR</button>
         <input type="range" id="time-slider" min="0" max="0" step="1" value="0"
                aria-label="Time scrubber for the last 24 hours">
         <span id="sky-icon" aria-hidden="true"></span>
         <span id="time-label">–</span>
       </div>
+      <button id="panel-show" class="hidden" title="Show stations">«</button>
     </div>
 
-    <aside class="panel">
+    <aside class="panel" id="side-panel">
       <section class="detail hidden" id="detail">
         <div class="detail-head">
           <h2 id="detail-name"></h2>
@@ -74,6 +76,7 @@
             <option value="wind">Wind</option>
             <option value="civ">Community</option>
           </select>
+          <button id="panel-btn" title="Hide panel">»</button>
         </div>
         <ul id="station-list"></ul>
       </section>
@@ -86,11 +89,13 @@
     · shading: <span id="shade-mode">stations only</span>,
     model grid by <a href="https://open-meteo.com" target="_blank" rel="noopener">Open-Meteo</a>
     · wind <span id="wind-status">–</span>
+    · rain <span id="rain-status">…</span>
+    · radar <span id="sat-status">…</span>
     · community <span id="civ-status">…</span>
     · refreshes every minute
   </footer>
 
   <script src="assets/vendor/leaflet/leaflet.js"></script>
-  <script src="assets/app.js?v=20260611c"></script>
+  <script src="assets/app.js?v=20260611p"></script>
 </body>
 </html>

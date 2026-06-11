@@ -62,6 +62,19 @@ static page, no backend, no hosting costs.
   so the numbers tick like a real-time feed between the actual per-minute
   polls. Only the number displays refresh (no overlay re-rasterization),
   and it pauses when the tab is hidden.
+- Rain: 5-minute rainfall totals from NEA's ~60 gauges (polled every 5
+  minutes) are rasterized onto the same coarse grid as the wind; falling
+  streaks render near wet gauges from the existing particle loop, leaning
+  with the local wind and lengthening with intensity. Live view only —
+  there's no archived rain series yet. The footer shows wet-gauge count
+  and peak intensity.
+- Clouds: NEA's 2-hour forecast names ~47 areas; cloudy/rainy/stormy ones
+  get a blurred drifting sprite at the area's label point (CSS-animated in
+  its own map pane, zero per-frame JS). Hidden while scrubbing, since the
+  forecast only describes now.
+- The wind field is precomputed onto a 24×16 grid once per change, so
+  particles and rain sample it with one bilinear lookup per tick instead
+  of per-particle IDW.
 - Citizen sensors from [Sensor.Community](https://sensor.community) (open
   API, no key) appear as small pins with a modest temperature chip and
   sharpen the shading via reduced-weight residuals. They're sanity-filtered (range check, plus a

@@ -9,6 +9,9 @@ const V2_URL = "https://api-open.data.gov.sg/v2/real-time/api/air-temperature";
 const V1_URL = "https://api.data.gov.sg/v1/environment/air-temperature";
 const WIND_SPEED_URL = "https://api.data.gov.sg/v1/environment/wind-speed";
 const WIND_DIR_URL = "https://api.data.gov.sg/v1/environment/wind-direction";
+const RAIN_URL = "https://api.data.gov.sg/v1/environment/rainfall";
+const RAIN_POLL_MS = 5 * 60_000; // gauges report 5-minute totals
+const SAT_POLL_MS = 10 * 60_000; // satellite frames update every ~10 minutes
 const KNOTS_TO_KMH = 1.852;
 const OM_URL = "https://api.open-meteo.com/v1/forecast";
 const POLL_MS = 60_000;
@@ -386,6 +389,406 @@ function updateWindField() {
     windVectors.push(vec);
     windVectorsById.set(st.id, vec);
   }
+  buildWindGrid();
+}
+
+/* The displayed-time wind field rasterized onto a coarse grid: built once
+   per field change (a few hundred cells × a dozen stations), so the
+   per-frame particle work drops from one IDW pass per particle per tick to
+   a cheap bilinear lookup. NaN cells mark "no data within coverage". */
+const WGRID = { nx: 24, ny: 16 };
+let windGridU = null, windGridV = null;
+
+function buildWindGrid() {
+  if (windVectors.length < 2) { windGridU = null; windGridV = null; return; }
+  const { nx, ny } = WGRID;
+  windGridU = new Float32Array(nx * ny);
+  windGridV = new Float32Array(nx * ny);
+  const cosLat = Math.cos((1.35 * Math.PI) / 180);
+  const cover2 = WIND_COVER_KM * WIND_COVER_KM;
+  for (let iy = 0; iy < ny; iy++) {
+    const lat = OVERLAY.latMax - ((iy + 0.5) / ny) * (OVERLAY.latMax - OVERLAY.latMin);
+    for (let ix = 0; ix < nx; ix++) {
+      const lon = OVERLAY.lonMin + ((ix + 0.5) / nx) * (OVERLAY.lonMax - OVERLAY.lonMin);
+      let wSum = 0, u = 0, v = 0, nearest = Infinity;
+      for (const p of windVectors) {
+        const dx = (lon - p.lon) * cosLat * KM_PER_DEG;
+        const dy = (lat - p.lat) * KM_PER_DEG;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < nearest) nearest = d2;
+        const w = 1 / (d2 + 0.5);
+        wSum += w; u += w * p.u; v += w * p.v;
+      }
+      const i = iy * nx + ix;
+      if (nearest > cover2) { windGridU[i] = NaN; windGridV[i] = NaN; }
+      else { windGridU[i] = u / wSum; windGridV[i] = v / wSum; }
+    }
+  }
+}
+
+// ---------- rain (NEA rain gauges, 24h history, scrubbable) ----------
+
+/* 5-minute rainfall totals from ~60 gauges, kept as a 24-hour per-gauge
+   series (positive readings only — absence means dry). A gauge is "wet" at
+   a moment if it rained within the previous 30 minutes, so showers that
+   just ended still show (faded). The time scrubber replays the day's rain.
+   Each wet gauge gets a rain glyph and a translucent circle estimating the
+   splash zone (radius and colour grow with intensity). */
+const RAIN_RECENT_MS = 30 * 60_000;
+let rainReadings = []; // latest poll: [{id, lat, lon, mm}]
+let wetGauges = [];    // wet list at "now"
+const rainSeries = new Map(); // gauge id -> [{t, mm>0}] sorted, ~25h window
+const rainLocs = new Map();   // gauge id -> {lat, lon}
+
+function pushRainSeries(id, t, mm) {
+  if (!(mm > 0) || !Number.isFinite(t)) return;
+  const arr = rainSeries.get(id) ?? [];
+  if (arr.some((p) => p.t === t)) return;
+  arr.push({ t, mm });
+  arr.sort((a, b) => a.t - b.t);
+  rainSeries.set(id, arr);
+}
+
+function pruneRainSeries() {
+  const cutoff = Date.now() - (HISTORY_HOURS + 1) * 3600_000;
+  for (const [id, arr] of rainSeries) {
+    while (arr.length && arr[0].t < cutoff) arr.shift();
+    if (!arr.length) rainSeries.delete(id);
+  }
+}
+
+function rainSum(arr, from, to) {
+  let s = 0;
+  for (const p of arr) {
+    if (p.t > from && p.t <= to) s += p.mm;
+  }
+  return s;
+}
+
+// Gauges wet at a moment: rained in the 30 minutes before it.
+function wetList(t) {
+  const out = [];
+  for (const [id, arr] of rainSeries) {
+    const recent = rainSum(arr, t - RAIN_RECENT_MS, t);
+    if (recent <= 0.2) continue;
+    const loc = rainLocs.get(id);
+    if (!loc) continue;
+    out.push({ id, lat: loc.lat, lon: loc.lon, mm: rainSum(arr, t - 5.5 * 60_000, t), recent });
+  }
+  return out;
+}
+
+function recomputeWet() {
+  pruneRainSeries();
+  wetGauges = wetList(Date.now());
+}
+
+async function fetchRainSnap(dt) {
+  const q = dt ? `?date_time=${encodeURIComponent(sgtStamp(dt))}` : "";
+  const res = await fetch429(RAIN_URL + q);
+  if (!res.ok) throw new Error(`rain HTTP ${res.status}`);
+  const json = await res.json();
+  const item = json.items?.[0] ?? { readings: [] };
+  for (const s of json.metadata?.stations ?? []) {
+    if (s.location) rainLocs.set(s.id, { lat: s.location.latitude, lon: s.location.longitude });
+  }
+  return {
+    t: new Date(item.timestamp).getTime() || Date.now(),
+    readings: item.readings ?? [],
+  };
+}
+
+async function fetchRain() {
+  // like every realtime feed here, the latest snapshot can be sparse — top
+  // up from the previous 5-minute mark when it looks thin
+  const snaps = [await fetchRainSnap()];
+  if (snaps[0].readings.length < 10) {
+    const m = new Date(Date.now() - 5 * 60_000);
+    m.setSeconds(0, 0);
+    m.setMinutes(Math.floor(m.getMinutes() / 5) * 5);
+    try { snaps.push(await fetchRainSnap(m)); } catch { /* best-effort */ }
+  }
+  const byId = new Map();
+  for (const snap of snaps) {
+    for (const r of snap.readings) {
+      const loc = rainLocs.get(r.station_id);
+      if (!loc || r.value == null || r.value < 0 || byId.has(r.station_id)) continue;
+      byId.set(r.station_id, { id: r.station_id, lat: loc.lat, lon: loc.lon, mm: r.value });
+      pushRainSeries(r.station_id, snap.t, r.value);
+    }
+  }
+  rainReadings = [...byId.values()];
+  recomputeWet();
+  console.info(`[sgtemp] rain: ${rainReadings.length} gauges reporting, ${wetGauges.length} wet`);
+  renderRain();
+  renderRainStatus();
+}
+
+// Full 24h rain history from the day files (today + yesterday), deferred —
+// it powers the time scrubber and settles "did it really not rain today?".
+let rainDayLoaded = false;
+
+async function loadRainHistory() {
+  if (rainDayLoaded) return;
+  rainDayLoaded = true;
+  for (const day of [sgtDate(new Date()), sgtDate(new Date(Date.now() - 86_400_000))]) {
+    try {
+      const res = await fetch429(`${RAIN_URL}?date=${day}`);
+      if (!res.ok) continue;
+      const json = await res.json();
+      for (const s of json.metadata?.stations ?? []) {
+        if (s.location) rainLocs.set(s.id, { lat: s.location.latitude, lon: s.location.longitude });
+      }
+      for (const item of json.items ?? []) {
+        const t = new Date(item.timestamp).getTime();
+        for (const r of item.readings ?? []) {
+          if (r.value > 0) pushRainSeries(r.station_id, t, r.value);
+        }
+      }
+    } catch { /* day files are best-effort */ }
+  }
+  recomputeWet();
+  renderRain();
+  renderRainStatus();
+  if (typeof localStorage !== "undefined") saveHistCache();
+}
+
+// Seed the 30-minute window so rain that fell before the page was opened
+// still shows. Rainfall publishes on exact 5-minute marks (unlike wind), so
+// six small spot-snapshots beat downloading the multi-MB day file.
+async function seedRainRecent() {
+  for (let back = 5; back <= 30; back += 5) {
+    const m = new Date(Date.now() - back * 60_000);
+    m.setSeconds(0, 0);
+    m.setMinutes(Math.floor(m.getMinutes() / 5) * 5);
+    try {
+      const res = await fetch429(`${RAIN_URL}?date_time=${encodeURIComponent(sgtStamp(m))}`);
+      if (!res.ok) continue;
+      const item = (await res.json()).items?.[0];
+      if (!item) continue;
+      const t = new Date(item.timestamp).getTime();
+      if (!Number.isFinite(t)) continue;
+      for (const r of item.readings ?? []) {
+        if (r.value > 0) pushRainSeries(r.station_id, t, r.value);
+      }
+    } catch { /* seeding is best-effort */ }
+  }
+  recomputeWet();
+  renderRain();
+  renderRainStatus();
+}
+
+const rainLayer = new Map(); // gauge id -> {circle, icon}
+
+// Light drizzle = light blue, downpour = deep blue.
+function rainColor(mm) {
+  const t = Math.min(1, Math.max(0, (mm - 0.2) / 8));
+  const c0 = [158, 212, 255], c1 = [16, 86, 200];
+  return `rgb(${c0.map((v, i) => Math.round(v + (c1[i] - v) * t)).join(",")})`;
+}
+
+function renderRain() {
+  if (typeof L === "undefined" || !map) return;
+  // live shows "now"; scrubbing replays the day's rain at the displayed time
+  const list = displayedT === null ? wetGauges : wetList(displayedTime() ?? Date.now());
+  const seen = new Set();
+  for (const g of list) {
+    seen.add(g.id);
+    const active = g.mm > 0.05; // raining now vs rained recently
+    const intensity = Math.max(g.mm, (g.recent ?? 0) / 3);
+    const radius = 1200 + Math.min(8, intensity) * 350; // metres — a rough splash zone
+    const col = rainColor(intensity);
+    let e = rainLayer.get(g.id);
+    if (!e) {
+      e = {
+        circle: L.circle([g.lat, g.lon], {
+          pane: "rain", radius,
+          color: col, weight: 1,
+          fillColor: col,
+          interactive: false,
+        }).addTo(map),
+        icon: L.marker([g.lat, g.lon], { pane: "rain", keyboard: false }).addTo(map),
+      };
+      rainLayer.set(g.id, e);
+    }
+    e.circle.setRadius(radius);
+    if (e.circle.setStyle) {
+      e.circle.setStyle({
+        color: col, fillColor: col,
+        opacity: active ? 0.4 : 0.2,
+        fillOpacity: active ? 0.14 : 0.06,
+      });
+    }
+    e.icon.setIcon(L.divIcon({
+      className: "",
+      html: `<span class="rain-icon"${active ? "" : ' style="opacity:0.5"'}>🌧️</span>`,
+      iconSize: [0, 0],
+    }));
+    e.icon.bindTooltip(
+      `${g.mm.toFixed(1)} mm now · ${(g.recent ?? 0).toFixed(1)} mm last 30 min`);
+  }
+  for (const [id, e] of rainLayer) {
+    if (!seen.has(id)) { e.circle.remove(); e.icon.remove(); rainLayer.delete(id); }
+  }
+}
+
+// Open the page with ?testrain to verify the rain rendering on a dry day:
+// synthetic wet gauges replace the real poll.
+const TEST_RAIN = typeof location !== "undefined" && /testrain/.test(location.search);
+
+function injectTestRain() {
+  const now = Date.now();
+  const gauges = [
+    { id: "T1", lat: 1.34, lon: 103.78, mm: 6 },
+    { id: "T2", lat: 1.36, lon: 103.95, mm: 2.5 },
+    { id: "T3", lat: 1.29, lon: 103.85, mm: 0 }, // "rained 20 min ago" look
+  ];
+  rainReadings = gauges;
+  for (const g of gauges) {
+    rainLocs.set(g.id, { lat: g.lat, lon: g.lon });
+    pushRainSeries(g.id, now, g.mm);
+    pushRainSeries(g.id, now - 20 * 60_000, 3);
+  }
+  recomputeWet();
+  renderRain();
+  const el = document.getElementById("rain-status");
+  if (el) el.textContent = "TEST MODE — synthetic rain";
+}
+
+function pollRain() {
+  if (TEST_RAIN) { injectTestRain(); return; }
+  fetchRain().catch(() => {
+    const el = document.getElementById("rain-status");
+    if (el) el.textContent = "unreachable";
+  });
+}
+
+function renderRainStatus() {
+  const el = document.getElementById("rain-status");
+  if (!el) return;
+  if (!rainReadings.length) { el.textContent = "no gauges reporting"; return; }
+  if (!wetGauges.length) {
+    el.textContent = `dry 30 min (${rainReadings.length} gauges)`;
+    return;
+  }
+  const max = Math.max(...wetGauges.map((g) => Math.max(g.mm, (g.recent ?? 0) / 3)));
+  el.textContent = `${wetGauges.length} gauge${wetGauges.length > 1 ? "s" : ""} wet · up to ${max.toFixed(1)} mm`;
+}
+
+// ---------- precipitation radar (RainViewer) ----------
+
+/* The organic green blobs on commercial weather maps are precipitation
+   radar, not satellite cloud photos: smoothed reflectivity composites
+   coloured by intensity. RainViewer's free API still serves the global
+   radar composite (only its satellite product was retired), so we draw the
+   latest frame with the classic NEXRAD palette, smoothed. */
+const RV_META_URL = "https://api.rainviewer.com/public/weather-maps.json";
+let satLayer = null, satLabel = "";
+let radarOn = true;
+try { radarOn = localStorage.getItem("sgtemp-radar") !== "off"; } catch { /* default on */ }
+
+function updateRadarBtn() {
+  const b = document.getElementById("radar-btn");
+  if (b && b.classList) b.classList.toggle("active", radarOn);
+}
+
+function setSatStatus(text) {
+  const el = document.getElementById("sat-status");
+  if (el) el.textContent = text;
+}
+
+let radarFrames = []; // [{time: sec, path}] \u2014 RainViewer keeps ~2h of past frames
+let radarHost = "";
+let radarPath = null;
+
+function radarUrl(path) {
+  // colour scheme 6 = NEXRAD green/yellow/red; options 1_1 = smoothed
+  return `${radarHost}${path}/256/{z}/{x}/{y}/6/1_1.png`;
+}
+
+function radarFrameFor(tMs) {
+  let best = null, bestD = Infinity;
+  for (const f of radarFrames) {
+    const d = Math.abs(f.time * 1000 - tMs);
+    if (d < bestD) { bestD = d; best = f; }
+  }
+  return bestD <= 15 * 60_000 ? best : null;
+}
+
+// Show the frame matching the displayed time: latest when live, the nearest
+// archive frame when scrubbing the last ~2h, hidden (with an honest status)
+// beyond the archive.
+function applyRadarFrame() {
+  if (!satLayer || !radarOn || !radarFrames.length) return;
+  const pane = map.getPane && map.getPane("clouds");
+  const f = displayedT === null
+    ? radarFrames[radarFrames.length - 1]
+    : radarFrameFor(displayedTime() ?? Date.now());
+  if (!f) {
+    if (pane) pane.style.display = "none";
+    setSatStatus("no archive at this time");
+    return;
+  }
+  if (pane) pane.style.display = "";
+  if (f.path !== radarPath) {
+    radarPath = f.path;
+    satLabel = new Date(f.time * 1000).toLocaleTimeString("en-SG",
+      { timeZone: "Asia/Singapore", hour: "2-digit", minute: "2-digit" });
+    satLayer.setUrl(radarUrl(f.path));
+    setSatStatus(`radar ${satLabel}`);
+  }
+}
+
+async function fetchSatellite() {
+  if (!radarOn) { setSatStatus("off"); return; }
+  const res = await fetch429(RV_META_URL);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const json = await res.json();
+  radarHost = json.host;
+  radarFrames = json.radar?.past ?? [];
+  if (!radarFrames.length) { setSatStatus("no radar frames"); return; }
+  if (!satLayer) {
+    satLayer = L.tileLayer(radarUrl(radarFrames[radarFrames.length - 1].path), {
+      pane: "clouds",
+      opacity: 0.7,
+      // RainViewer's free tiles stop here; beyond it they serve a literal
+      // "Zoom Level Not Supported" image, so Leaflet must upscale instead
+      maxNativeZoom: 7,
+      maxZoom: 18,
+      attribution: 'Radar: <a href="https://www.rainviewer.com/">RainViewer</a>',
+    });
+    if (satLayer.on) {
+      satLayer.on("tileload", () => setSatStatus(`radar ${satLabel}`));
+      satLayer.on("tileerror", () => setSatStatus("tiles failing"));
+    }
+    satLayer.addTo(map);
+    setSatStatus("loading radar\u2026");
+  }
+  radarPath = null; // force re-apply with the fresh frame list
+  applyRadarFrame();
+}
+
+function pollSatellite() {
+  fetchSatellite().catch((e) => setSatStatus(`unreachable (${e.message})`));
+}
+
+
+// Bilinear sample over a WGRID-shaped array (row 0 = north); null on NaN.
+function gridSample2(arr, lat, lon) {
+  const { nx, ny } = WGRID;
+  let fy = ((OVERLAY.latMax - lat) / (OVERLAY.latMax - OVERLAY.latMin)) * ny - 0.5;
+  let fx = ((lon - OVERLAY.lonMin) / (OVERLAY.lonMax - OVERLAY.lonMin)) * nx - 0.5;
+  fy = Math.min(ny - 1, Math.max(0, fy));
+  fx = Math.min(nx - 1, Math.max(0, fx));
+  const cy = Math.min(ny - 2, Math.floor(fy));
+  const cx = Math.min(nx - 2, Math.floor(fx));
+  const ty = fy - cy, tx = fx - cx;
+  const v00 = arr[cy * nx + cx], v01 = arr[cy * nx + cx + 1];
+  const v10 = arr[(cy + 1) * nx + cx], v11 = arr[(cy + 1) * nx + cx + 1];
+  if (Number.isNaN(v00) || Number.isNaN(v01) || Number.isNaN(v10) || Number.isNaN(v11)) return null;
+  const top = v00 + (v01 - v00) * tx;
+  const bot = v10 + (v11 - v10) * tx;
+  return top + (bot - top) * ty;
 }
 
 function ensureWindField() {
@@ -554,21 +957,13 @@ function pollWind() {
   fetchWind().catch(() => renderWindStatus());
 }
 
-function idwWind(lat, lon) {
-  const cosLat = Math.cos((1.35 * Math.PI) / 180);
-  let wSum = 0, uSum = 0, vSum = 0;
-  for (const p of windVectors) {
-    const dx = (lon - p.lon) * cosLat * KM_PER_DEG;
-    const dy = (lat - p.lat) * KM_PER_DEG;
-    const w = 1 / (dx * dx + dy * dy + 0.5);
-    wSum += w; uSum += w * p.u; vSum += w * p.v;
-  }
-  return { u: uSum / wSum, v: vSum / wSum };
-}
-
 function windVecAt(lat, lon) {
   ensureWindField();
-  if (windVectors.length >= 2) return idwWind(lat, lon); // observed at displayed time
+  if (windGridU) { // observed at displayed time, precomputed grid
+    const u = gridSample2(windGridU, lat, lon);
+    const v = gridSample2(windGridV, lat, lon);
+    return u == null || v == null ? null : { u, v };
+  }
   if (!windU) return null; // fall back to the model field if we have one
   const u = gridSample(windU, lat, lon);
   const v = gridSample(windV, lat, lon);
@@ -1189,6 +1584,8 @@ function renderAll() {
   renderTimebar(t);
   renderWindStatus();
   renderWindPins();
+  renderRain(); // rain follows the scrubber (24h series)
+  applyRadarFrame(); // radar follows it too, within RainViewer's ~2h archive
 }
 
 // Coalesce slider-drag renders to animation frames.
@@ -1226,6 +1623,7 @@ let windParts = [];
 // Particles only where there's actual wind data nearby — the IDW field happily
 // extrapolates over Malaysia, but that's invention, not data.
 function windCovered(lat, lon) {
+  if (windGridU) return gridSample2(windGridU, lat, lon) != null;
   const pts = windStations.size
     ? [...windStations.values()]
     : [...stations.values()].filter((s) => s.kind === "nea" && Number.isFinite(s.lat));
@@ -1306,20 +1704,21 @@ function startWind() {
 
   windParts = Array.from({ length: WIND_N }, () => spawnPart());
   const cosLat = Math.cos((1.35 * Math.PI) / 180);
-  let last = 0, tick = 0, wasReady = false;
+  let last = 0, tick = 0, spawnedFor = -1;
 
   // Until the anemometer set is in, the coverage mask is one small circle
   // around whichever station reported first — all 400 particles would swarm
   // it. Hold rendering until the archive lands (or enough stations join),
-  // then scatter the particles across the full coverage in one go.
+  // and re-scatter whenever the network grows meaningfully so the swarm
+  // can never persist.
   const windReady = () => windDayLoaded || windStations.size >= 8;
 
   function frame(ts) {
     requestAnimationFrame(frame);
     if (!windOn || document.hidden) { last = ts; return; }
     if (!windReady()) { last = ts; return; }
-    if (!wasReady) {
-      wasReady = true;
+    if (spawnedFor < 0 || windStations.size >= spawnedFor + 3) {
+      spawnedFor = windStations.size;
       windParts.forEach((p) => spawnPart(p));
     }
     if (ts - last < WIND_TICK_MS) return;
@@ -1431,7 +1830,7 @@ async function refresh() {
 // extracted per-station series are a few hundred KB — small enough for
 // localStorage. A reload within the freshness window restores instantly and
 // skips every archive download (live polls fill forward from there).
-const HIST_CACHE_KEY = "sgtemp-hist-v1";
+const HIST_CACHE_KEY = "sgtemp-hist-v2";
 const HIST_CACHE_MS = 15 * 60_000;
 let lastHistSave = 0;
 
@@ -1448,6 +1847,11 @@ function saveHistCache() {
         id: w.id, name: w.name, lat: w.lat, lon: w.lon,
         series: w.series.map((p) => [p.t, p.u, p.v]),
       })),
+      rain: [...rainSeries].map(([id, arr]) => {
+        const loc = rainLocs.get(id);
+        return { id, lat: loc?.lat, lon: loc?.lon, series: arr.map((p) => [p.t, p.mm]) };
+      }),
+      rainDone: rainDayLoaded,
     }));
   } catch { /* quota or unavailable — caching is best-effort */ }
 }
@@ -1468,7 +1872,16 @@ function loadHistCache() {
         });
       }
     }
-    if (c.wind?.length) windDayLoaded = true; // wind archive already covered
+    // Only trust the cached wind set if it's the full network — a cache
+    // saved during a rate-limited session can hold 1-2 stations, and
+    // marking the archive "done" then locks in the degraded set (particles
+    // swarm the one covered circle).
+    if ((c.wind?.length ?? 0) >= 8) windDayLoaded = true;
+    for (const rc of c.rain ?? []) {
+      if (Number.isFinite(rc.lat)) rainLocs.set(rc.id, { lat: rc.lat, lon: rc.lon });
+      for (const [t, mm] of rc.series ?? []) pushRainSeries(rc.id, t, mm);
+    }
+    if (c.rainDone) rainDayLoaded = true;
     return (c.stations ?? []).length > 0;
   } catch {
     return false;
@@ -1547,6 +1960,11 @@ function initMap() {
     maxBoundsViscosity: 1.0, // hard wall when panning
     zoomSnap: 0, // fractional zoom, so min zoom can match the bounds exactly
   });
+  const cloudPane = map.createPane("clouds"); // satellite tiles
+  cloudPane.style.zIndex = 430; // above the shading (400), below markers (600)
+  cloudPane.style.pointerEvents = "none";
+  const rainPane = map.createPane("rain"); // gauge glyphs + splash circles
+  rainPane.style.zIndex = 440;
   map.fitBounds(dataBounds);
   // Fully zoomed out = screen completely filled by the data window
   // (inside=true), so the map can never show past the data edge. Recompute
@@ -1588,6 +2006,42 @@ filterSel.addEventListener("change", () => {
   renderAll();
 });
 
+document.getElementById("radar-btn").addEventListener("click", () => {
+  radarOn = !radarOn;
+  try { localStorage.setItem("sgtemp-radar", radarOn ? "on" : "off"); } catch { /* fine */ }
+  updateRadarBtn();
+  if (!radarOn) {
+    if (satLayer && satLayer.remove) satLayer.remove();
+    setSatStatus("off");
+  } else if (satLayer) {
+    satLayer.addTo(map);
+    radarPath = null;
+    applyRadarFrame();
+  } else {
+    pollSatellite();
+  }
+});
+updateRadarBtn();
+
+// Collapsible station panel: hide to give the map the full width; a slim
+// handle on the map edge brings it back. The map must re-measure after.
+let panelOpen = true;
+try { panelOpen = localStorage.getItem("sgtemp-panel") !== "closed"; } catch { /* default open */ }
+
+function setPanel(open) {
+  panelOpen = open;
+  const panel = document.getElementById("side-panel");
+  const show = document.getElementById("panel-show");
+  if (panel && panel.classList) panel.classList.toggle("hidden", !open);
+  if (show && show.classList) show.classList.toggle("hidden", open);
+  try { localStorage.setItem("sgtemp-panel", open ? "open" : "closed"); } catch { /* fine */ }
+  if (map && map.invalidateSize) map.invalidateSize();
+}
+
+document.getElementById("panel-btn").addEventListener("click", () => setPanel(false));
+document.getElementById("panel-show").addEventListener("click", () => setPanel(true));
+if (!panelOpen) setPanel(false);
+
 document.getElementById("wind-btn").addEventListener("click", () => {
   windOn = !windOn;
   try { localStorage.setItem("sgtemp-wind", windOn ? "on" : "off"); } catch { /* fine */ }
@@ -1599,10 +2053,18 @@ initMap();
 startWind();
 refresh().then(loadHistory).then(() => {
   pollCommunity();
-  // wind archive matters only for scrubbing — let the visible stuff win
+  pollRain();
+  pollSatellite();
+  // archives matter only for scrubbing/recency — let the visible stuff win
   setTimeout(() => loadWindHistory().catch(() => {}), 1500);
+  if (!TEST_RAIN) {
+    setTimeout(() => seedRainRecent().catch(() => {}), 3000);
+    setTimeout(() => loadRainHistory().catch(() => {}), 6000);
+  }
 });
 pollWind();
+setInterval(pollRain, RAIN_POLL_MS);
+setInterval(pollSatellite, SAT_POLL_MS);
 setInterval(pollWind, POLL_MS);
 refreshModel();
 setInterval(refresh, POLL_MS);
