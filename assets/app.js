@@ -420,16 +420,25 @@ async function fetchWindDayRaw(dayStr) {
   }
 }
 
+// Deferred wind archive: only needed for scrubbing, so it loads after the
+// temperature history instead of competing with it at startup.
+async function loadWindHistory() {
+  if (windDayLoaded) return;
+  windDayLoaded = true;
+  for (const day of [sgtDate(new Date()), sgtDate(new Date(Date.now() - 86_400_000))]) {
+    try { await fetchWindDayRaw(day); } catch { /* day files are best-effort */ }
+  }
+  updateWindField();
+  renderWindStatus();
+  renderWindPins();
+  scheduleRender();
+  if (typeof localStorage !== "undefined") saveHistCache();
+}
+
 async function fetchWind() {
   const snap = await fetchWindAt();
   for (const [id, kn] of snap.speeds) {
     addWindPoint(id, snap.locs.get(id), snap.ts, kn, snap.dirs.get(id));
-  }
-  if (!windDayLoaded) {
-    windDayLoaded = true;
-    for (const day of [sgtDate(new Date()), sgtDate(new Date(Date.now() - 86_400_000))]) {
-      try { await fetchWindDayRaw(day); } catch { /* day files are best-effort */ }
-    }
   }
   const cutoff = Date.now() - (HISTORY_HOURS + 1) * 3600_000;
   for (const st of windStations.values()) {
@@ -1357,28 +1366,91 @@ async function refresh() {
     showError(null);
     latestReadingT = timeline[timeline.length - 1] ?? null;
     tickStatus();
+    // keep the reload cache fresh so the next visit skips the archives
+    if (typeof localStorage !== "undefined" && Date.now() - lastHistSave > 5 * 60_000 && timeline.length > 100) {
+      saveHistCache();
+    }
   } catch (e) {
     showError(`Could not reach data.gov.sg (${e.message}). Retrying in a minute…`);
     setStatus("retrying…", true);
   }
 }
 
-// Bulk-load the 24h window: yesterday + today fetched in parallel, each
-// rendered as soon as it lands so the scrubber becomes usable immediately.
+// Processed-history cache: the raw day files are several MB each, but the
+// extracted per-station series are a few hundred KB — small enough for
+// localStorage. A reload within the freshness window restores instantly and
+// skips every archive download (live polls fill forward from there).
+const HIST_CACHE_KEY = "sgtemp-hist-v1";
+const HIST_CACHE_MS = 15 * 60_000;
+let lastHistSave = 0;
+
+function saveHistCache() {
+  try {
+    lastHistSave = Date.now();
+    localStorage.setItem(HIST_CACHE_KEY, JSON.stringify({
+      at: lastHistSave,
+      stations: [...stations.values()].map((s) => ({
+        id: s.id, name: s.name, lat: s.lat, lon: s.lon, kind: s.kind,
+        series: [...s.series],
+      })),
+      wind: [...windStations.values()].map((w) => ({
+        id: w.id, name: w.name, lat: w.lat, lon: w.lon,
+        series: w.series.map((p) => [p.t, p.u, p.v]),
+      })),
+    }));
+  } catch { /* quota or unavailable — caching is best-effort */ }
+}
+
+function loadHistCache() {
+  try {
+    const c = JSON.parse(localStorage.getItem(HIST_CACHE_KEY));
+    if (!c || Date.now() - c.at > HIST_CACHE_MS) return false;
+    for (const sc of c.stations ?? []) {
+      const s = upsertStation({ id: sc.id, name: sc.name, lat: sc.lat, lon: sc.lon, kind: sc.kind });
+      for (const [t, v] of sc.series) s.series.set(t, v);
+    }
+    for (const wc of c.wind ?? []) {
+      if (!windStations.has(wc.id)) {
+        windStations.set(wc.id, {
+          id: wc.id, name: wc.name, lat: wc.lat, lon: wc.lon,
+          series: wc.series.map(([t, u, v]) => ({ t, u, v })),
+        });
+      }
+    }
+    if (c.wind?.length) windDayLoaded = true; // wind archive already covered
+    return (c.stations ?? []).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+// Bulk-load the 24h window. Today's file first (the most useful hours) and
+// only then yesterday's, sequentially — one download at full bandwidth beats
+// two sharing it, and each renders as soon as it lands.
 async function loadHistory() {
   const now = Date.now();
-  const days = [sgtDate(new Date(now)), sgtDate(new Date(now - 24 * 3600_000))];
+  if (typeof localStorage !== "undefined" && loadHistCache()) {
+    rebuild(now);
+    renderAll();
+    latestReadingT = timeline[timeline.length - 1] ?? null;
+    statusPinned = false;
+    tickStatus();
+    return;
+  }
   setStatus("loading 24h history…", true);
-  await Promise.all(days.map((day) =>
-    fetchDay(day)
-      .then((r) => { ingest(r); rebuild(); renderAll(); })
-      .catch(() => { /* a missing day just shortens the scrubber range */ })
-  ));
+  for (const day of [sgtDate(new Date(now)), sgtDate(new Date(now - 24 * 3600_000))]) {
+    try {
+      ingest(await fetchDay(day));
+      rebuild();
+      renderAll();
+    } catch { /* a missing day just shortens the scrubber range */ }
+  }
   rebuild(now);
   renderAll();
   latestReadingT = timeline[timeline.length - 1] ?? null;
   statusPinned = false;
   tickStatus();
+  if (typeof localStorage !== "undefined") saveHistCache();
 }
 
 // ---------- init ----------
@@ -1443,7 +1515,11 @@ document.getElementById("wind-btn").addEventListener("click", () => {
 
 initMap();
 startWind();
-refresh().then(loadHistory).then(pollCommunity);
+refresh().then(loadHistory).then(() => {
+  pollCommunity();
+  // wind archive matters only for scrubbing — let the visible stuff win
+  setTimeout(() => loadWindHistory().catch(() => {}), 1500);
+});
 pollWind();
 setInterval(pollWind, POLL_MS);
 refreshModel();
