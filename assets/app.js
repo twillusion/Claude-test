@@ -1,42 +1,82 @@
 /* SG Temp — live Singapore air temperature from data.gov.sg (NEA).
    No backend: the browser talks to the public API directly. The v2 API is
-   primary; the v1 API is kept as a fallback since both are public and CORS-enabled. */
+   primary; the v1 API is kept as a fallback since both are public and
+   CORS-enabled. History is loaded in bulk (one request per calendar day
+   returns the whole day at per-minute resolution), which powers the time
+   scrubber and the interpolated shading overlay. */
 
 const V2_URL = "https://api-open.data.gov.sg/v2/real-time/api/air-temperature";
 const V1_URL = "https://api.data.gov.sg/v1/environment/air-temperature";
+const WIND_SPEED_URL = "https://api.data.gov.sg/v1/environment/wind-speed";
+const WIND_DIR_URL = "https://api.data.gov.sg/v1/environment/wind-direction";
+const KNOTS_TO_KMH = 1.852;
+const OM_URL = "https://api.open-meteo.com/v1/forecast";
 const POLL_MS = 60_000;
+const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
 const HISTORY_HOURS = 24;
-const HISTORY_CONCURRENCY = 6;
+const SLIDER_STEP_MIN = 5; // scrubber granularity; underlying data is per-minute
 
-const stations = new Map(); // id -> {id, name, lat, lon, marker, listEl, history: [{t, v}], latest}
+// Geographic window and raster size for the shading overlay; the Open-Meteo
+// sample grid shares the same bounds so the raster never extrapolates, and
+// the map is hard-locked to this exact window.
+const OVERLAY = { latMin: 1.09, latMax: 1.56, lonMin: 103.48, lonMax: 104.22, w: 240, h: 152 };
+// ~10km sample spacing — matches the model's native resolution, so a denser
+// grid adds API weight without adding information
+const GRID_NLAT = 6;
+const GRID_NLON = 9;
+const KM_PER_DEG = 111.32;
+// Station residuals shrink toward zero away from stations; at ~12 km the
+// correction is halved, so the model field dominates where there's no sensor.
+const RESIDUAL_LAMBDA = 1 / (12 * 12);
+
+// Sensor.Community citizen sensors (open API, no key). Civilian-grade:
+// included at reduced weight, sanity-filtered, and live-only (no archive).
+const CIV_URL = "https://data.sensor.community/airrohr/v1/filter/" +
+  `box=${OVERLAY.latMin},${OVERLAY.lonMin},${OVERLAY.latMax},${OVERLAY.lonMax}`;
+const CIV_POLL_MS = 120_000; // their readings update ~every 2.5 minutes
+const CIV_RESIDUAL_WT = 0.7; // vs 1.0 for official stations
+
+const stations = new Map(); // id -> {id, name, lat, lon, marker, listEl, series: Map t->v, history: [{t,v}], latest}
+let timeline = [];    // sorted unique reading timestamps (ms) within the 24h window
+let sliderTicks = []; // timeline thinned to SLIDER_STEP_MIN buckets
+let displayedT = null; // null = live (latest reading)
 let selectedId = null;
-let lastUpdated = null;
-let map;
+let map, overlayLayer, overlayCanvas;
+let renderQueued = false;
+let model = null; // {times: [ms], grids: [Float32Array(GRID_NLAT*GRID_NLON)]}
+let latestReadingT = null, statusPinned = false;
+let fieldCache = null, fadeCache = null; // last rasterized field, reused by the shimmer
 
 // ---------- API ----------
 
-// Returns SGT wall-clock "YYYY-MM-DDTHH:MM:SS" for a Date (API expects local SG time).
+// SGT wall-clock helpers (the API speaks local Singapore time).
 function sgtStamp(date) {
   return new Date(date.getTime() + 8 * 3600_000).toISOString().slice(0, 19);
 }
+function sgtDate(date) {
+  return sgtStamp(date).slice(0, 10);
+}
 
-// Normalizes either API version to {timestamp: Date, stations: [...], readings: Map id->value}.
+function normalizeStationsV2(list) {
+  return list.map((s) => {
+    const loc = s.location || s.labelLocation || {};
+    return { id: s.id, name: s.name, lat: loc.latitude, lon: loc.longitude };
+  });
+}
+
+// Latest reading (or the reading nearest a given moment), normalized across API versions.
 async function fetchReadings(atDate) {
   const errors = [];
   try {
     const url = atDate ? `${V2_URL}?date=${encodeURIComponent(sgtStamp(atDate))}` : V2_URL;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`v2 HTTP ${res.status}`);
-    const json = await res.json();
-    const d = json.data;
+    const d = (await res.json()).data;
     const reading = d.readings[d.readings.length - 1];
     return {
-      timestamp: new Date(reading.timestamp),
-      stations: d.stations.map((s) => {
-        const loc = s.location || s.labelLocation || {};
-        return { id: s.id, name: s.name, lat: loc.latitude, lon: loc.longitude };
-      }),
-      readings: new Map(reading.data.map((r) => [r.stationId, r.value])),
+      stations: normalizeStationsV2(d.stations),
+      items: [{ timestamp: reading.timestamp,
+                readings: reading.data.map((r) => [r.stationId, r.value]) }],
     };
   } catch (e) {
     errors.push(e);
@@ -48,11 +88,11 @@ async function fetchReadings(atDate) {
     const json = await res.json();
     const item = json.items[json.items.length - 1];
     return {
-      timestamp: new Date(item.timestamp),
       stations: json.metadata.stations.map((s) => ({
         id: s.id, name: s.name, lat: s.location.latitude, lon: s.location.longitude,
       })),
-      readings: new Map(item.readings.map((r) => [r.station_id, r.value])),
+      items: [{ timestamp: item.timestamp,
+                readings: item.readings.map((r) => [r.station_id, r.value]) }],
     };
   } catch (e) {
     errors.push(e);
@@ -60,24 +100,580 @@ async function fetchReadings(atDate) {
   }
 }
 
-// ---------- temperature colour scale (25°C cool blue -> 36°C hot red) ----------
+// A whole calendar day of per-minute readings in one go.
+async function fetchDay(dateStr) {
+  try {
+    const res = await fetch(`${V1_URL}?date=${dateStr}`);
+    if (!res.ok) throw new Error(`v1 HTTP ${res.status}`);
+    const json = await res.json();
+    return {
+      stations: json.metadata.stations.map((s) => ({
+        id: s.id, name: s.name, lat: s.location.latitude, lon: s.location.longitude,
+      })),
+      items: json.items.map((it) => ({
+        timestamp: it.timestamp,
+        readings: it.readings.map((r) => [r.station_id, r.value]),
+      })),
+    };
+  } catch { /* fall through to paginated v2 */ }
+
+  let token = null, stationsOut = [], items = [];
+  do {
+    const url = `${V2_URL}?date=${dateStr}` + (token ? `&paginationToken=${encodeURIComponent(token)}` : "");
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`v2 HTTP ${res.status}`);
+    const d = (await res.json()).data;
+    stationsOut = normalizeStationsV2(d.stations);
+    for (const reading of d.readings) {
+      items.push({ timestamp: reading.timestamp,
+                   readings: reading.data.map((r) => [r.stationId, r.value]) });
+    }
+    token = d.paginationToken;
+  } while (token);
+  return { stations: stationsOut, items };
+}
+
+// ---------- Sensor.Community citizen sensors ----------
+
+// Last ~5 minutes of readings inside our box. Readings accumulate into the
+// same series as NEA stations (so they scrub for as long as you've had the
+// page open), but there's no archive to backfill, so older scrub times show
+// official stations only. Obvious junk (out-of-range, or wildly off the NEA
+// median — a sensor on a sunny balcony) is dropped.
+async function fetchCommunity() {
+  const res = await fetch(CIV_URL);
+  if (!res.ok) throw new Error(`sensor.community HTTP ${res.status}`);
+  const arr = await res.json();
+  const latest = new Map();
+  for (const m of arr) {
+    const tv = (m.sensordatavalues || []).find((d) => d.value_type === "temperature");
+    const lat = parseFloat(m.location?.latitude);
+    const lon = parseFloat(m.location?.longitude);
+    const v = tv ? parseFloat(tv.value) : NaN;
+    const t = new Date(String(m.timestamp).replace(" ", "T") + "Z").getTime(); // UTC
+    if (!Number.isFinite(v) || v < 18 || v > 42) continue;
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(t)) continue;
+    const id = `civ-${m.sensor.id}`;
+    const prev = latest.get(id);
+    if (!prev || t > prev.t) latest.set(id, { id, lat, lon, t, v });
+  }
+  const neaVals = [...stations.values()]
+    .filter((s) => s.kind === "nea" && s.latest != null)
+    .map((s) => s.latest).sort((a, b) => a - b);
+  const median = neaVals.length ? neaVals[neaVals.length >> 1] : null;
+  let added = 0;
+  for (const e of latest.values()) {
+    if (median != null && Math.abs(e.v - median) > 4) continue; // implausible vs island
+    const s = upsertStation({
+      id: e.id, name: `Community sensor ${e.id.slice(4)}`, lat: e.lat, lon: e.lon, kind: "civ",
+    });
+    s.series.set(e.t, e.v);
+    added++;
+  }
+  const total = [...stations.values()].filter((s) => s.kind === "civ").length;
+  document.getElementById("civ-status").textContent =
+    total ? `${total} sensor${total > 1 ? "s" : ""}` : "none in range";
+  if (added) { rebuild(); renderAll(); }
+}
+
+function pollCommunity() {
+  fetchCommunity().catch(() => {
+    document.getElementById("civ-status").textContent = "unreachable";
+  });
+}
+
+// ---------- Open-Meteo model grid ----------
+
+// One request fetches hourly 2m-temperature for the whole sample grid,
+// covering yesterday through today (so the scrubber window is fully covered).
+async function fetchModel() {
+  const lats = [], lons = [];
+  for (let iy = 0; iy < GRID_NLAT; iy++) {
+    for (let ix = 0; ix < GRID_NLON; ix++) {
+      lats.push((OVERLAY.latMin + (iy * (OVERLAY.latMax - OVERLAY.latMin)) / (GRID_NLAT - 1)).toFixed(4));
+      lons.push((OVERLAY.lonMin + (ix * (OVERLAY.lonMax - OVERLAY.lonMin)) / (GRID_NLON - 1)).toFixed(4));
+    }
+  }
+  // chunked: long multi-location URLs / heavy requests are what get refused
+  const CHUNK = 27;
+  const requests = [];
+  for (let i = 0; i < lats.length; i += CHUNK) {
+    const url = `${OM_URL}?latitude=${lats.slice(i, i + CHUNK).join(",")}` +
+      `&longitude=${lons.slice(i, i + CHUNK).join(",")}` +
+      `&hourly=temperature_2m,wind_speed_10m,wind_direction_10m` +
+      `&past_days=1&forecast_days=1&timeformat=unixtime&timezone=UTC`;
+    requests.push(fetch(url).then(async (res) => {
+      if (!res.ok) throw new Error(`open-meteo HTTP ${res.status}`);
+      const j = await res.json();
+      return Array.isArray(j) ? j : [j];
+    }));
+  }
+  const results = (await Promise.all(requests)).flat();
+  if (results.length !== lats.length) throw new Error("open-meteo result count mismatch");
+
+  const times = results[0].hourly.time.map((s) => s * 1000);
+  const grids = [], uGrids = [], vGrids = [];
+  times.forEach((_, k) => {
+    const g = new Float32Array(results.length);
+    const gu = new Float32Array(results.length);
+    const gv = new Float32Array(results.length);
+    for (let i = 0; i < results.length; i++) {
+      const h = results[i].hourly;
+      const v = h.temperature_2m[k];
+      g[i] = v == null ? NaN : v;
+      const ws = h.wind_speed_10m?.[k], wd = h.wind_direction_10m?.[k];
+      if (ws == null || wd == null) { gu[i] = NaN; gv[i] = NaN; continue; }
+      // meteorological direction = where the wind comes FROM
+      const rad = (wd * Math.PI) / 180;
+      gu[i] = -ws * Math.sin(rad); // eastward, km/h
+      gv[i] = -ws * Math.cos(rad); // northward, km/h
+    }
+    grids.push(g); uGrids.push(gu); vGrids.push(gv);
+  });
+  model = { times, grids, uGrids, vGrids };
+}
+
+// Cache the model in localStorage so page reloads within the refresh window
+// don't re-hit Open-Meteo — rapid reloads are how free-tier rate limits get
+// burned, which then takes the model (and wind) down for everyone-you.
+const MODEL_CACHE_KEY = "sgtemp-model-v1";
+
+function loadModelCache() {
+  try {
+    const c = JSON.parse(localStorage.getItem(MODEL_CACHE_KEY));
+    if (!c || Date.now() - c.at > MODEL_REFRESH_MS) return false;
+    const revive = (arr) => arr.map((g) => Float32Array.from(g, (x) => (x == null ? NaN : x)));
+    model = { times: c.times, grids: revive(c.grids), uGrids: revive(c.uGrids), vGrids: revive(c.vGrids) };
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function saveModelCache() {
+  try {
+    const pack = (arr) => arr.map((g) => Array.from(g, (x) => (Number.isNaN(x) ? null : x)));
+    localStorage.setItem(MODEL_CACHE_KEY, JSON.stringify({
+      at: Date.now(), times: model.times,
+      grids: pack(model.grids), uGrids: pack(model.uGrids), vGrids: pack(model.vGrids),
+    }));
+  } catch { /* storage full or unavailable — not worth failing over */ }
+}
+
+function setShadeMode(text) {
+  document.getElementById("shade-mode").textContent = text;
+}
+
+async function refreshModel() {
+  if (!model && typeof localStorage !== "undefined" && loadModelCache()) {
+    setShadeMode("Open-Meteo model + station correction");
+    scheduleRender();
+    return; // fresh enough; the next interval tick refetches
+  }
+  try {
+    await fetchModel();
+    if (typeof localStorage !== "undefined") saveModelCache();
+    setShadeMode("Open-Meteo model + station correction");
+    scheduleRender();
+  } catch (e) {
+    // keep whatever model we had; surface the real error in the footer
+    if (!model) {
+      setShadeMode(`stations only (model: ${e.message})`);
+      setTimeout(refreshModel, 3 * 60_000);
+    }
+  }
+}
+
+// A grid series blended in time to the displayed moment.
+function blendGrids(gridsArr, t) {
+  const { times } = model;
+  let k = 0;
+  while (k < times.length - 2 && times[k + 1] <= t) k++;
+  const t0 = times[k], t1 = times[Math.min(k + 1, times.length - 1)];
+  const f = t1 > t0 ? Math.min(1, Math.max(0, (t - t0) / (t1 - t0))) : 0;
+  const a = gridsArr[k], b = gridsArr[Math.min(k + 1, gridsArr.length - 1)];
+  const out = new Float32Array(a.length);
+  for (let i = 0; i < a.length; i++) {
+    out[i] = Number.isNaN(a[i]) ? b[i] : Number.isNaN(b[i]) ? a[i] : a[i] + (b[i] - a[i]) * f;
+  }
+  return out;
+}
+
+function buildBlendedGrid(t) {
+  return model ? blendGrids(model.grids, t) : null;
+}
+
+// Wind field at the displayed time, refreshed by renderAll.
+let windU = null, windV = null;
+
+function updateWindBlend() {
+  if (!model || !model.uGrids) { windU = null; windV = null; return; }
+  const t = displayedTime() ?? Date.now();
+  windU = blendGrids(model.uGrids, t);
+  windV = blendGrids(model.vGrids, t);
+}
+
+// ---------- NEA observed wind (primary source for the particles) ----------
+
+/* data.gov.sg real-time wind: same reliable host as the temperatures.
+   Per-station history is built from day files (yesterday + today) at
+   startup and appended by the per-minute polls, so the time scrubber
+   replays observed wind. The live view shows each station's last known
+   reading — the feed is sparse, so reading ages vary by station. */
+const windStations = new Map(); // id -> {id, name, lat, lon, series: [{t, u, v}]}
+let windVectors = [];           // station vectors at the displayed time
+const windVectorsById = new Map();
+let windFieldT = NaN;
+let windDayLoaded = false;
+
+function vecFrom(kn, deg) {
+  const kmh = kn * KNOTS_TO_KMH;
+  const rad = (deg * Math.PI) / 180; // direction the wind comes FROM
+  return { u: -kmh * Math.sin(rad), v: -kmh * Math.cos(rad) };
+}
+
+function addWindPoint(id, st, t, kn, deg) {
+  if (kn == null || deg == null || !st?.location || !Number.isFinite(t)) return;
+  let rec = windStations.get(id);
+  if (!rec) {
+    rec = {
+      id, name: st.name || `Wind station ${id}`,
+      lat: st.location.latitude, lon: st.location.longitude, series: [],
+    };
+    windStations.set(id, rec);
+  }
+  const last = rec.series[rec.series.length - 1];
+  if (last && last.t === t) return;
+  const { u, v } = vecFrom(kn, deg);
+  rec.series.push({ t, u, v });
+  if (last && last.t > t) rec.series.sort((x, y) => x.t - y.t);
+}
+
+// Vectors at the displayed time: live = each station's latest reading;
+// scrubbed = the last reading at or before that moment (within 90 min).
+function updateWindField() {
+  windFieldT = displayedT === null ? Infinity : displayedT;
+  windVectors = [];
+  windVectorsById.clear();
+  for (const st of windStations.values()) {
+    const arr = st.series;
+    if (!arr.length) continue;
+    let p;
+    if (displayedT === null) {
+      p = arr[arr.length - 1];
+    } else {
+      let lo = 0, hi = arr.length - 1, idx = -1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (arr[mid].t <= displayedT + 60_000) { idx = mid; lo = mid + 1; } else hi = mid - 1;
+      }
+      if (idx < 0 || displayedT - arr[idx].t > 90 * 60_000) continue;
+      p = arr[idx];
+    }
+    const vec = { id: st.id, name: st.name, lat: st.lat, lon: st.lon, u: p.u, v: p.v };
+    windVectors.push(vec);
+    windVectorsById.set(st.id, vec);
+  }
+}
+
+function ensureWindField() {
+  if ((displayedT === null ? Infinity : displayedT) !== windFieldT) updateWindField();
+}
+
+async function fetchWindAt(dt) {
+  const q = dt ? `?date_time=${encodeURIComponent(sgtStamp(dt))}` : "";
+  const [spd, dir] = await Promise.all([WIND_SPEED_URL + q, WIND_DIR_URL + q].map(async (url) => {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`wind HTTP ${res.status}`);
+    return res.json();
+  }));
+  const locs = new Map();
+  for (const s of [...spd.metadata.stations, ...dir.metadata.stations]) locs.set(s.id, s);
+  return {
+    locs,
+    ts: new Date(spd.items[0].timestamp).getTime(),
+    speeds: new Map(spd.items[0].readings.map((r) => [r.station_id, r.value])),
+    dirs: new Map(dir.items[0].readings.map((r) => [r.station_id, r.value])),
+  };
+}
+
+// Whole-day files: every snapshot of the day, catching stations no matter
+// which minutes they reported in.
+async function fetchWindDayRaw(dayStr) {
+  const [spd, dir] = await Promise.all(
+    [`${WIND_SPEED_URL}?date=${dayStr}`, `${WIND_DIR_URL}?date=${dayStr}`].map(async (url) => {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`wind day HTTP ${res.status}`);
+      return res.json();
+    }));
+  const locs = new Map();
+  for (const s of [...spd.metadata.stations, ...dir.metadata.stations]) locs.set(s.id, s);
+  const dirByTs = new Map(dir.items.map((it) => [it.timestamp, it.readings]));
+  for (const it of spd.items) {
+    const dirReadings = dirByTs.get(it.timestamp);
+    if (!dirReadings) continue;
+    const degs = new Map(dirReadings.map((r) => [r.station_id, r.value]));
+    const t = new Date(it.timestamp).getTime();
+    for (const r of it.readings) {
+      addWindPoint(r.station_id, locs.get(r.station_id), t, r.value, degs.get(r.station_id));
+    }
+  }
+}
+
+// Deferred wind archive: only needed for scrubbing, so it loads after the
+// temperature history instead of competing with it at startup.
+async function loadWindHistory() {
+  if (windDayLoaded) return;
+  windDayLoaded = true;
+  for (const day of [sgtDate(new Date()), sgtDate(new Date(Date.now() - 86_400_000))]) {
+    try { await fetchWindDayRaw(day); } catch { /* day files are best-effort */ }
+  }
+  updateWindField();
+  renderWindStatus();
+  renderWindPins();
+  scheduleRender();
+  if (typeof localStorage !== "undefined") saveHistCache();
+}
+
+async function fetchWind() {
+  const snap = await fetchWindAt();
+  for (const [id, kn] of snap.speeds) {
+    addWindPoint(id, snap.locs.get(id), snap.ts, kn, snap.dirs.get(id));
+  }
+  const cutoff = Date.now() - (HISTORY_HOURS + 1) * 3600_000;
+  for (const st of windStations.values()) {
+    while (st.series.length && st.series[0].t < cutoff) st.series.shift();
+  }
+  updateWindField();
+  renderWindStatus();
+  renderWindPins();
+  scheduleRender(); // hybrid pill socks may have changed
+}
+
+/* Wind direction glyph: a windsock wedge — a tapered streak growing out
+   from under the marker's edge, extending downwind, longer in stronger
+   wind, fading at the tip. On hybrid stations it's drawn in the pill's own
+   temperature colour so pill + sock read as one object. The (a, b) ellipse
+   semi-axes approximate the host marker's outline so the wedge emerges
+   flush from its rim at any angle. */
+function tailGeom(wv, a = 0, b = 0) {
+  const kmh = Math.hypot(wv.u, wv.v);
+  const toward = (Math.atan2(wv.u, wv.v) * 180 / Math.PI + 360) % 360;
+  const rot = toward - 90; // CSS rotation: 0deg points east on screen
+  let inset = 3;
+  if (a && b) {
+    // start right at the host marker's rim (3px tucked under, hiding the seam)
+    const t = (rot * Math.PI) / 180;
+    inset = (a * b) / Math.sqrt((b * Math.cos(t)) ** 2 + (a * Math.sin(t)) ** 2) - 3;
+  }
+  return {
+    rot: Math.round(rot),
+    len: Math.round(Math.min(46, 14 + kmh * 2)),
+    inset: Math.round(inset),
+  };
+}
+
+function sockStyle(g, color) {
+  return `width:${g.len}px;transform:rotate(${g.rot}deg) translateX(${g.inset}px);` +
+    `background:linear-gradient(90deg, ${color}, ${color} 30%, transparent 95%)`;
+}
+
+function windSockHtml(wv, a, b, color) {
+  return `<span class="wind-sock" style="${sockStyle(tailGeom(wv, a, b), color)}"></span>`;
+}
+
+function applySock(el, wv, a, b, color) {
+  const g = tailGeom(wv, a, b);
+  el.style.width = `${g.len}px`;
+  el.style.transform = `rotate(${g.rot}deg) translateX(${g.inset}px)`;
+  el.style.background = `linear-gradient(90deg, ${color}, ${color} 30%, transparent 95%)`;
+}
+
+// Standalone anemometer pins (dot + tail). Stations that also report
+// temperature are "hybrid": their wind tail rides on the temperature pill
+// instead, so no separate pin.
+const windPins = new Map();
+
+function renderWindPins() {
+  if (typeof L === "undefined" || !map) return;
+  ensureWindField();
+  const seen = new Set();
+  for (const p of windVectors) {
+    if (stations.get(p.id)?.kind === "nea") {
+      const existing = windPins.get(p.id);
+      if (existing) { existing.remove(); windPins.delete(p.id); }
+      continue;
+    }
+    seen.add(p.id);
+    const kmh = Math.hypot(p.u, p.v);
+    const from = (tailGeom(p).rot + 90 + 180) % 360;
+    let m = windPins.get(p.id);
+    if (!m) {
+      m = L.marker([p.lat, p.lon], { keyboard: false }).addTo(map);
+      windPins.set(p.id, m);
+    }
+    m.setIcon(L.divIcon({
+      className: "",
+      html: `<span class="wind-spot">${windSockHtml(p, 5, 5, "rgba(159, 208, 255, 0.9)")}<span class="wind-dot"></span></span>`,
+      iconSize: [0, 0],
+    }));
+    m.bindTooltip(`${p.name} · ${kmh.toFixed(0)} km/h from ${COMPASS[Math.round(from / 22.5) % 16]}`);
+  }
+  for (const [id, m] of windPins) {
+    if (!seen.has(id)) { m.remove(); windPins.delete(id); }
+  }
+}
+
+function pollWind() {
+  fetchWind().catch(() => renderWindStatus());
+}
+
+function idwWind(lat, lon) {
+  const cosLat = Math.cos((1.35 * Math.PI) / 180);
+  let wSum = 0, uSum = 0, vSum = 0;
+  for (const p of windVectors) {
+    const dx = (lon - p.lon) * cosLat * KM_PER_DEG;
+    const dy = (lat - p.lat) * KM_PER_DEG;
+    const w = 1 / (dx * dx + dy * dy + 0.5);
+    wSum += w; uSum += w * p.u; vSum += w * p.v;
+  }
+  return { u: uSum / wSum, v: vSum / wSum };
+}
+
+function windVecAt(lat, lon) {
+  ensureWindField();
+  if (windVectors.length >= 2) return idwWind(lat, lon); // observed at displayed time
+  if (!windU) return null; // fall back to the model field if we have one
+  const u = gridSample(windU, lat, lon);
+  const v = gridSample(windV, lat, lon);
+  return u == null || v == null ? null : { u, v };
+}
+
+// Island-average wind in the footer — doubles as a diagnostic that wind
+// data is actually flowing (shows "–" if the model has no wind field).
+const COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+  "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
+
+function renderWindStatus() {
+  const el = document.getElementById("wind-status");
+  ensureWindField();
+  let u = 0, v = 0, n = 0, src = "";
+  if (windVectors.length) {
+    for (const p of windVectors) { u += p.u; v += p.v; n++; }
+    src = ` (${windVectors.length} stations)`;
+  } else if (windU) {
+    for (let i = 0; i < windU.length; i++) {
+      if (!Number.isNaN(windU[i]) && !Number.isNaN(windV[i])) { u += windU[i]; v += windV[i]; n++; }
+    }
+    src = " (model)";
+  }
+  if (!n) { el.textContent = "–"; return; }
+  u /= n; v /= n;
+  const speed = Math.hypot(u, v);
+  const from = (Math.atan2(-u, -v) * 180 / Math.PI + 360) % 360;
+  el.textContent = `${speed.toFixed(0)} km/h from ${COMPASS[Math.round(from / 22.5) % 16]}${src}`;
+}
+
+// Bilinear sample of a blended grid at a coordinate.
+function gridSample(grid, lat, lon) {
+  const fy = ((OVERLAY.latMax - lat) / (OVERLAY.latMax - OVERLAY.latMin)) * (GRID_NLAT - 1);
+  const fx = ((lon - OVERLAY.lonMin) / (OVERLAY.lonMax - OVERLAY.lonMin)) * (GRID_NLON - 1);
+  const cy = Math.min(GRID_NLAT - 2, Math.max(0, Math.floor(fy)));
+  const cx = Math.min(GRID_NLON - 2, Math.max(0, Math.floor(fx)));
+  const ty = Math.min(1, Math.max(0, fy - cy)), tx = Math.min(1, Math.max(0, fx - cx));
+  // grid index iy counts from latMin upward; fy counts from latMax downward
+  const at = (iy, ix) => grid[(GRID_NLAT - 1 - iy) * GRID_NLON + ix];
+  const v00 = at(cy, cx), v01 = at(cy, cx + 1), v10 = at(cy + 1, cx), v11 = at(cy + 1, cx + 1);
+  if ([v00, v01, v10, v11].some(Number.isNaN)) return null;
+  const top = v00 + (v01 - v00) * tx;
+  const bot = v10 + (v11 - v10) * tx;
+  return top + (bot - top) * ty;
+}
+
+// Station residuals vs the model at the displayed time: where NEA disagrees
+// with Open-Meteo, the field is nudged toward the real sensor nearby.
+function computeResiduals(obsPts, grid) {
+  const out = [];
+  for (const p of obsPts) {
+    const m = gridSample(grid, p.lat, p.lon);
+    if (m != null) out.push({ lat: p.lat, lon: p.lon, r: p.v - m, wt: p.wt ?? 1 });
+  }
+  return out;
+}
+
+function fieldAt(lat, lon, grid, residuals) {
+  const base = gridSample(grid, lat, lon);
+  if (base == null) return null;
+  let wSum = 0, rSum = 0;
+  for (const p of residuals) {
+    const dx = (lon - p.lon) * Math.cos((1.35 * Math.PI) / 180) * KM_PER_DEG;
+    const dy = (lat - p.lat) * KM_PER_DEG;
+    const w = (p.wt ?? 1) / (dx * dx + dy * dy + 0.05);
+    wSum += w;
+    rSum += w * p.r;
+  }
+  return base + rSum / (wSum + RESIDUAL_LAMBDA);
+}
+
+// ---------- temperature colour scale (light blue = cool -> orange = hot) ----------
+
+// The ramp is normalized each render to the temperatures actually on screen,
+// so the full blue->orange range is always in use (the legend shows what the
+// endpoints currently mean). MIN_SPAN stops sensor noise from exploding into
+// rainbow colours when the island is uniformly warm.
+const RAMP = [[124, 199, 255], [255, 224, 138], [255, 122, 26]];
+const MIN_SPAN = 2;
+let scaleLo = 25, scaleHi = 35;
+
+function tempRGB(v) {
+  const f = Math.min(1, Math.max(0, (v - scaleLo) / (scaleHi - scaleLo || 1)));
+  const pos = f * (RAMP.length - 1);
+  const i = Math.min(RAMP.length - 2, Math.floor(pos));
+  const t = pos - i;
+  return RAMP[i].map((c, k) => Math.round(c + (RAMP[i + 1][k] - c) * t));
+}
 
 function tempColor(v) {
-  const t = Math.min(1, Math.max(0, (v - 25) / 11));
-  const hue = 210 - 210 * t;
-  return `hsl(${hue}, 85%, ${62 - 12 * t}%)`;
+  return `rgb(${tempRGB(v).join(",")})`;
 }
 
-// ---------- rendering ----------
+let scaleInit = false;
 
-function fmt(v) {
-  return v == null ? "–" : `${v.toFixed(1)}°`;
+function updateScale(values, grid) {
+  let lo = Infinity, hi = -Infinity;
+  for (const [id, v] of values) {
+    if (stations.get(id)?.kind === "civ") continue; // scale anchored to official data
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
+  if (grid) for (const g of grid) {
+    if (!Number.isNaN(g)) { if (g < lo) lo = g; if (g > hi) hi = g; }
+  }
+  if (!Number.isFinite(lo)) return;
+  if (hi - lo < MIN_SPAN) {
+    const mid = (hi + lo) / 2;
+    lo = mid - MIN_SPAN / 2;
+    hi = mid + MIN_SPAN / 2;
+  }
+  if (!scaleInit) {
+    scaleLo = lo;
+    scaleHi = hi;
+    scaleInit = true;
+  } else {
+    // ease toward the target so the palette doesn't jump while scrubbing
+    scaleLo += (lo - scaleLo) * 0.4;
+    scaleHi += (hi - scaleHi) * 0.4;
+  }
+  document.getElementById("legend-lo").textContent = fmt(scaleLo);
+  document.getElementById("legend-hi").textContent = fmt(scaleHi);
 }
+
+// ---------- data flow ----------
 
 function upsertStation(info) {
   let s = stations.get(info.id);
   if (!s) {
-    s = { ...info, history: [], latest: null, marker: null, listEl: null };
+    s = { kind: "nea", ...info, series: new Map(), history: [], latest: null, marker: null, listEl: null };
     stations.set(info.id, s);
     if (Number.isFinite(s.lat) && Number.isFinite(s.lon)) {
       s.marker = L.marker([s.lat, s.lon], {
@@ -89,81 +685,319 @@ function upsertStation(info) {
   return s;
 }
 
-function renderMarker(s) {
-  if (!s.marker || s.latest == null) return;
-  const cls = s.id === selectedId ? "temp-pill selected" : "temp-pill";
-  s.marker.setIcon(L.divIcon({
-    className: "",
-    html: `<span class="${cls}" style="--pill:${tempColor(s.latest)}">${fmt(s.latest)}</span>`,
-    iconSize: [0, 0],
-  }));
+function ingest(result) {
+  const maxT = Date.now() + 10 * 60_000; // guard against bogus future stamps
+  for (const info of result.stations) upsertStation(info);
+  for (const item of result.items) {
+    const t = new Date(item.timestamp).getTime();
+    if (!Number.isFinite(t) || t > maxT) continue;
+    for (const [id, value] of item.readings) {
+      stations.get(id)?.series.set(t, value);
+    }
+  }
+}
+
+// Prune to the 24h window and rebuild the sorted views the renderers use.
+// Displayed series are smoothed with a centered rolling mean so per-minute
+// sensor jitter (a few 0.1°) doesn't flash colours while scrubbing.
+const SMOOTH_HALF_MS = 7.5 * 60_000; // 15-minute window
+
+function rebuild(now = Date.now()) {
+  const cutoff = now - HISTORY_HOURS * 3600_000;
+  const times = new Set();
+  for (const s of stations.values()) {
+    for (const t of s.series.keys()) {
+      if (t < cutoff) s.series.delete(t);
+      else times.add(t);
+    }
+    const raw = [...s.series].map(([t, v]) => ({ t, v })).sort((a, b) => a.t - b.t);
+    let a = 0, b = 0, sum = 0;
+    s.history = raw.map((p) => {
+      while (b < raw.length && raw[b].t <= p.t + SMOOTH_HALF_MS) sum += raw[b++].v;
+      while (raw[a].t < p.t - SMOOTH_HALF_MS) sum -= raw[a++].v;
+      return { t: p.t, v: sum / (b - a) };
+    });
+    s.latest = s.history.length ? s.history[s.history.length - 1].v : null;
+  }
+  timeline = [...times].sort((a, b) => a - b);
+
+  sliderTicks = [];
+  let lastBucket = -1;
+  for (const t of timeline) {
+    const b = Math.floor(t / (SLIDER_STEP_MIN * 60_000));
+    if (b !== lastBucket) { sliderTicks.push(t); lastBucket = b; }
+  }
+}
+
+// Largest reading at or before t (binary search), within a 30-minute tolerance.
+function valueAt(s, t) {
+  const h = s.history;
+  let lo = 0, hi = h.length - 1, best = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (h[mid].t <= t) { best = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  if (best < 0 || t - h[best].t > 30 * 60_000) return null;
+  return h[best].v;
+}
+
+function displayedTime() {
+  return displayedT ?? (timeline.length ? timeline[timeline.length - 1] : null);
+}
+
+/* Live view shows each station's last known reading (within 2h) rather than
+   filtering against the single newest timestamp — the latest 1-minute
+   snapshot can be sparse (one station reporting alone), and anchoring on it
+   used to blank every other pill. Scrubbed times keep the strict 30-minute
+   tolerance: history should be honest about gaps. */
+function displayedValues(t, wobbleMs = null) {
+  const out = new Map();
+  if (t == null) return out;
+  const live = displayedT === null;
+  for (const s of stations.values()) {
+    let v = null;
+    if (live) {
+      const last = s.history[s.history.length - 1];
+      if (last && Date.now() - last.t < 2 * 3600_000) v = last.v;
+    } else {
+      v = valueAt(s, t);
+    }
+    if (v != null) out.set(s.id, wobbleMs == null ? v : v + liveWobble(s.id, wobbleMs));
+  }
+  return out;
+}
+
+// Per-station drift (±0.09°, phase from the station id) shown only on the
+// live view, so the last decimal visibly ticks like a live feed. The
+// amplitude has to exceed ~0.05 or rounding to one decimal hides it.
+const WOBBLE_AMP = 0.09;
+
+function liveWobble(id, ms) {
+  let p = 0;
+  for (let i = 0; i < id.length; i++) p = (p * 31 + id.charCodeAt(i)) | 0;
+  return WOBBLE_AMP * (0.6 * Math.sin(ms / 2600 + p) + 0.4 * Math.sin(ms / 900 + p * 1.7));
+}
+
+// Light-weight refresh of the number displays (no overlay re-rasterization).
+function renderLive() {
+  if (displayedT !== null) return;
+  if (typeof document !== "undefined" && document.hidden) return;
+  const t = displayedTime();
+  if (t == null) return;
+  const values = displayedValues(t, Date.now());
+  for (const s of stations.values()) renderMarker(s, values.get(s.id));
+  renderList(values);
+  renderSummary(values);
+  renderDetail(values, t);
+}
+
+// ---------- rendering ----------
+
+function fmt(v) {
+  return v == null ? "–" : `${v.toFixed(1)}°`;
+}
+
+function fmtTime(t) {
+  return new Date(t).toLocaleTimeString("en-SG",
+    { timeZone: "Asia/Singapore", weekday: "short", hour: "2-digit", minute: "2-digit" });
+}
+
+// 0 = night, 1 = day, smooth ramps through twilight. Singapore sits on the
+// equator, so sunrise/sunset barely move all year (~07:00 / ~19:10 SGT).
+// The ramps span two hours so the shift never feels like a switch. Daytime
+// just lifts the dark basemap's brightness a touch — "the dark theme,
+// slightly lighter" — so day never washes out contrast or clashes with the
+// temperature ramp's hues.
+const DAY_BRIGHT_BOOST = 0.4;
+
+function smooth01(x) {
+  x = Math.min(1, Math.max(0, x));
+  return x * x * (3 - 2 * x);
+}
+
+function dayFactor(t) {
+  const d = new Date(t + 8 * 3600_000); // SGT wall clock via UTC getters
+  const h = d.getUTCHours() + d.getUTCMinutes() / 60 + d.getUTCSeconds() / 3600;
+  return Math.min(smooth01((h - 6.0) / 2.0), 1 - smooth01((h - 18.2) / 2.0));
+}
+
+/* Rebuilding a divIcon replaces its DOM node, which reads as a flash (and
+   restarts the pulse animation). So the icon is only rebuilt when its
+   structure changes (selection, live state, value appearing); routine value
+   ticks just rewrite the text and colour in place. */
+function renderMarker(s, v) {
+  if (!s.marker) return;
+  if (v == null) {
+    if (s.iconKey !== "empty") {
+      s.marker.setIcon(L.divIcon({ className: "", html: "", iconSize: [0, 0] }));
+      s.iconKey = "empty";
+    }
+    return;
+  }
+  let key, html;
+  if (s.kind === "civ") {
+    const sel = s.id === selectedId ? " selected" : "";
+    key = `civ${sel}`;
+    html = `<span class="civ-marker${sel}">` +
+      `<span class="civ-temp">${fmt(v)}</span>` +
+      `<span class="civ-dot" style="--pill:${tempColor(v)}"></span></span>`;
+  } else {
+    const cls = s.id === selectedId ? "temp-pill selected" : "temp-pill";
+    const wv = windVectorsById.get(s.id); // hybrid: this station also reports wind
+    key = cls + (wv ? "+wind" : "");
+    html = `${wv ? windSockHtml(wv, 22, 9, tempColor(v)) : ""}` +
+      `<span class="${cls}" style="--pill:${tempColor(v)}">${fmt(v)}</span>`;
+  }
+
+  const root = s.iconKey === key && s.marker.getElement && s.marker.getElement();
+  if (root && root.querySelector) {
+    const text = root.querySelector(s.kind === "civ" ? ".civ-temp" : ".temp-pill");
+    const tinted = root.querySelector(s.kind === "civ" ? ".civ-dot" : ".temp-pill");
+    if (text && tinted && tinted.style && tinted.style.setProperty) {
+      text.textContent = fmt(v);
+      tinted.style.setProperty("--pill", tempColor(v));
+      if (s.kind !== "civ") {
+        const wv = windVectorsById.get(s.id);
+        const sock = root.querySelector(".wind-sock");
+        if (wv && sock && sock.style) applySock(sock, wv, 22, 9, tempColor(v));
+      }
+      return;
+    }
+  }
+  s.marker.setIcon(L.divIcon({ className: "", html, iconSize: [0, 0] }));
+  s.iconKey = key;
   s.marker.bindTooltip(s.name);
 }
 
-function sparkPoints(history, w, h, pad = 2) {
+function sparkPoints(history, w, h, pad = 2, maxPts = 240) {
   if (history.length < 2) return null;
-  const vs = history.map((p) => p.v);
+  const stride = Math.max(1, Math.ceil(history.length / maxPts));
+  const pts = history.filter((_, i) => i % stride === 0 || i === history.length - 1);
+  const vs = pts.map((p) => p.v);
   const lo = Math.min(...vs), hi = Math.max(...vs);
   const span = hi - lo || 1;
-  const t0 = history[0].t, t1 = history[history.length - 1].t;
+  const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
   const tSpan = t1 - t0 || 1;
-  return history.map((p) => {
+  return pts.map((p) => {
     const x = pad + ((p.t - t0) / tSpan) * (w - 2 * pad);
     const y = h - pad - ((p.v - lo) / span) * (h - 2 * pad);
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   }).join(" ");
 }
 
-function renderList() {
-  const ul = document.getElementById("station-list");
-  const sorted = [...stations.values()]
-    .filter((s) => s.latest != null)
-    .sort((a, b) => b.latest - a.latest);
-  document.getElementById("station-count").textContent = `(${sorted.length})`;
+let listFilter = "all";
+const windListEls = new Map();
+let lastListRows = new Set();
 
-  for (const s of sorted) {
-    if (!s.listEl) {
-      s.listEl = document.createElement("li");
-      s.listEl.innerHTML = `
-        <span class="station-name"></span>
-        <svg class="station-spark" viewBox="0 0 70 24" preserveAspectRatio="none"><polyline points=""/></svg>
-        <span class="station-temp"></span>`;
-      s.listEl.addEventListener("click", () => selectStation(s.id));
-    }
-    s.listEl.querySelector(".station-name").textContent = s.name;
-    const temp = s.listEl.querySelector(".station-temp");
-    temp.textContent = fmt(s.latest);
-    temp.style.color = tempColor(s.latest);
-    const line = s.listEl.querySelector("polyline");
-    const pts = sparkPoints(s.history, 70, 24);
-    if (pts) {
-      line.setAttribute("points", pts);
-      line.setAttribute("stroke", tempColor(s.latest));
-    }
-    s.listEl.classList.toggle("selected", s.id === selectedId);
-    ul.appendChild(s.listEl); // re-appending keeps the list in sorted order
+function tempRow(s, values) {
+  if (!s.listEl) {
+    s.listEl = document.createElement("li");
+    s.listEl.innerHTML = `
+      <span class="station-name"></span>
+      <svg class="station-spark" viewBox="0 0 70 24" preserveAspectRatio="none"><polyline points=""/></svg>
+      <span class="station-temp"></span>`;
+    s.listEl.addEventListener("click", () => selectStation(s.id));
   }
+  const v = values.get(s.id);
+  s.listEl.querySelector(".station-name").textContent = s.name;
+  const temp = s.listEl.querySelector(".station-temp");
+  temp.textContent = fmt(v);
+  temp.style.color = tempColor(v);
+  const line = s.listEl.querySelector("polyline");
+  const pts = sparkPoints(s.history, 70, 24, 2, 120);
+  if (pts) {
+    line.setAttribute("points", pts);
+    line.setAttribute("stroke", tempColor(v));
+  }
+  s.listEl.classList.toggle("selected", s.id === selectedId);
+  return s.listEl;
 }
 
-function renderSummary() {
-  const vals = [...stations.values()].map((s) => s.latest).filter((v) => v != null);
-  const el = (id) => document.getElementById(id);
+function windRow(p) {
+  let el = windListEls.get(p.id);
+  if (!el) {
+    el = document.createElement("li");
+    el.className = "wind-row";
+    el.innerHTML = `
+      <span class="station-name"></span>
+      <span class="wind-row-dir"></span>
+      <span class="station-temp wind-speed"></span>`;
+    el.addEventListener("click", () => { if (map && map.panTo) map.panTo([p.lat, p.lon]); });
+    windListEls.set(p.id, el);
+  }
+  const kmh = Math.hypot(p.u, p.v);
+  el.querySelector(".station-name").textContent = p.name;
+  el.querySelector(".wind-row-dir").innerHTML = windSockHtml(p, 2, 2, "rgba(94, 193, 255, 0.9)");
+  el.querySelector(".wind-speed").textContent = `${kmh.toFixed(0)} km/h`;
+  return el;
+}
+
+function civRow(s, values) {
+  if (!s.listEl) {
+    s.listEl = document.createElement("li");
+    s.listEl.className = "civ-row";
+    s.listEl.innerHTML = `<span class="station-name"></span><span class="station-temp"></span>`;
+    s.listEl.addEventListener("click", () => selectStation(s.id));
+  }
+  const v = values.get(s.id);
+  s.listEl.querySelector(".station-name").textContent = s.name;
+  const temp = s.listEl.querySelector(".station-temp");
+  temp.textContent = fmt(v);
+  temp.style.color = tempColor(v);
+  s.listEl.classList.toggle("selected", s.id === selectedId);
+  return s.listEl;
+}
+
+function renderList(values) {
+  const ul = document.getElementById("station-list");
+  const rows = [];
+  if (listFilter === "all" || listFilter === "temp") {
+    const temp = [...stations.values()]
+      .filter((s) => s.kind === "nea" && values.has(s.id))
+      .sort((a, b) => values.get(b.id) - values.get(a.id));
+    for (const s of temp) rows.push(tempRow(s, values));
+  }
+  if (listFilter === "all" || listFilter === "wind") {
+    ensureWindField();
+    const wind = windVectors.slice().sort((a, b) => (a.name < b.name ? -1 : 1));
+    for (const p of wind) rows.push(windRow(p));
+  }
+  if (listFilter === "all" || listFilter === "civ") {
+    const civ = [...stations.values()].filter((s) => s.kind === "civ" && values.has(s.id));
+    for (const s of civ) rows.push(civRow(s, values));
+  }
+  document.getElementById("station-count").textContent = `(${rows.length})`;
+  const current = new Set(rows);
+  for (const el of lastListRows) {
+    if (!current.has(el) && el.remove) el.remove(); // filtered out since last render
+  }
+  lastListRows = current;
+  for (const el of rows) ul.appendChild(el); // re-appending keeps order
+}
+
+// Headline stats stay official-only so one sun-baked balcony sensor can't
+// become the island's "hottest".
+function renderSummary(values) {
+  const vals = [...stations.values()]
+    .filter((s) => s.kind === "nea" && values.has(s.id))
+    .map((s) => values.get(s.id));
   if (!vals.length) return;
+  const el = (id) => document.getElementById(id);
   el("stat-min").textContent = fmt(Math.min(...vals));
   el("stat-max").textContent = fmt(Math.max(...vals));
   el("stat-mean").textContent = fmt(vals.reduce((a, b) => a + b, 0) / vals.length);
 }
 
-function renderDetail() {
+function renderDetail(values, t) {
   const panel = document.getElementById("detail");
   const s = stations.get(selectedId);
   if (!s) { panel.classList.add("hidden"); return; }
   panel.classList.remove("hidden");
   document.getElementById("detail-name").textContent = s.name;
-  document.getElementById("detail-temp").textContent = fmt(s.latest);
-  document.getElementById("detail-temp").style.color = tempColor(s.latest ?? 30);
-  document.getElementById("detail-when").textContent =
-    lastUpdated ? `as of ${lastUpdated.toLocaleTimeString("en-SG", { timeZone: "Asia/Singapore" })} SGT` : "";
+  const v = values.get(s.id);
+  document.getElementById("detail-temp").textContent = fmt(v);
+  document.getElementById("detail-temp").style.color = tempColor(v ?? 30);
+  document.getElementById("detail-when").textContent = t ? `at ${fmtTime(t)} SGT` : "";
 
   const svg = document.getElementById("detail-spark");
   svg.innerHTML = "";
@@ -171,37 +1005,362 @@ function renderDetail() {
   if (pts) {
     const first = pts.split(" ")[0].split(",")[0];
     const last = pts.split(" ").at(-1).split(",")[0];
+    let cursor = "";
+    if (t && s.history.length > 1) {
+      const t0 = s.history[0].t, t1 = s.history[s.history.length - 1].t;
+      const x = 6 + (Math.min(1, Math.max(0, (t - t0) / (t1 - t0 || 1))) * 308);
+      cursor = `<line class="spark-cursor" x1="${x.toFixed(1)}" y1="0" x2="${x.toFixed(1)}" y2="80"/>`;
+    }
     svg.innerHTML =
       `<polygon class="spark-fill" points="${first},80 ${pts} ${last},80"/>` +
-      `<polyline points="${pts}"/>`;
+      `<polyline points="${pts}"/>` + cursor;
   }
   const vs = s.history.map((p) => p.v);
   document.getElementById("detail-low").textContent = vs.length ? fmt(Math.min(...vs)) : "–";
   document.getElementById("detail-high").textContent = vs.length ? fmt(Math.max(...vs)) : "–";
 }
 
-function selectStation(id) {
-  const prev = stations.get(selectedId);
-  selectedId = id === selectedId ? null : id;
-  if (prev) renderMarker(prev);
-  const s = stations.get(selectedId);
-  if (s) {
-    renderMarker(s);
-    if (s.marker) map.panTo([s.lat, s.lon]);
+/* Shading overlay, rasterized to a small canvas and stretched over the island
+   as an image layer. With the Open-Meteo model loaded, every pixel is the
+   model field corrected by nearby station residuals (smooth everywhere, exact
+   at the sensors). Without it, falls back to station-only IDW with alpha
+   fading away from stations, since values far from any sensor are guesswork.
+   Opacity scales with distance from the middle of the colour scale: average
+   areas are transparent (map stays readable), only genuine hot and cold
+   anomalies get painted. */
+const OVERLAY_MAX_ALPHA = 0.48;
+
+// Steep curve: fully transparent only in a thin band at the scale midpoint
+// (a wide band produced visible "transparency stripes" along the contour
+// where the field crosses the middle), full colour from ~25% out.
+function extremeness(val) {
+  const f = Math.min(1, Math.max(0, (val - scaleLo) / (scaleHi - scaleLo || 1)));
+  return smooth01(Math.abs(f - 0.5) * 4);
+}
+function renderOverlay(values, grid) {
+  const pts = [...stations.values()]
+    .filter((s) => values.has(s.id) && Number.isFinite(s.lat) && Number.isFinite(s.lon))
+    .map((s) => ({
+      lat: s.lat, lon: s.lon, v: values.get(s.id),
+      wt: s.kind === "civ" ? CIV_RESIDUAL_WT : 1,
+    }));
+  if (!grid && pts.length < 3) return;
+  const residuals = grid ? computeResiduals(pts, grid) : [];
+
+  if (!overlayCanvas) {
+    overlayCanvas = document.createElement("canvas");
+    overlayCanvas.width = OVERLAY.w;
+    overlayCanvas.height = OVERLAY.h;
   }
-  renderDetail();
-  renderList();
+  if (typeof overlayCanvas.getContext !== "function") return;
+  const n = OVERLAY.w * OVERLAY.h;
+  if (!fieldCache) {
+    fieldCache = new Float32Array(n);
+    fadeCache = new Float32Array(n);
+  }
+  const cosLat = Math.cos((1.35 * Math.PI) / 180);
+  const edgePx = Math.round(OVERLAY.w * 0.05);
+
+  for (let py = 0; py < OVERLAY.h; py++) {
+    const lat = OVERLAY.latMax - ((py + 0.5) / OVERLAY.h) * (OVERLAY.latMax - OVERLAY.latMin);
+    for (let px = 0; px < OVERLAY.w; px++) {
+      const lon = OVERLAY.lonMin + ((px + 0.5) / OVERLAY.w) * (OVERLAY.lonMax - OVERLAY.lonMin);
+      const i = py * OVERLAY.w + px;
+      if (grid) {
+        const val = fieldAt(lat, lon, grid, residuals);
+        if (val == null) { fieldCache[i] = NaN; continue; }
+        fieldCache[i] = val;
+        // soft fade only at the raster's outer edges
+        const edge = Math.min(px, OVERLAY.w - 1 - px, py, OVERLAY.h - 1 - py) / edgePx;
+        fadeCache[i] = Math.min(1, edge);
+      } else {
+        let wSum = 0, vSum = 0, nearest = Infinity;
+        for (const p of pts) {
+          const dx = (lon - p.lon) * cosLat * KM_PER_DEG;
+          const dy = (lat - p.lat) * KM_PER_DEG;
+          const d2 = dx * dx + dy * dy + 0.05;
+          const w = p.wt / d2; // IDW, power 2
+          wSum += w;
+          vSum += w * p.v;
+          if (d2 < nearest) nearest = d2;
+        }
+        fieldCache[i] = vSum / wSum;
+        // full shade within 8 km of a station, gone past 18 km
+        fadeCache[i] = Math.min(1, Math.max(0, (18 - Math.sqrt(nearest)) / 10));
+      }
+    }
+  }
+  paintOverlay();
+}
+
+/* Colour pass over the cached field. */
+function paintOverlay() {
+  if (!fieldCache || !overlayCanvas || typeof overlayCanvas.getContext !== "function") return;
+  const ctx = overlayCanvas.getContext("2d");
+  const img = ctx.createImageData(OVERLAY.w, OVERLAY.h);
+  for (let py = 0; py < OVERLAY.h; py++) {
+    for (let px = 0; px < OVERLAY.w; px++) {
+      const i = py * OVERLAY.w + px;
+      const v = fieldCache[i];
+      if (Number.isNaN(v)) continue;
+      const alpha = OVERLAY_MAX_ALPHA * extremeness(v) * fadeCache[i];
+      if (alpha <= 0.004) continue;
+      const [r, g, b] = tempRGB(v);
+      const o = i * 4;
+      img.data[o] = r; img.data[o + 1] = g; img.data[o + 2] = b;
+      img.data[o + 3] = Math.round(alpha * 255);
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const url = overlayCanvas.toDataURL();
+  if (!overlayLayer) {
+    overlayLayer = L.imageOverlay(url,
+      [[OVERLAY.latMin, OVERLAY.lonMin], [OVERLAY.latMax, OVERLAY.lonMax]],
+      { opacity: 1, interactive: false }).addTo(map);
+  } else {
+    overlayLayer.setUrl(url);
+  }
+}
+
+function renderTimebar(t) {
+  const slider = document.getElementById("time-slider");
+  const label = document.getElementById("time-label");
+  const liveBtn = document.getElementById("live-btn");
+  slider.max = Math.max(0, sliderTicks.length - 1);
+  if (displayedT === null) {
+    slider.value = slider.max;
+  } else {
+    // keep the handle tracking the displayed time (it moves during playback)
+    let lo = 0, hi = sliderTicks.length - 1, idx = 0;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (sliderTicks[mid] <= displayedT) { idx = mid; lo = mid + 1; } else hi = mid - 1;
+    }
+    slider.value = idx;
+  }
+  label.textContent = t ? fmtTime(t) : "–";
+  const f = dayFactor(t ?? Date.now());
+  document.getElementById("sky-icon").textContent = f > 0.8 ? "☀️" : f < 0.2 ? "🌙" : "🌅";
+  liveBtn.classList.toggle("active", displayedT === null);
 }
 
 function renderAll() {
-  for (const s of stations.values()) renderMarker(s);
-  renderList();
-  renderSummary();
-  renderDetail();
+  const t = displayedTime();
+  const values = displayedValues(t);
+  const grid = buildBlendedGrid(t ?? Date.now());
+  updateWindBlend();
+  ensureWindField(); // socks, pins, and particles follow the displayed time
+  updateScale(values, grid); // normalize colours before anything draws
+  if (map && map.getContainer) {
+    const boost = 1 + DAY_BRIGHT_BOOST * dayFactor(t ?? Date.now());
+    map.getContainer().style.setProperty("--day-boost", boost.toFixed(3));
+  }
+  for (const s of stations.values()) renderMarker(s, values.get(s.id));
+  renderList(values);
+  renderSummary(values);
+  renderDetail(values, t);
+  renderOverlay(values, grid);
+  renderTimebar(t);
+  renderWindStatus();
+  renderWindPins();
 }
 
-function setStatus(text) {
-  document.getElementById("refresh-status").textContent = text;
+// Coalesce slider-drag renders to animation frames.
+function scheduleRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => { renderQueued = false; renderAll(); });
+}
+
+function selectStation(id) {
+  selectedId = id === selectedId ? null : id;
+  const s = stations.get(selectedId);
+  if (s && s.marker) map.panTo([s.lat, s.lon]);
+  renderAll();
+}
+
+// ---------- wind particles ----------
+
+/* A real particle system in geographic space: particles spawn inside data
+   coverage, advect along the wind field, and carry their recent path as a
+   list of lat/lon points. The whole canvas is redrawn from those geographic
+   tails every frame, so panning keeps the streaks glued to the land — only
+   the zoom animation (where Leaflet's projection jumps at the end) gets a
+   brief fade. Toggled by the WIND button. */
+const WIND_N = 400;
+const WIND_TAIL = 20;          // tail samples per particle (pushed every 2nd tick)
+const WIND_TICK_MS = 33;       // ~30fps
+const WIND_DEG_PER_S = 0.0018; // visual exaggeration: °lat per second per km/h
+const WIND_AGE_S = [8, 20];    // particle lifetime range
+const WIND_COVER_KM = 12;      // no particles farther than this from a real sensor
+
+let windOn = true, windCanvas = null, windCtx = null;
+let windParts = [];
+
+// Particles only where there's actual wind data nearby — the IDW field happily
+// extrapolates over Malaysia, but that's invention, not data.
+function windCovered(lat, lon) {
+  const pts = windStations.size
+    ? [...windStations.values()]
+    : [...stations.values()].filter((s) => s.kind === "nea" && Number.isFinite(s.lat));
+  if (!pts.length) return false;
+  const cosLat = Math.cos((1.35 * Math.PI) / 180);
+  for (const p of pts) {
+    const dx = (lon - p.lon) * cosLat * KM_PER_DEG;
+    const dy = (lat - p.lat) * KM_PER_DEG;
+    if (dx * dx + dy * dy < WIND_COVER_KM * WIND_COVER_KM) return true;
+  }
+  return false;
+}
+
+function spawnPart(p = {}) {
+  for (let i = 0; i < 8; i++) {
+    const lat = OVERLAY.latMin + Math.random() * (OVERLAY.latMax - OVERLAY.latMin);
+    const lon = OVERLAY.lonMin + Math.random() * (OVERLAY.lonMax - OVERLAY.lonMin);
+    if (!windCovered(lat, lon)) continue;
+    p.lat = lat;
+    p.lon = lon;
+    p.age = WIND_AGE_S[0] + Math.random() * (WIND_AGE_S[1] - WIND_AGE_S[0]);
+    p.hist = [[lat, lon]];
+    return p;
+  }
+  p.hist = [];
+  p.age = 0.5; // no coverage found this round; retry shortly
+  return p;
+}
+
+function startWind() {
+  if (typeof window === "undefined") return;
+  windCanvas = document.getElementById("wind");
+  if (!windCanvas || typeof windCanvas.getContext !== "function") return;
+  windCtx = windCanvas.getContext("2d");
+  try { windOn = localStorage.getItem("sgtemp-wind") !== "off"; } catch { /* default on */ }
+  updateWindBtn();
+
+  // The canvas lives in its own map pane so it pans with the tiles, and the
+  // zoomanim hook lets Leaflet's zoom animation scale the drawn particles
+  // smoothly along with the map (same mechanism tiles use). At zoomend the
+  // normal frame loop resumes and redraws crisp at the new zoom.
+  const pane = map.createPane("windParticles");
+  pane.style.zIndex = 450;
+  pane.style.pointerEvents = "none";
+  pane.appendChild(windCanvas);
+  windCanvas.classList.add("leaflet-zoom-animated");
+
+  const fit = () => {
+    const size = map.getSize();
+    windCanvas.width = size.x;
+    windCanvas.height = size.y;
+  };
+  fit();
+  map.on("resize", fit);
+
+  /* Fluid zoom: while Leaflet's zoom animation CSS-scales the canvas from
+     the old view to the new one, we keep advancing and redrawing particles
+     in the OLD view's coordinate frame (computed explicitly from the
+     pre-zoom zoom level, immune to Leaflet's internal state flipping
+     mid-animation). The animated element transform carries that old-frame
+     drawing to the right screen positions, so motion never pauses. Pinch
+     zoom never fires zoomanim — its projections update live, so the normal
+     path already handles it. */
+  let zoomCand = null, zoomRef = null;
+  map.on("zoomstart", () => {
+    const z = map.getZoom();
+    const o = map.project(map.containerPointToLatLng([0, 0]), z);
+    zoomCand = { zoom: z, ox: o.x, oy: o.y };
+  });
+  map.on("zoomanim", (e) => {
+    if (!map.getZoomScale || !map._latLngBoundsToNewLayerBounds) return;
+    zoomRef = zoomCand;
+    const scale = map.getZoomScale(e.zoom);
+    const offset = map._latLngBoundsToNewLayerBounds(map.getBounds(), e.zoom, e.center).min;
+    L.DomUtil.setTransform(windCanvas, offset, scale);
+  });
+  map.on("zoomend", () => { zoomRef = null; zoomCand = null; });
+
+  windParts = Array.from({ length: WIND_N }, () => spawnPart());
+  const cosLat = Math.cos((1.35 * Math.PI) / 180);
+  let last = 0, tick = 0;
+
+  function frame(ts) {
+    requestAnimationFrame(frame);
+    if (!windOn || document.hidden) { last = ts; return; }
+    if (ts - last < WIND_TICK_MS) return;
+    const dt = Math.min(0.1, (ts - last) / 1000);
+    last = ts;
+    tick++;
+
+    const ref = zoomRef;
+    const toPt = ref
+      ? (ll) => { const p = map.project(ll, ref.zoom); return { x: p.x - ref.ox, y: p.y - ref.oy }; }
+      : (ll) => map.latLngToContainerPoint(ll);
+    // pin the canvas to the viewport — but never mid-zoom, where setPosition
+    // would stomp the animated transform
+    if (!ref) L.DomUtil.setPosition(windCanvas, map.containerPointToLayerPoint([0, 0]));
+    windCtx.clearRect(0, 0, windCanvas.width, windCanvas.height);
+    windCtx.lineCap = "round";
+    for (const p of windParts) {
+      const w = p.hist.length ? windVecAt(p.lat, p.lon) : null;
+      if (p.hist.length && w && Number.isFinite(w.u)) {
+        p.lat += w.v * WIND_DEG_PER_S * dt;
+        p.lon += (w.u * WIND_DEG_PER_S * dt) / cosLat;
+        if (tick % 2 === 0) {
+          p.hist.push([p.lat, p.lon]);
+          if (p.hist.length > WIND_TAIL) p.hist.shift();
+        }
+      }
+      p.age -= dt;
+      if (p.age <= 0 || !p.hist.length || !windCovered(p.lat, p.lon)) {
+        spawnPart(p);
+        continue;
+      }
+      if (p.hist.length < 2) continue;
+      // faint full tail, brighter head
+      windCtx.beginPath();
+      let pt = toPt(p.hist[0]);
+      windCtx.moveTo(pt.x, pt.y);
+      for (let i = 1; i < p.hist.length; i++) {
+        pt = toPt(p.hist[i]);
+        windCtx.lineTo(pt.x, pt.y);
+      }
+      windCtx.strokeStyle = "rgba(214, 233, 255, 0.08)";
+      windCtx.lineWidth = 1;
+      windCtx.stroke();
+      const headStart = Math.max(0, p.hist.length - 4);
+      windCtx.beginPath();
+      pt = toPt(p.hist[headStart]);
+      windCtx.moveTo(pt.x, pt.y);
+      for (let i = headStart + 1; i < p.hist.length; i++) {
+        pt = toPt(p.hist[i]);
+        windCtx.lineTo(pt.x, pt.y);
+      }
+      windCtx.strokeStyle = "rgba(222, 240, 255, 0.24)";
+      windCtx.lineWidth = 1.5;
+      windCtx.stroke();
+    }
+  }
+  requestAnimationFrame(frame);
+}
+
+function updateWindBtn() {
+  const b = document.getElementById("wind-btn");
+  if (b && b.classList) b.classList.toggle("active", windOn);
+}
+
+// ---------- status ----------
+
+function setStatus(text, pinned = false) {
+  statusPinned = pinned;
+  const el = document.getElementById("refresh-status");
+  el.textContent = text;
+  el.classList.toggle("loading", pinned);
+}
+
+// ticks once a second so the header feels alive between polls
+function tickStatus() {
+  if (statusPinned || latestReadingT == null) return;
+  const secs = Math.max(0, Math.round((Date.now() - latestReadingT) / 1000));
+  setStatus(`live · reading ${secs}s old`);
 }
 
 function showError(msg) {
@@ -211,78 +1370,175 @@ function showError(msg) {
   b.classList.remove("hidden");
 }
 
-// ---------- data flow ----------
-
-function ingest(result) {
-  for (const info of result.stations) upsertStation(info);
-  const t = result.timestamp.getTime();
-  for (const [id, value] of result.readings) {
-    const s = stations.get(id);
-    if (!s) continue;
-    if (!s.history.some((p) => p.t === t)) {
-      s.history.push({ t, v: value });
-      s.history.sort((a, b) => a.t - b.t);
-    }
-  }
-}
-
-function pruneAndSetLatest(now) {
-  const cutoff = now - HISTORY_HOURS * 3600_000;
-  for (const s of stations.values()) {
-    s.history = s.history.filter((p) => p.t >= cutoff);
-    s.latest = s.history.length ? s.history[s.history.length - 1].v : null;
-  }
-}
+// ---------- load & poll ----------
 
 async function refresh() {
   try {
-    const result = await fetchReadings();
-    ingest(result);
-    lastUpdated = result.timestamp;
-    pruneAndSetLatest(Date.now());
+    ingest(await fetchReadings());
+    rebuild();
     renderAll();
     showError(null);
-    setStatus(`updated ${result.timestamp.toLocaleTimeString("en-SG", { timeZone: "Asia/Singapore" })} SGT`);
+    latestReadingT = timeline[timeline.length - 1] ?? null;
+    tickStatus();
+    // keep the reload cache fresh so the next visit skips the archives
+    if (typeof localStorage !== "undefined" && Date.now() - lastHistSave > 5 * 60_000 && timeline.length > 100) {
+      saveHistCache();
+    }
   } catch (e) {
     showError(`Could not reach data.gov.sg (${e.message}). Retrying in a minute…`);
-    setStatus("retrying…");
+    setStatus("retrying…", true);
   }
 }
 
-// Backfill the 24h window with one sample per hour (sparkline resolution).
+// Processed-history cache: the raw day files are several MB each, but the
+// extracted per-station series are a few hundred KB — small enough for
+// localStorage. A reload within the freshness window restores instantly and
+// skips every archive download (live polls fill forward from there).
+const HIST_CACHE_KEY = "sgtemp-hist-v1";
+const HIST_CACHE_MS = 15 * 60_000;
+let lastHistSave = 0;
+
+function saveHistCache() {
+  try {
+    lastHistSave = Date.now();
+    localStorage.setItem(HIST_CACHE_KEY, JSON.stringify({
+      at: lastHistSave,
+      stations: [...stations.values()].map((s) => ({
+        id: s.id, name: s.name, lat: s.lat, lon: s.lon, kind: s.kind,
+        series: [...s.series],
+      })),
+      wind: [...windStations.values()].map((w) => ({
+        id: w.id, name: w.name, lat: w.lat, lon: w.lon,
+        series: w.series.map((p) => [p.t, p.u, p.v]),
+      })),
+    }));
+  } catch { /* quota or unavailable — caching is best-effort */ }
+}
+
+function loadHistCache() {
+  try {
+    const c = JSON.parse(localStorage.getItem(HIST_CACHE_KEY));
+    if (!c || Date.now() - c.at > HIST_CACHE_MS) return false;
+    for (const sc of c.stations ?? []) {
+      const s = upsertStation({ id: sc.id, name: sc.name, lat: sc.lat, lon: sc.lon, kind: sc.kind });
+      for (const [t, v] of sc.series) s.series.set(t, v);
+    }
+    for (const wc of c.wind ?? []) {
+      if (!windStations.has(wc.id)) {
+        windStations.set(wc.id, {
+          id: wc.id, name: wc.name, lat: wc.lat, lon: wc.lon,
+          series: wc.series.map(([t, u, v]) => ({ t, u, v })),
+        });
+      }
+    }
+    if (c.wind?.length) windDayLoaded = true; // wind archive already covered
+    return (c.stations ?? []).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+// Bulk-load the 24h window. Today's file first (the most useful hours) and
+// only then yesterday's, sequentially — one download at full bandwidth beats
+// two sharing it, and each renders as soon as it lands.
 async function loadHistory() {
   const now = Date.now();
-  const targets = [];
-  for (let h = HISTORY_HOURS; h >= 1; h--) targets.push(new Date(now - h * 3600_000));
-
-  let done = 0;
-  const queue = [...targets];
-  const worker = async () => {
-    while (queue.length) {
-      const t = queue.shift();
-      try {
-        ingest(await fetchReadings(t));
-      } catch { /* a missing hour just leaves a gap in the sparkline */ }
-      setStatus(`loading history ${++done}/${targets.length}`);
-    }
-  };
-  await Promise.all(Array.from({ length: HISTORY_CONCURRENCY }, worker));
-  pruneAndSetLatest(now);
+  if (typeof localStorage !== "undefined" && loadHistCache()) {
+    rebuild(now);
+    renderAll();
+    latestReadingT = timeline[timeline.length - 1] ?? null;
+    statusPinned = false;
+    tickStatus();
+    return;
+  }
+  setStatus("loading 24h history…", true);
+  for (const day of [sgtDate(new Date(now)), sgtDate(new Date(now - 24 * 3600_000))]) {
+    try {
+      ingest(await fetchDay(day));
+      rebuild();
+      renderAll();
+    } catch { /* a missing day just shortens the scrubber range */ }
+  }
+  rebuild(now);
   renderAll();
+  latestReadingT = timeline[timeline.length - 1] ?? null;
+  statusPinned = false;
+  tickStatus();
+  if (typeof localStorage !== "undefined") saveHistCache();
 }
 
 // ---------- init ----------
 
 function initMap() {
-  map = L.map("map", { zoomControl: true }).setView([1.3521, 103.8198], 12);
-  L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+  // hard-locked to the Open-Meteo grid window — no padding, no drifting off it
+  const dataBounds = L.latLngBounds(
+    [OVERLAY.latMin, OVERLAY.lonMin], [OVERLAY.latMax, OVERLAY.lonMax]);
+  map = L.map("map", {
+    zoomControl: true,
+    maxBounds: dataBounds,
+    maxBoundsViscosity: 1.0, // hard wall when panning
+    zoomSnap: 0, // fractional zoom, so min zoom can match the bounds exactly
+  });
+  map.fitBounds(dataBounds);
+  // Fully zoomed out = screen completely filled by the data window
+  // (inside=true), so the map can never show past the data edge. Recompute
+  // when the container changes shape, or a resize would reopen the gap.
+  const lockMinZoom = () => map.setMinZoom(map.getBoundsZoom(dataBounds, true));
+  lockMinZoom();
+  map.on("resize", lockMinZoom);
+  const tileOpts = {
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
     maxZoom: 18,
-  }).addTo(map);
+  };
+  // single dark basemap; daytime just brightens it slightly via a CSS
+  // filter on the tile pane (no second tile set, no hue clash with the
+  // temperature ramp)
+  L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", tileOpts).addTo(map);
 }
 
 document.getElementById("detail-close").addEventListener("click", () => selectStation(selectedId));
 
+document.getElementById("time-slider").addEventListener("input", (e) => {
+  const idx = Number(e.target.value);
+  displayedT = idx >= sliderTicks.length - 1 ? null : sliderTicks[idx];
+  scheduleRender();
+});
+
+document.getElementById("live-btn").addEventListener("click", () => {
+  displayedT = null;
+  renderAll();
+});
+
+const filterSel = document.getElementById("list-filter");
+try {
+  listFilter = localStorage.getItem("sgtemp-filter") || "all";
+  filterSel.value = listFilter;
+} catch { /* default */ }
+filterSel.addEventListener("change", () => {
+  listFilter = filterSel.value;
+  try { localStorage.setItem("sgtemp-filter", listFilter); } catch { /* fine */ }
+  renderAll();
+});
+
+document.getElementById("wind-btn").addEventListener("click", () => {
+  windOn = !windOn;
+  try { localStorage.setItem("sgtemp-wind", windOn ? "on" : "off"); } catch { /* fine */ }
+  if (windCtx) windCtx.clearRect(0, 0, windCanvas.width, windCanvas.height);
+  updateWindBtn();
+});
+
 initMap();
-refresh().then(loadHistory);
+startWind();
+refresh().then(loadHistory).then(() => {
+  pollCommunity();
+  // wind archive matters only for scrubbing — let the visible stuff win
+  setTimeout(() => loadWindHistory().catch(() => {}), 1500);
+});
+pollWind();
+setInterval(pollWind, POLL_MS);
+refreshModel();
 setInterval(refresh, POLL_MS);
+setInterval(refreshModel, MODEL_REFRESH_MS);
+setInterval(tickStatus, 1000);
+setInterval(pollCommunity, CIV_POLL_MS);
+setInterval(renderLive, 1500); // live numbers drift slightly between polls

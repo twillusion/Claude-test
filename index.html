@@ -5,6 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>SG Temp — Live Singapore Temperature</title>
   <meta name="description" content="Live air temperature across Singapore's weather stations, with a 24-hour rolling view. Data from NEA via data.gov.sg.">
+  <link rel="preconnect" href="https://api.data.gov.sg" crossorigin>
+  <link rel="preconnect" href="https://api-open.data.gov.sg" crossorigin>
+  <link rel="preconnect" href="https://a.basemaps.cartocdn.com" crossorigin>
+  <link rel="preconnect" href="https://unpkg.com" crossorigin>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
         integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
   <link rel="stylesheet" href="assets/style.css">
@@ -26,7 +30,24 @@
   <div class="banner hidden" id="error-banner"></div>
 
   <main class="layout">
-    <div id="map" aria-label="Map of Singapore weather stations"></div>
+    <div class="map-wrap">
+      <div id="map" aria-label="Map of Singapore weather stations">
+        <canvas id="wind" aria-hidden="true"></canvas>
+      </div>
+      <div class="legend" title="Colour scale, normalized to the temperatures currently shown">
+        <span id="legend-lo">–</span>
+        <div class="legend-bar"></div>
+        <span id="legend-hi">–</span>
+      </div>
+      <div class="timebar">
+        <button id="live-btn" title="Jump to latest reading">LIVE</button>
+        <button id="wind-btn" title="Toggle wind streaks">WIND</button>
+        <input type="range" id="time-slider" min="0" max="0" step="1" value="0"
+               aria-label="Time scrubber for the last 24 hours">
+        <span id="sky-icon" aria-hidden="true"></span>
+        <span id="time-label">–</span>
+      </div>
+    </div>
 
     <aside class="panel">
       <section class="detail hidden" id="detail">
@@ -43,7 +64,15 @@
       </section>
 
       <section class="stations">
-        <h2 class="panel-title">Stations <span id="station-count"></span></h2>
+        <div class="panel-head">
+          <h2 class="panel-title">Stations <span id="station-count"></span></h2>
+          <select id="list-filter" aria-label="Filter station list">
+            <option value="all">All</option>
+            <option value="temp">Temperature</option>
+            <option value="wind">Wind</option>
+            <option value="civ">Community</option>
+          </select>
+        </div>
         <ul id="station-list"></ul>
       </section>
     </aside>
@@ -52,6 +81,10 @@
   <footer class="footer">
     Data: <a href="https://data.gov.sg" target="_blank" rel="noopener">NEA via data.gov.sg</a>
     (<a href="https://data.gov.sg/open-data-licence" target="_blank" rel="noopener">Singapore Open Data Licence</a>)
+    · shading: <span id="shade-mode">stations only</span>,
+    model grid by <a href="https://open-meteo.com" target="_blank" rel="noopener">Open-Meteo</a>
+    · wind <span id="wind-status">–</span>
+    · community <span id="civ-status">…</span>
     · refreshes every minute
   </footer>
 

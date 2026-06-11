@@ -39,6 +39,7 @@ body { display: flex; flex-direction: column; }
 .stat-label { font-size: 0.65rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
 
 .refresh { font-size: 0.7rem; color: var(--muted); min-width: 7rem; text-align: right; }
+.refresh.loading { color: var(--accent); animation: blink 1.4s ease-in-out infinite; }
 
 .banner {
   padding: 0.5rem 1rem;
@@ -50,7 +51,102 @@ body { display: flex; flex-direction: column; }
 
 .layout { flex: 1; display: flex; min-height: 0; }
 
+.map-wrap { flex: 1; position: relative; display: flex; min-height: 0; }
+
 #map { flex: 1; min-height: 0; background: #0a0e18; }
+
+.legend {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 800;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.3rem 0.6rem;
+  background: rgba(22, 29, 46, 0.92);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.7rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.legend-bar {
+  width: 84px;
+  height: 8px;
+  border-radius: 4px;
+  /* mirrors the overlay: transparent middle, colour only at the extremes */
+  background:
+    linear-gradient(90deg,
+      rgb(124, 199, 255), rgba(124, 199, 255, 0) 42%,
+      rgba(255, 122, 26, 0) 58%, rgb(255, 122, 26)),
+    repeating-linear-gradient(45deg, #2a3450 0 3px, #1d2740 3px 6px);
+}
+
+.timebar {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 14px;
+  z-index: 800;
+  width: min(92%, 540px);
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  padding: 0.45rem 0.8rem;
+  background: rgba(22, 29, 46, 0.92);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+}
+
+#live-btn, #wind-btn {
+  background: var(--panel-2);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+#live-btn.active { background: #1d4a2c; color: #7fe6a0; border-color: #2c6e42; }
+#wind-btn.active { background: #1d3a5c; color: var(--accent); border-color: #2c5a8e; }
+#live-btn.active::before {
+  content: "●";
+  margin-right: 4px;
+  animation: blink 2s ease-in-out infinite;
+}
+
+#sky-icon { font-size: 0.85rem; line-height: 1; }
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+/* wind streaklines: above tiles and shading (z 200/400), below markers (600) */
+/* lives inside the windParticles map pane; Leaflet positions it via
+   transforms, so only anchor the top-left (inset would zero its size) */
+#wind {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+}
+
+
+#time-slider { flex: 1; accent-color: var(--accent); min-width: 0; }
+
+#time-label {
+  font-size: 0.72rem;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  min-width: 5.5rem;
+  text-align: right;
+}
 
 .panel {
   width: 340px;
@@ -59,6 +155,13 @@ body { display: flex; flex-direction: column; }
   border-left: 1px solid var(--border);
   display: flex;
   flex-direction: column;
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-right: 1rem;
 }
 
 .panel-title {
@@ -70,6 +173,25 @@ body { display: flex; flex-direction: column; }
   padding: 0.8rem 1rem 0.4rem;
 }
 .panel-title span { font-weight: 400; }
+
+#list-filter {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.7rem;
+  padding: 2px 4px;
+}
+
+.wind-row .wind-row-dir {
+  position: relative;
+  width: 70px;
+  height: 14px;
+  flex-shrink: 0;
+}
+.wind-row .wind-row-dir .wind-sock { left: 26px; top: calc(50% - 6.5px); }
+.wind-row .wind-speed { color: var(--accent); font-weight: 600; }
+.civ-row .station-name { color: var(--muted); }
 
 #station-list { list-style: none; margin: 0; padding: 0 0 0.5rem; }
 
@@ -106,6 +228,7 @@ body { display: flex; flex-direction: column; }
 #detail-spark { width: 100%; height: 80px; background: var(--bg); border-radius: 6px; }
 #detail-spark polyline { fill: none; stroke: var(--accent); stroke-width: 2; }
 #detail-spark .spark-fill { fill: rgba(94, 193, 255, 0.12); stroke: none; }
+#detail-spark .spark-cursor { stroke: #ffffff; stroke-width: 1; stroke-dasharray: 3 3; opacity: 0.7; }
 .detail-range { display: flex; justify-content: space-between; margin-top: 0.5rem; font-size: 0.75rem; color: var(--muted); }
 .detail-range strong { color: var(--text); font-variant-numeric: tabular-nums; }
 
@@ -135,7 +258,70 @@ body { display: flex; flex-direction: column; }
 }
 .temp-pill.selected { outline: 2px solid #fff; }
 
+/* civilian sensors: small pin with a modest temperature chip above it */
+.civ-marker {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  transform: translate(-50%, -100%);
+}
+.civ-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50% 50% 50% 0;
+  transform: rotate(-45deg);
+  background: var(--pill, #888);
+  border: 1.5px solid rgba(255, 255, 255, 0.9);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+}
+.civ-temp {
+  font-size: 0.58rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  background: rgba(14, 19, 32, 0.8);
+  padding: 0 4px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+.civ-marker.selected .civ-dot { outline: 2px solid #fff; }
+
+/* wind direction: a windsock wedge growing out from under the marker,
+   extending downwind, tapering and fading at the tip — no arrowheads.
+   Colour comes inline (the host pill's temperature colour on hybrids). */
+.wind-sock {
+  position: absolute;
+  left: 0;
+  top: -6.5px;
+  height: 13px;
+  transform-origin: 0 50%;
+  clip-path: polygon(0 0, 0 100%, 100% 50%);
+  /* white rim matching the pill border, so pill + sock read as one outline */
+  filter: drop-shadow(0 0 1px rgba(255, 255, 255, 0.65));
+  pointer-events: none;
+}
+
+.wind-spot { position: absolute; }
+
+.wind-dot {
+  position: absolute;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #9fd0ff;
+  border: 1.5px solid rgba(255, 255, 255, 0.85);
+  transform: translate(-50%, -50%);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+}
+
 .leaflet-container { font: inherit; }
+
+/* daytime gently brightens the dark basemap (driven by --day-boost) */
+#map .leaflet-tile-pane {
+  filter: brightness(var(--day-boost, 1));
+  transition: filter 0.8s linear;
+}
 
 @media (max-width: 760px) {
   .layout { flex-direction: column; }
