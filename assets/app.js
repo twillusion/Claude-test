@@ -433,13 +433,27 @@ async function fetchWindDayRaw(dayStr) {
 }
 
 // Deferred wind archive: only needed for scrubbing, so it loads after the
-// temperature history instead of competing with it at startup.
+// temperature history instead of competing with it at startup. Total
+// failure (rate limit) retries itself with backoff rather than leaving the
+// session windless.
+let windHistRetries = 0;
+
 async function loadWindHistory() {
   if (windDayLoaded) return;
-  windDayLoaded = true;
+  let ok = false;
   for (const day of [sgtDate(new Date()), sgtDate(new Date(Date.now() - 86_400_000))]) {
-    try { await fetchWindDayRaw(day); } catch { /* day files are best-effort */ }
+    try {
+      await fetchWindDayRaw(day);
+      ok = true;
+    } catch { /* day files are best-effort */ }
   }
+  if (!ok) {
+    if (windHistRetries++ < 3) {
+      setTimeout(() => loadWindHistory().catch(() => {}), 60_000 * windHistRetries);
+    }
+    return;
+  }
+  windDayLoaded = true;
   updateWindField();
   renderWindStatus();
   renderWindPins();
@@ -1464,19 +1478,50 @@ async function loadHistory() {
     return;
   }
   setStatus("loading 24h history…", true);
+  const failed = [];
   for (const day of [sgtDate(new Date(now)), sgtDate(new Date(now - 24 * 3600_000))]) {
     try {
       ingest(await fetchDay(day));
       rebuild();
       renderAll();
-    } catch { /* a missing day just shortens the scrubber range */ }
+    } catch {
+      failed.push(day); // rate limit or hiccup — retried below
+    }
   }
   rebuild(now);
   renderAll();
   latestReadingT = timeline[timeline.length - 1] ?? null;
   statusPinned = false;
   tickStatus();
-  if (typeof localStorage !== "undefined") saveHistCache();
+  if (failed.length === 2) {
+    showError("History download was rate-limited — retrying in the background…");
+  }
+  scheduleHistRetry(failed);
+  if (!failed.length && typeof localStorage !== "undefined") saveHistCache();
+}
+
+// Failed archive days retry themselves with growing backoff instead of
+// staying missing for the whole session.
+let histRetries = 0;
+
+function scheduleHistRetry(days) {
+  if (!days.length || histRetries >= 3) return;
+  histRetries++;
+  setTimeout(async () => {
+    const still = [];
+    for (const day of days) {
+      try {
+        ingest(await fetchDay(day));
+        rebuild();
+        renderAll();
+        showError(null);
+      } catch {
+        still.push(day);
+      }
+    }
+    if (!still.length && typeof localStorage !== "undefined") saveHistCache();
+    scheduleHistRetry(still);
+  }, 45_000 * histRetries);
 }
 
 // ---------- init ----------
