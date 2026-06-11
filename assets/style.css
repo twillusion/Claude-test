@@ -287,30 +287,12 @@ body { display: flex; flex-direction: column; }
 }
 .civ-marker.selected .civ-dot { outline: 2px solid #fff; }
 
-/* forecast clouds: blurred sprites drifting via CSS (margin, not transform —
-   Leaflet owns the transform), GPU-composited, zero per-frame JS */
-.cloud-puff {
-  position: absolute;
+/* rain gauges: glyph centred on the gauge, splash circle drawn by Leaflet */
+.rain-icon {
+  display: inline-block;
+  font-size: 15px;
   transform: translate(-50%, -50%);
-  border-radius: 50%;
-  background: radial-gradient(ellipse at center, rgba(222, 230, 242, 0.5), rgba(222, 230, 242, 0) 70%);
-  filter: blur(7px);
-  pointer-events: none;
-  /* size, offset (margins), opacity, and timing come inline, seeded from
-     the area name; the drift animates the translate property so it never
-     fights the centering transform or the margin offsets */
-  animation: cloud-drift 46s ease-in-out infinite alternate;
-}
-.cloud-puff.rainy {
-  background: radial-gradient(ellipse at center, rgba(150, 165, 190, 0.6), rgba(150, 165, 190, 0) 70%);
-}
-.cloud-puff.storm {
-  background: radial-gradient(ellipse at center, rgba(108, 120, 145, 0.7), rgba(108, 120, 145, 0) 70%);
-}
-
-@keyframes cloud-drift {
-  from { translate: -10px 0; }
-  to { translate: 10px 0; }
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.6));
 }
 
 /* wind direction: a windsock wedge growing out from under the marker,

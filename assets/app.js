@@ -11,8 +11,8 @@ const WIND_SPEED_URL = "https://api.data.gov.sg/v1/environment/wind-speed";
 const WIND_DIR_URL = "https://api.data.gov.sg/v1/environment/wind-direction";
 const RAIN_URL = "https://api.data.gov.sg/v1/environment/rainfall";
 const RAIN_POLL_MS = 5 * 60_000; // gauges report 5-minute totals
-const FORECAST_URL = "https://api.data.gov.sg/v1/environment/2-hour-weather-forecast";
-const FORECAST_POLL_MS = 30 * 60_000;
+const RV_META_URL = "https://api.rainviewer.com/public/weather-maps.json";
+const SAT_POLL_MS = 10 * 60_000; // satellite frames update every ~10 minutes
 const KNOTS_TO_KMH = 1.852;
 const OM_URL = "https://api.open-meteo.com/v1/forecast";
 const POLL_MS = 60_000;
@@ -429,14 +429,12 @@ function buildWindGrid() {
 
 // ---------- rain (NEA rain gauges, live view only) ----------
 
-/* 5-minute rainfall totals from ~60 gauges, rasterized onto the same coarse
-   grid as the wind so rain streaks can sample intensity with one bilinear
-   lookup. Live-only for now: there's no archived series, so scrubbing hides
-   the rain rather than inventing it. */
-const RAIN_COVER_KM = 10;
-let rainReadings = []; // [{lat, lon, mm}]
+/* 5-minute rainfall totals from ~60 gauges. Each wet gauge gets a rain
+   glyph and a translucent circle estimating the splash zone (radius grows
+   with intensity). Live-only: there's no archived series, so scrubbing
+   hides the rain rather than inventing it. */
+let rainReadings = []; // [{id, lat, lon, mm}]
 let wetGauges = [];    // readings with mm above drizzle threshold
-let rainGrid = null;   // Float32Array over WGRID; NaN outside coverage
 
 async function fetchRain() {
   const res = await fetch429(RAIN_URL);
@@ -447,11 +445,45 @@ async function fetchRain() {
   for (const r of json.items[0].readings) {
     const loc = locs.get(r.station_id);
     if (!loc || r.value == null || r.value < 0) continue;
-    rainReadings.push({ lat: loc.latitude, lon: loc.longitude, mm: r.value });
+    rainReadings.push({ id: r.station_id, lat: loc.latitude, lon: loc.longitude, mm: r.value });
   }
   wetGauges = rainReadings.filter((g) => g.mm > 0.2);
-  buildRainGrid();
+  renderRain();
   renderRainStatus();
+}
+
+const rainLayer = new Map(); // gauge id -> {circle, icon}
+
+function renderRain() {
+  if (typeof L === "undefined" || !map) return;
+  const seen = new Set();
+  for (const g of wetGauges) {
+    seen.add(g.id);
+    const radius = 1200 + Math.min(8, g.mm) * 350; // metres — a rough splash zone
+    let e = rainLayer.get(g.id);
+    if (!e) {
+      e = {
+        circle: L.circle([g.lat, g.lon], {
+          pane: "rain", radius,
+          color: "#5ec1ff", weight: 1, opacity: 0.35,
+          fillColor: "#5ec1ff", fillOpacity: 0.12,
+          interactive: false,
+        }).addTo(map),
+        icon: L.marker([g.lat, g.lon], { pane: "rain", keyboard: false }).addTo(map),
+      };
+      rainLayer.set(g.id, e);
+    }
+    e.circle.setRadius(radius);
+    e.icon.setIcon(L.divIcon({
+      className: "",
+      html: `<span class="rain-icon">🌧️</span>`,
+      iconSize: [0, 0],
+    }));
+    e.icon.bindTooltip(`${g.mm.toFixed(1)} mm in the last 5 min`);
+  }
+  for (const [id, e] of rainLayer) {
+    if (!seen.has(id)) { e.circle.remove(); e.icon.remove(); rainLayer.delete(id); }
+  }
 }
 
 // Open the page with ?testrain to verify the rain rendering on a dry day:
@@ -460,12 +492,12 @@ const TEST_RAIN = typeof location !== "undefined" && /testrain/.test(location.se
 
 function injectTestRain() {
   rainReadings = [
-    { lat: 1.34, lon: 103.78, mm: 6 },
-    { lat: 1.36, lon: 103.95, mm: 2.5 },
-    { lat: 1.29, lon: 103.85, mm: 9 },
+    { id: "T1", lat: 1.34, lon: 103.78, mm: 6 },
+    { id: "T2", lat: 1.36, lon: 103.95, mm: 2.5 },
+    { id: "T3", lat: 1.29, lon: 103.85, mm: 9 },
   ];
   wetGauges = rainReadings.slice();
-  buildRainGrid();
+  renderRain();
   const el = document.getElementById("rain-status");
   if (el) el.textContent = "TEST MODE — synthetic rain";
 }
@@ -478,34 +510,6 @@ function pollRain() {
   });
 }
 
-function buildRainGrid() {
-  if (!rainReadings.length) { rainGrid = null; return; }
-  const { nx, ny } = WGRID;
-  rainGrid = new Float32Array(nx * ny);
-  const cosLat = Math.cos((1.35 * Math.PI) / 180);
-  const cover2 = RAIN_COVER_KM * RAIN_COVER_KM;
-  for (let iy = 0; iy < ny; iy++) {
-    const lat = OVERLAY.latMax - ((iy + 0.5) / ny) * (OVERLAY.latMax - OVERLAY.latMin);
-    for (let ix = 0; ix < nx; ix++) {
-      const lon = OVERLAY.lonMin + ((ix + 0.5) / nx) * (OVERLAY.lonMax - OVERLAY.lonMin);
-      let wSum = 0, mm = 0, nearest = Infinity;
-      for (const g of rainReadings) {
-        const dx = (lon - g.lon) * cosLat * KM_PER_DEG;
-        const dy = (lat - g.lat) * KM_PER_DEG;
-        const d2 = dx * dx + dy * dy;
-        if (d2 < nearest) nearest = d2;
-        const w = 1 / (d2 + 0.5);
-        wSum += w; mm += w * g.mm;
-      }
-      rainGrid[iy * nx + ix] = nearest > cover2 ? NaN : mm / wSum;
-    }
-  }
-}
-
-function rainAt(lat, lon) {
-  return rainGrid ? gridSample2(rainGrid, lat, lon) : null;
-}
-
 function renderRainStatus() {
   const el = document.getElementById("rain-status");
   if (!el) return;
@@ -515,111 +519,35 @@ function renderRainStatus() {
   el.textContent = `${wetGauges.length} gauge${wetGauges.length > 1 ? "s" : ""} wet · up to ${max.toFixed(1)} mm`;
 }
 
-// Drops anchor near a wet gauge and replay a short screen-space fall, drawn
-// from the same loop and canvas as the wind particles.
-const RAIN_N = 160;
-const rainDrops = [];
+// ---------- satellite clouds (RainViewer infrared, live view only) ----------
 
-function spawnDrop(d) {
-  if (!wetGauges.length) { d.mm = 0; return d; }
-  for (let i = 0; i < 10; i++) {
-    const g = wetGauges[(Math.random() * wetGauges.length) | 0];
-    const lat = g.lat + (Math.random() - 0.5) * 0.07;
-    const lon = g.lon + (Math.random() - 0.5) * 0.07;
-    const mm = rainAt(lat, lon);
-    if (mm != null && mm > 0.1) {
-      d.lat = lat; d.lon = lon; d.mm = mm;
-      d.phase = Math.random();
-      d.speed = 0.8 + Math.random() * 0.7;
-      return d;
-    }
-  }
-  d.mm = 0;
-  return d;
-}
+/* Real clouds: the latest global infrared satellite frame from RainViewer's
+   free tile service, drawn as a translucent tile layer in its own pane.
+   One tiny JSON poll every 10 minutes; the tiles themselves are ordinary
+   map tiles the browser caches like any basemap. */
+let satLayer = null;
 
-// ---------- clouds (2-hour forecast per area, live view only) ----------
-
-/* NEA's 2-hour forecast names ~47 areas with condition text. Cloudy ones
-   get a single blurred sprite at the area's label point, drifting via CSS
-   animation in its own map pane — GPU-composited, no per-frame JS. The pane
-   hides while scrubbing, since the forecast only describes "now". */
-const cloudMarkers = new Map(); // area name -> marker
-
-function hashStr(s) {
-  let h = 0;
-  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
-  return h;
-}
-
-function cloudClass(forecast) {
-  const f = forecast.toLowerCase();
-  if (f.includes("thunder")) return "storm";
-  if (f.includes("rain") || f.includes("showers")) return "rainy";
-  if (f.includes("partly") || f.includes("hazy") || f.includes("mist") || f.includes("fog")) return "light";
-  if (f.includes("cloudy") || f.includes("overcast")) return "cloudy";
-  return null; // fair / clear / sunny / windy
-}
-
-// Each area's cloud is 2–3 overlapping puffs with sizes, offsets, drift
-// rhythms, and opacity all seeded from the area name — every cloud unique
-// but stable across refreshes.
-const CLOUD_BASE_OPACITY = { light: 0.4, cloudy: 0.65, rainy: 0.7, storm: 0.78 };
-
-function cloudIconHtml(area, cls) {
-  let h = hashStr(area) || 1;
-  const rnd = () => {
-    h = (h * 1103515245 + 12345) | 0;
-    return ((h >>> 8) % 1000) / 1000;
-  };
-  const baseW = 85 + rnd() * 80;
-  const n = 2 + (rnd() > 0.45 ? 1 : 0);
-  const puffs = [];
-  for (let i = 0; i < n; i++) {
-    const w = Math.round(baseW * (0.55 + rnd() * 0.6));
-    const ht = Math.round(w * (0.3 + rnd() * 0.2));
-    const dx = Math.round((rnd() - 0.5) * baseW * 0.75);
-    const dy = Math.round((rnd() - 0.5) * 28);
-    const dur = Math.round(34 + rnd() * 30);
-    const delay = -Math.round(rnd() * 40);
-    const op = Math.min(0.85, CLOUD_BASE_OPACITY[cls] * (0.75 + rnd() * 0.5));
-    puffs.push(`<span class="cloud-puff ${cls}" style="width:${w}px;height:${ht}px;` +
-      `margin-left:${dx}px;margin-top:${dy}px;opacity:${op.toFixed(2)};` +
-      `animation-duration:${dur}s;animation-delay:${delay}s"></span>`);
-  }
-  return puffs.join("");
-}
-
-async function fetchForecast() {
-  const res = await fetch429(FORECAST_URL);
-  if (!res.ok) throw new Error(`forecast HTTP ${res.status}`);
+async function fetchSatellite() {
+  const res = await fetch429(RV_META_URL);
+  if (!res.ok) throw new Error(`rainviewer HTTP ${res.status}`);
   const json = await res.json();
-  const locs = new Map(json.area_metadata.map((a) => [a.name, a.label_location]));
-  const seen = new Set();
-  for (const f of json.items[0].forecasts) {
-    const cls = cloudClass(f.forecast || "");
-    const loc = locs.get(f.area);
-    if (!cls || !loc) continue;
-    seen.add(f.area);
-    let m = cloudMarkers.get(f.area);
-    if (!m) {
-      m = L.marker([loc.latitude, loc.longitude],
-        { pane: "clouds", keyboard: false, interactive: false }).addTo(map);
-      cloudMarkers.set(f.area, m);
-    }
-    m.setIcon(L.divIcon({
-      className: "",
-      html: cloudIconHtml(f.area, cls),
-      iconSize: [0, 0],
-    }));
-  }
-  for (const [name, m] of cloudMarkers) {
-    if (!seen.has(name)) { m.remove(); cloudMarkers.delete(name); }
+  const frames = json.satellite?.infrared ?? [];
+  if (!frames.length) return;
+  const url = `${json.host}${frames[frames.length - 1].path}/256/{z}/{x}/{y}/0/0_0.png`;
+  if (!satLayer) {
+    satLayer = L.tileLayer(url, {
+      pane: "clouds",
+      opacity: 0.5,
+      maxZoom: 18,
+      attribution: '<a href="https://www.rainviewer.com/">RainViewer</a>',
+    }).addTo(map);
+  } else {
+    satLayer.setUrl(url);
   }
 }
 
-function pollForecast() {
-  fetchForecast().catch(() => {});
+function pollSatellite() {
+  fetchSatellite().catch(() => {});
 }
 
 // Bilinear sample over a WGRID-shaped array (row 0 = north); null on NaN.
@@ -1433,9 +1361,14 @@ function renderAll() {
   renderTimebar(t);
   renderWindStatus();
   renderWindPins();
-  // clouds describe the 2h forecast — only honest on the live view
-  const cloudPane = map && map.getPane && map.getPane("clouds");
-  if (cloudPane) cloudPane.style.display = displayedT === null ? "" : "none";
+  // satellite clouds and rain describe "now" — only honest on the live view
+  if (map && map.getPane) {
+    const show = displayedT === null ? "" : "none";
+    for (const pane of ["clouds", "rain"]) {
+      const el = map.getPane(pane);
+      if (el) el.style.display = show;
+    }
+  }
 }
 
 // Coalesce slider-drag renders to animation frames.
@@ -1623,27 +1556,6 @@ function startWind() {
       windCtx.lineWidth = 1.5;
       windCtx.stroke();
     }
-
-    // rain streaks: live view only, riding the same canvas and budget
-    if (displayedT === null && wetGauges.length) {
-      if (!rainDrops.length) for (let i = 0; i < RAIN_N; i++) rainDrops.push(spawnDrop({}));
-      windCtx.beginPath();
-      for (const d of rainDrops) {
-        if (!d.mm) { spawnDrop(d); continue; }
-        d.phase += dt * d.speed;
-        if (d.phase >= 1) { spawnDrop(d); continue; }
-        const pt = toPt([d.lat, d.lon]);
-        const drift = (windVecAt(d.lat, d.lon)?.u ?? 0) * 0.35; // lean with the wind
-        const x = pt.x + drift * d.phase;
-        const y = pt.y - 45 + d.phase * 90;
-        const len = 8 + Math.min(9, d.mm * 1.5); // heavier rain, longer streaks
-        windCtx.moveTo(x, y);
-        windCtx.lineTo(x + drift * 0.08, y + len);
-      }
-      windCtx.strokeStyle = "rgba(178, 212, 255, 0.45)";
-      windCtx.lineWidth = 1.2;
-      windCtx.stroke();
-    }
   }
   requestAnimationFrame(frame);
 }
@@ -1816,9 +1728,11 @@ function initMap() {
     maxBoundsViscosity: 1.0, // hard wall when panning
     zoomSnap: 0, // fractional zoom, so min zoom can match the bounds exactly
   });
-  const cloudPane = map.createPane("clouds");
+  const cloudPane = map.createPane("clouds"); // satellite tiles
   cloudPane.style.zIndex = 430; // above the shading (400), below markers (600)
   cloudPane.style.pointerEvents = "none";
+  const rainPane = map.createPane("rain"); // gauge glyphs + splash circles
+  rainPane.style.zIndex = 440;
   map.fitBounds(dataBounds);
   // Fully zoomed out = screen completely filled by the data window
   // (inside=true), so the map can never show past the data edge. Recompute
@@ -1872,13 +1786,13 @@ startWind();
 refresh().then(loadHistory).then(() => {
   pollCommunity();
   pollRain();
-  pollForecast();
+  pollSatellite();
   // wind archive matters only for scrubbing — let the visible stuff win
   setTimeout(() => loadWindHistory().catch(() => {}), 1500);
 });
 pollWind();
 setInterval(pollRain, RAIN_POLL_MS);
-setInterval(pollForecast, FORECAST_POLL_MS);
+setInterval(pollSatellite, SAT_POLL_MS);
 setInterval(pollWind, POLL_MS);
 refreshModel();
 setInterval(refresh, POLL_MS);
