@@ -385,23 +385,54 @@ function renderWindPins() {
 
 // Permanent union of anemometers: unlike the temperature feed (every station,
 // every minute), the wind feed publishes sparse snapshots — some stations
-// surface only occasionally. A station's last known reading persists until a
-// newer one replaces it, so the set only ever grows.
+// surface only occasionally and not at predictable minutes. A station's last
+// known reading persists until a newer one replaces it.
 const windSeen = new Map(); // id -> latest known vector
+let windDayTried = false;
+
+// Latest value per station across a whole day of snapshots (items are
+// chronological, so later readings overwrite earlier ones).
+function latestPerStation(items) {
+  const m = new Map();
+  for (const it of items ?? []) {
+    for (const r of it.readings ?? []) {
+      if (r.value != null) m.set(r.station_id, r.value);
+    }
+  }
+  return m;
+}
+
+// The day file catches every station that reported at all today — immune to
+// the "which minute did it report?" problem that spot-checks have.
+async function fetchWindDayFile(dayStr) {
+  const [spd, dir] = await Promise.all(
+    [`${WIND_SPEED_URL}?date=${dayStr}`, `${WIND_DIR_URL}?date=${dayStr}`].map(async (url) => {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`wind day HTTP ${res.status}`);
+      return res.json();
+    }));
+  const locs = new Map();
+  for (const s of [...spd.metadata.stations, ...dir.metadata.stations]) locs.set(s.id, s);
+  return { locs, speeds: latestPerStation(spd.items), dirs: latestPerStation(dir.items) };
+}
 
 async function fetchWind() {
-  const snaps = [await fetchWindAt()];
-  let out = joinWind(snaps);
-  // First fill digs up to an hour back to find the whole network; once the
-  // set is populated, routine polls just take the latest snapshot.
-  const deep = windSeen.size < 10;
-  for (let back = 10; deep && back <= 60 && out.length < 10; back += 10) {
-    try {
-      snaps.push(await fetchWindAt(new Date(Date.now() - back * 60_000)));
-      out = joinWind(snaps);
-    } catch { break; }
-  }
+  const out = joinWind([await fetchWindAt()]);
   for (const e of out) windSeen.set(e.id, e);
+  if (!windDayTried && windSeen.size < 8) {
+    windDayTried = true;
+    for (const day of [sgtDate(new Date()), sgtDate(new Date(Date.now() - 86_400_000))]) {
+      try {
+        const dayOut = joinWind([await fetchWindDayFile(day)]);
+        for (const e of dayOut) if (!windSeen.has(e.id)) windSeen.set(e.id, e);
+        console.info(`[sgtemp] wind day ${day}: ${dayOut.length} stations (known now ${windSeen.size})`);
+      } catch (e) {
+        console.info(`[sgtemp] wind day ${day} failed: ${e.message}`);
+      }
+      if (windSeen.size >= 8) break;
+    }
+  }
+  console.info(`[sgtemp] wind poll: ${out.length} in latest snapshot, ${windSeen.size} known total`);
   neaWind = windSeen.size ? [...windSeen.values()] : null;
   renderWindStatus();
   renderWindPins();
