@@ -1,42 +1,58 @@
 /* SG Temp — live Singapore air temperature from data.gov.sg (NEA).
    No backend: the browser talks to the public API directly. The v2 API is
-   primary; the v1 API is kept as a fallback since both are public and CORS-enabled. */
+   primary; the v1 API is kept as a fallback since both are public and
+   CORS-enabled. History is loaded in bulk (one request per calendar day
+   returns the whole day at per-minute resolution), which powers the time
+   scrubber and the interpolated shading overlay. */
 
 const V2_URL = "https://api-open.data.gov.sg/v2/real-time/api/air-temperature";
 const V1_URL = "https://api.data.gov.sg/v1/environment/air-temperature";
 const POLL_MS = 60_000;
 const HISTORY_HOURS = 24;
-const HISTORY_CONCURRENCY = 6;
+const SLIDER_STEP_MIN = 5; // scrubber granularity; underlying data is per-minute
 
-const stations = new Map(); // id -> {id, name, lat, lon, marker, listEl, history: [{t, v}], latest}
+// Geographic window and raster size for the shading overlay.
+const OVERLAY = { latMin: 1.16, latMax: 1.495, lonMin: 103.55, lonMax: 104.15, w: 240, h: 140 };
+const KM_PER_DEG = 111.32;
+
+const stations = new Map(); // id -> {id, name, lat, lon, marker, listEl, series: Map t->v, history: [{t,v}], latest}
+let timeline = [];    // sorted unique reading timestamps (ms) within the 24h window
+let sliderTicks = []; // timeline thinned to SLIDER_STEP_MIN buckets
+let displayedT = null; // null = live (latest reading)
 let selectedId = null;
-let lastUpdated = null;
-let map;
+let map, overlayLayer, overlayCanvas;
+let renderQueued = false;
 
 // ---------- API ----------
 
-// Returns SGT wall-clock "YYYY-MM-DDTHH:MM:SS" for a Date (API expects local SG time).
+// SGT wall-clock helpers (the API speaks local Singapore time).
 function sgtStamp(date) {
   return new Date(date.getTime() + 8 * 3600_000).toISOString().slice(0, 19);
 }
+function sgtDate(date) {
+  return sgtStamp(date).slice(0, 10);
+}
 
-// Normalizes either API version to {timestamp: Date, stations: [...], readings: Map id->value}.
+function normalizeStationsV2(list) {
+  return list.map((s) => {
+    const loc = s.location || s.labelLocation || {};
+    return { id: s.id, name: s.name, lat: loc.latitude, lon: loc.longitude };
+  });
+}
+
+// Latest reading (or the reading nearest a given moment), normalized across API versions.
 async function fetchReadings(atDate) {
   const errors = [];
   try {
     const url = atDate ? `${V2_URL}?date=${encodeURIComponent(sgtStamp(atDate))}` : V2_URL;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`v2 HTTP ${res.status}`);
-    const json = await res.json();
-    const d = json.data;
+    const d = (await res.json()).data;
     const reading = d.readings[d.readings.length - 1];
     return {
-      timestamp: new Date(reading.timestamp),
-      stations: d.stations.map((s) => {
-        const loc = s.location || s.labelLocation || {};
-        return { id: s.id, name: s.name, lat: loc.latitude, lon: loc.longitude };
-      }),
-      readings: new Map(reading.data.map((r) => [r.stationId, r.value])),
+      stations: normalizeStationsV2(d.stations),
+      items: [{ timestamp: reading.timestamp,
+                readings: reading.data.map((r) => [r.stationId, r.value]) }],
     };
   } catch (e) {
     errors.push(e);
@@ -48,11 +64,11 @@ async function fetchReadings(atDate) {
     const json = await res.json();
     const item = json.items[json.items.length - 1];
     return {
-      timestamp: new Date(item.timestamp),
       stations: json.metadata.stations.map((s) => ({
         id: s.id, name: s.name, lat: s.location.latitude, lon: s.location.longitude,
       })),
-      readings: new Map(item.readings.map((r) => [r.station_id, r.value])),
+      items: [{ timestamp: item.timestamp,
+                readings: item.readings.map((r) => [r.station_id, r.value]) }],
     };
   } catch (e) {
     errors.push(e);
@@ -60,24 +76,69 @@ async function fetchReadings(atDate) {
   }
 }
 
-// ---------- temperature colour scale (25°C cool blue -> 36°C hot red) ----------
+// A whole calendar day of per-minute readings in one go.
+async function fetchDay(dateStr) {
+  try {
+    const res = await fetch(`${V1_URL}?date=${dateStr}`);
+    if (!res.ok) throw new Error(`v1 HTTP ${res.status}`);
+    const json = await res.json();
+    return {
+      stations: json.metadata.stations.map((s) => ({
+        id: s.id, name: s.name, lat: s.location.latitude, lon: s.location.longitude,
+      })),
+      items: json.items.map((it) => ({
+        timestamp: it.timestamp,
+        readings: it.readings.map((r) => [r.station_id, r.value]),
+      })),
+    };
+  } catch { /* fall through to paginated v2 */ }
+
+  let token = null, stationsOut = [], items = [];
+  do {
+    const url = `${V2_URL}?date=${dateStr}` + (token ? `&paginationToken=${encodeURIComponent(token)}` : "");
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`v2 HTTP ${res.status}`);
+    const d = (await res.json()).data;
+    stationsOut = normalizeStationsV2(d.stations);
+    for (const reading of d.readings) {
+      items.push({ timestamp: reading.timestamp,
+                   readings: reading.data.map((r) => [r.stationId, r.value]) });
+    }
+    token = d.paginationToken;
+  } while (token);
+  return { stations: stationsOut, items };
+}
+
+// ---------- temperature colour scale (light blue = cool -> orange = hot) ----------
+
+const SCALE = [
+  [25, [124, 199, 255]],
+  [30, [255, 224, 138]],
+  [35, [255, 122, 26]],
+];
+
+function tempRGB(v) {
+  if (v <= SCALE[0][0]) return SCALE[0][1];
+  for (let i = 1; i < SCALE.length; i++) {
+    if (v <= SCALE[i][0]) {
+      const [t0, c0] = SCALE[i - 1], [t1, c1] = SCALE[i];
+      const f = (v - t0) / (t1 - t0);
+      return c0.map((c, k) => Math.round(c + (c1[k] - c) * f));
+    }
+  }
+  return SCALE[SCALE.length - 1][1];
+}
 
 function tempColor(v) {
-  const t = Math.min(1, Math.max(0, (v - 25) / 11));
-  const hue = 210 - 210 * t;
-  return `hsl(${hue}, 85%, ${62 - 12 * t}%)`;
+  return `rgb(${tempRGB(v).join(",")})`;
 }
 
-// ---------- rendering ----------
-
-function fmt(v) {
-  return v == null ? "–" : `${v.toFixed(1)}°`;
-}
+// ---------- data flow ----------
 
 function upsertStation(info) {
   let s = stations.get(info.id);
   if (!s) {
-    s = { ...info, history: [], latest: null, marker: null, listEl: null };
+    s = { ...info, series: new Map(), history: [], latest: null, marker: null, listEl: null };
     stations.set(info.id, s);
     if (Number.isFinite(s.lat) && Number.isFinite(s.lon)) {
       s.marker = L.marker([s.lat, s.lon], {
@@ -89,36 +150,108 @@ function upsertStation(info) {
   return s;
 }
 
-function renderMarker(s) {
-  if (!s.marker || s.latest == null) return;
+function ingest(result) {
+  for (const info of result.stations) upsertStation(info);
+  for (const item of result.items) {
+    const t = new Date(item.timestamp).getTime();
+    for (const [id, value] of item.readings) {
+      stations.get(id)?.series.set(t, value);
+    }
+  }
+}
+
+// Prune to the 24h window and rebuild the sorted views the renderers use.
+function rebuild(now = Date.now()) {
+  const cutoff = now - HISTORY_HOURS * 3600_000;
+  const times = new Set();
+  for (const s of stations.values()) {
+    for (const t of s.series.keys()) {
+      if (t < cutoff) s.series.delete(t);
+      else times.add(t);
+    }
+    s.history = [...s.series].map(([t, v]) => ({ t, v })).sort((a, b) => a.t - b.t);
+    s.latest = s.history.length ? s.history[s.history.length - 1].v : null;
+  }
+  timeline = [...times].sort((a, b) => a - b);
+
+  sliderTicks = [];
+  let lastBucket = -1;
+  for (const t of timeline) {
+    const b = Math.floor(t / (SLIDER_STEP_MIN * 60_000));
+    if (b !== lastBucket) { sliderTicks.push(t); lastBucket = b; }
+  }
+}
+
+// Largest reading at or before t (binary search), within a 30-minute tolerance.
+function valueAt(s, t) {
+  const h = s.history;
+  let lo = 0, hi = h.length - 1, best = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (h[mid].t <= t) { best = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  if (best < 0 || t - h[best].t > 30 * 60_000) return null;
+  return h[best].v;
+}
+
+function displayedTime() {
+  return displayedT ?? (timeline.length ? timeline[timeline.length - 1] : null);
+}
+
+function displayedValues(t) {
+  const out = new Map();
+  if (t == null) return out;
+  for (const s of stations.values()) {
+    const v = valueAt(s, t);
+    if (v != null) out.set(s.id, v);
+  }
+  return out;
+}
+
+// ---------- rendering ----------
+
+function fmt(v) {
+  return v == null ? "–" : `${v.toFixed(1)}°`;
+}
+
+function fmtTime(t) {
+  return new Date(t).toLocaleTimeString("en-SG",
+    { timeZone: "Asia/Singapore", weekday: "short", hour: "2-digit", minute: "2-digit" });
+}
+
+function renderMarker(s, v) {
+  if (!s.marker) return;
+  if (v == null) { s.marker.setIcon(L.divIcon({ className: "", html: "", iconSize: [0, 0] })); return; }
   const cls = s.id === selectedId ? "temp-pill selected" : "temp-pill";
   s.marker.setIcon(L.divIcon({
     className: "",
-    html: `<span class="${cls}" style="--pill:${tempColor(s.latest)}">${fmt(s.latest)}</span>`,
+    html: `<span class="${cls}" style="--pill:${tempColor(v)}">${fmt(v)}</span>`,
     iconSize: [0, 0],
   }));
   s.marker.bindTooltip(s.name);
 }
 
-function sparkPoints(history, w, h, pad = 2) {
+function sparkPoints(history, w, h, pad = 2, maxPts = 240) {
   if (history.length < 2) return null;
-  const vs = history.map((p) => p.v);
+  const stride = Math.max(1, Math.ceil(history.length / maxPts));
+  const pts = history.filter((_, i) => i % stride === 0 || i === history.length - 1);
+  const vs = pts.map((p) => p.v);
   const lo = Math.min(...vs), hi = Math.max(...vs);
   const span = hi - lo || 1;
-  const t0 = history[0].t, t1 = history[history.length - 1].t;
+  const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
   const tSpan = t1 - t0 || 1;
-  return history.map((p) => {
+  return pts.map((p) => {
     const x = pad + ((p.t - t0) / tSpan) * (w - 2 * pad);
     const y = h - pad - ((p.v - lo) / span) * (h - 2 * pad);
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   }).join(" ");
 }
 
-function renderList() {
+function renderList(values) {
   const ul = document.getElementById("station-list");
   const sorted = [...stations.values()]
-    .filter((s) => s.latest != null)
-    .sort((a, b) => b.latest - a.latest);
+    .filter((s) => values.has(s.id))
+    .sort((a, b) => values.get(b.id) - values.get(a.id));
   document.getElementById("station-count").textContent = `(${sorted.length})`;
 
   for (const s of sorted) {
@@ -130,40 +263,41 @@ function renderList() {
         <span class="station-temp"></span>`;
       s.listEl.addEventListener("click", () => selectStation(s.id));
     }
+    const v = values.get(s.id);
     s.listEl.querySelector(".station-name").textContent = s.name;
     const temp = s.listEl.querySelector(".station-temp");
-    temp.textContent = fmt(s.latest);
-    temp.style.color = tempColor(s.latest);
+    temp.textContent = fmt(v);
+    temp.style.color = tempColor(v);
     const line = s.listEl.querySelector("polyline");
-    const pts = sparkPoints(s.history, 70, 24);
+    const pts = sparkPoints(s.history, 70, 24, 2, 120);
     if (pts) {
       line.setAttribute("points", pts);
-      line.setAttribute("stroke", tempColor(s.latest));
+      line.setAttribute("stroke", tempColor(v));
     }
     s.listEl.classList.toggle("selected", s.id === selectedId);
     ul.appendChild(s.listEl); // re-appending keeps the list in sorted order
   }
 }
 
-function renderSummary() {
-  const vals = [...stations.values()].map((s) => s.latest).filter((v) => v != null);
-  const el = (id) => document.getElementById(id);
+function renderSummary(values) {
+  const vals = [...values.values()];
   if (!vals.length) return;
+  const el = (id) => document.getElementById(id);
   el("stat-min").textContent = fmt(Math.min(...vals));
   el("stat-max").textContent = fmt(Math.max(...vals));
   el("stat-mean").textContent = fmt(vals.reduce((a, b) => a + b, 0) / vals.length);
 }
 
-function renderDetail() {
+function renderDetail(values, t) {
   const panel = document.getElementById("detail");
   const s = stations.get(selectedId);
   if (!s) { panel.classList.add("hidden"); return; }
   panel.classList.remove("hidden");
   document.getElementById("detail-name").textContent = s.name;
-  document.getElementById("detail-temp").textContent = fmt(s.latest);
-  document.getElementById("detail-temp").style.color = tempColor(s.latest ?? 30);
-  document.getElementById("detail-when").textContent =
-    lastUpdated ? `as of ${lastUpdated.toLocaleTimeString("en-SG", { timeZone: "Asia/Singapore" })} SGT` : "";
+  const v = values.get(s.id);
+  document.getElementById("detail-temp").textContent = fmt(v);
+  document.getElementById("detail-temp").style.color = tempColor(v ?? 30);
+  document.getElementById("detail-when").textContent = t ? `at ${fmtTime(t)} SGT` : "";
 
   const svg = document.getElementById("detail-spark");
   svg.innerHTML = "";
@@ -171,33 +305,112 @@ function renderDetail() {
   if (pts) {
     const first = pts.split(" ")[0].split(",")[0];
     const last = pts.split(" ").at(-1).split(",")[0];
+    let cursor = "";
+    if (t && s.history.length > 1) {
+      const t0 = s.history[0].t, t1 = s.history[s.history.length - 1].t;
+      const x = 6 + (Math.min(1, Math.max(0, (t - t0) / (t1 - t0 || 1))) * 308);
+      cursor = `<line class="spark-cursor" x1="${x.toFixed(1)}" y1="0" x2="${x.toFixed(1)}" y2="80"/>`;
+    }
     svg.innerHTML =
       `<polygon class="spark-fill" points="${first},80 ${pts} ${last},80"/>` +
-      `<polyline points="${pts}"/>`;
+      `<polyline points="${pts}"/>` + cursor;
   }
   const vs = s.history.map((p) => p.v);
   document.getElementById("detail-low").textContent = vs.length ? fmt(Math.min(...vs)) : "–";
   document.getElementById("detail-high").textContent = vs.length ? fmt(Math.max(...vs)) : "–";
 }
 
-function selectStation(id) {
-  const prev = stations.get(selectedId);
-  selectedId = id === selectedId ? null : id;
-  if (prev) renderMarker(prev);
-  const s = stations.get(selectedId);
-  if (s) {
-    renderMarker(s);
-    if (s.marker) map.panTo([s.lat, s.lon]);
+/* Shading overlay: inverse-distance-weighted interpolation of station readings,
+   rasterized to a small canvas and stretched over the island as an image layer.
+   Alpha fades with distance to the nearest station so the open sea stays clear. */
+function renderOverlay(values) {
+  const pts = [...stations.values()]
+    .filter((s) => values.has(s.id) && Number.isFinite(s.lat) && Number.isFinite(s.lon))
+    .map((s) => ({ lat: s.lat, lon: s.lon, v: values.get(s.id) }));
+  if (pts.length < 3) return;
+
+  if (!overlayCanvas) {
+    overlayCanvas = document.createElement("canvas");
+    overlayCanvas.width = OVERLAY.w;
+    overlayCanvas.height = OVERLAY.h;
   }
-  renderDetail();
-  renderList();
+  if (typeof overlayCanvas.getContext !== "function") return;
+  const ctx = overlayCanvas.getContext("2d");
+  const img = ctx.createImageData(OVERLAY.w, OVERLAY.h);
+  const cosLat = Math.cos((1.35 * Math.PI) / 180);
+
+  for (let py = 0; py < OVERLAY.h; py++) {
+    const lat = OVERLAY.latMax - ((py + 0.5) / OVERLAY.h) * (OVERLAY.latMax - OVERLAY.latMin);
+    for (let px = 0; px < OVERLAY.w; px++) {
+      const lon = OVERLAY.lonMin + ((px + 0.5) / OVERLAY.w) * (OVERLAY.lonMax - OVERLAY.lonMin);
+      let wSum = 0, vSum = 0, nearest = Infinity;
+      for (const p of pts) {
+        const dx = (lon - p.lon) * cosLat * KM_PER_DEG;
+        const dy = (lat - p.lat) * KM_PER_DEG;
+        const d2 = dx * dx + dy * dy + 0.05;
+        const w = 1 / d2; // IDW, power 2
+        wSum += w;
+        vSum += w * p.v;
+        if (d2 < nearest) nearest = d2;
+      }
+      const distKm = Math.sqrt(nearest);
+      // full shade within 8 km of a station, gone past 18 km
+      const alpha = 0.55 * Math.min(1, Math.max(0, (18 - distKm) / 10));
+      if (alpha <= 0) continue;
+      const [r, g, b] = tempRGB(vSum / wSum);
+      const i = (py * OVERLAY.w + px) * 4;
+      img.data[i] = r; img.data[i + 1] = g; img.data[i + 2] = b;
+      img.data[i + 3] = Math.round(alpha * 255);
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const url = overlayCanvas.toDataURL();
+  if (!overlayLayer) {
+    overlayLayer = L.imageOverlay(url,
+      [[OVERLAY.latMin, OVERLAY.lonMin], [OVERLAY.latMax, OVERLAY.lonMax]],
+      { opacity: 1, interactive: false }).addTo(map);
+  } else {
+    overlayLayer.setUrl(url);
+  }
+}
+
+function renderTimebar(t) {
+  const slider = document.getElementById("time-slider");
+  const label = document.getElementById("time-label");
+  const liveBtn = document.getElementById("live-btn");
+  slider.max = Math.max(0, sliderTicks.length - 1);
+  if (displayedT === null) {
+    slider.value = slider.max;
+    label.textContent = t ? fmtTime(t) : "–";
+  } else {
+    label.textContent = t ? fmtTime(t) : "–";
+  }
+  liveBtn.classList.toggle("active", displayedT === null);
 }
 
 function renderAll() {
-  for (const s of stations.values()) renderMarker(s);
-  renderList();
-  renderSummary();
-  renderDetail();
+  const t = displayedTime();
+  const values = displayedValues(t);
+  for (const s of stations.values()) renderMarker(s, values.get(s.id));
+  renderList(values);
+  renderSummary(values);
+  renderDetail(values, t);
+  renderOverlay(values);
+  renderTimebar(t);
+}
+
+// Coalesce slider-drag renders to animation frames.
+function scheduleRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => { renderQueued = false; renderAll(); });
+}
+
+function selectStation(id) {
+  selectedId = id === selectedId ? null : id;
+  const s = stations.get(selectedId);
+  if (s && s.marker) map.panTo([s.lat, s.lon]);
+  renderAll();
 }
 
 function setStatus(text) {
@@ -211,64 +424,37 @@ function showError(msg) {
   b.classList.remove("hidden");
 }
 
-// ---------- data flow ----------
-
-function ingest(result) {
-  for (const info of result.stations) upsertStation(info);
-  const t = result.timestamp.getTime();
-  for (const [id, value] of result.readings) {
-    const s = stations.get(id);
-    if (!s) continue;
-    if (!s.history.some((p) => p.t === t)) {
-      s.history.push({ t, v: value });
-      s.history.sort((a, b) => a.t - b.t);
-    }
-  }
-}
-
-function pruneAndSetLatest(now) {
-  const cutoff = now - HISTORY_HOURS * 3600_000;
-  for (const s of stations.values()) {
-    s.history = s.history.filter((p) => p.t >= cutoff);
-    s.latest = s.history.length ? s.history[s.history.length - 1].v : null;
-  }
-}
+// ---------- load & poll ----------
 
 async function refresh() {
   try {
-    const result = await fetchReadings();
-    ingest(result);
-    lastUpdated = result.timestamp;
-    pruneAndSetLatest(Date.now());
+    ingest(await fetchReadings());
+    rebuild();
     renderAll();
     showError(null);
-    setStatus(`updated ${result.timestamp.toLocaleTimeString("en-SG", { timeZone: "Asia/Singapore" })} SGT`);
+    const t = timeline[timeline.length - 1];
+    setStatus(t ? `updated ${fmtTime(t)} SGT` : "no data");
   } catch (e) {
     showError(`Could not reach data.gov.sg (${e.message}). Retrying in a minute…`);
     setStatus("retrying…");
   }
 }
 
-// Backfill the 24h window with one sample per hour (sparkline resolution).
+// Bulk-load the 24h window: yesterday + today, each one day-sized request.
 async function loadHistory() {
   const now = Date.now();
-  const targets = [];
-  for (let h = HISTORY_HOURS; h >= 1; h--) targets.push(new Date(now - h * 3600_000));
-
-  let done = 0;
-  const queue = [...targets];
-  const worker = async () => {
-    while (queue.length) {
-      const t = queue.shift();
-      try {
-        ingest(await fetchReadings(t));
-      } catch { /* a missing hour just leaves a gap in the sparkline */ }
-      setStatus(`loading history ${++done}/${targets.length}`);
-    }
-  };
-  await Promise.all(Array.from({ length: HISTORY_CONCURRENCY }, worker));
-  pruneAndSetLatest(now);
+  const days = [sgtDate(new Date(now - 24 * 3600_000)), sgtDate(new Date(now))];
+  let loaded = 0;
+  for (const day of days) {
+    setStatus(`loading history ${++loaded}/${days.length}…`);
+    try {
+      ingest(await fetchDay(day));
+    } catch { /* a missing day just shortens the scrubber range */ }
+  }
+  rebuild(now);
   renderAll();
+  const t = timeline[timeline.length - 1];
+  setStatus(t ? `updated ${fmtTime(t)} SGT` : "no data");
 }
 
 // ---------- init ----------
@@ -282,6 +468,17 @@ function initMap() {
 }
 
 document.getElementById("detail-close").addEventListener("click", () => selectStation(selectedId));
+
+document.getElementById("time-slider").addEventListener("input", (e) => {
+  const idx = Number(e.target.value);
+  displayedT = idx >= sliderTicks.length - 1 ? null : sliderTicks[idx];
+  scheduleRender();
+});
+
+document.getElementById("live-btn").addEventListener("click", () => {
+  displayedT = null;
+  renderAll();
+});
 
 initMap();
 refresh().then(loadHistory);
