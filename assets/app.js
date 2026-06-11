@@ -675,178 +675,55 @@ function renderRainStatus() {
   el.textContent = `${wetGauges.length} gauge${wetGauges.length > 1 ? "s" : ""} wet · up to ${max.toFixed(1)} mm`;
 }
 
-// ---------- satellite clouds (NASA GIBS / Himawari infrared) ----------
+// ---------- precipitation radar (RainViewer) ----------
 
-/* Real clouds: Himawari Band-13 infrared via NASA GIBS WMTS tiles — the
-   geostationary satellite over Singapore, imaged every 10 minutes with
-   ~20–40 min publishing lag. No metadata API needed: frame times are on a
-   fixed 10-minute raster, so we ask for "about 30 minutes ago" and step
-   back another 10 minutes whenever tiles 404. The clouds pane uses screen
-   blending, so the IR's bright cloud tops glow over the dark map while the
-   warm dark ground stays invisible. */
-const GIBS_LAYER = "Himawari_AHI_Band13_Clean_Infrared";
-const SAT_MATRICES = ["GoogleMapsCompatible_Level7", "GoogleMapsCompatible_Level8", "GoogleMapsCompatible_Level6"];
-let satLayer = null, satErrors = 0, satBackoff = 0, satMatrix = null;
+/* The organic green blobs on commercial weather maps are precipitation
+   radar, not satellite cloud photos: smoothed reflectivity composites
+   coloured by intensity. RainViewer's free API still serves the global
+   radar composite (only its satellite product was retired), so we draw the
+   latest frame with the classic NEXRAD palette, smoothed. */
+const RV_META_URL = "https://api.rainviewer.com/public/weather-maps.json";
+let satLayer = null, satLabel = "";
 
 function setSatStatus(text) {
   const el = document.getElementById("sat-status");
   if (el) el.textContent = text;
 }
 
-function satFrameIso(stepsBack) {
-  const t = new Date(Date.now() - (30 + stepsBack * 10) * 60_000);
-  t.setUTCMinutes(Math.floor(t.getUTCMinutes() / 10) * 10, 0, 0);
-  return t.toISOString().slice(0, 19) + "Z";
-}
-
-function satTileUrl(matrix, iso, z, y, x) {
-  return "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/" +
-    `${GIBS_LAYER}/default/${iso}/${matrix}/${z}/${y}/${x}.png`;
-}
-
-function probeImage(url) {
-  return new Promise((resolve) => {
-    const img = new Image();
-    img.onload = () => resolve(true);
-    img.onerror = () => resolve(false);
-    img.src = url;
-  });
-}
-
-// Self-discover the working tile format: probe candidate matrices against a
-// 2-hour-old frame (safely published) with bare Image() requests, then build
-// the layer with whichever answered. z6/y31/x50 covers Singapore.
-async function satInit() {
-  if (typeof Image === "undefined") return; // browser only
-  const iso = satFrameIso(9);
-  for (const m of SAT_MATRICES) {
-    setSatStatus(`probing ${m.replace("GoogleMapsCompatible_", "")}…`);
-    if (await probeImage(satTileUrl(m, iso, 6, 31, 50))) { satMatrix = m; break; }
-  }
-  if (!satMatrix) { setSatStatus("unavailable (all probes failed)"); return; }
-  fetchSatellite();
-  setInterval(pollSatellite, SAT_POLL_MS);
-}
-
-/* IR assigns a brightness to everything — and in this product warm ground
-   renders BRIGHT while cold cloud tops render DARK (field-verified: raw
-   tiles whitened the ground and left holes exactly where the clouds were).
-   Each tile is drawn to a canvas and reprocessed per-pixel: whiteness is
-   how much darker (colder) the pixel is than the ground level, which is
-   self-calibrated from the brightest tile median seen this frame, so the
-   layer adapts to day/night without hardcoded thresholds. */
-const SAT_REF_MARGIN = 12; // ignore this much noise below the ground level
-const SAT_SPAN = 110;      // brightness drop for a fully opaque cloud
-let satGroundRef = null;
-const satTiles = new Set(); // {ctx, raw, w, h} of current-frame tiles
-
-function satMedian(raw) {
-  const vals = [];
-  for (let i = 0; i < raw.data.length; i += 256) vals.push(raw.data[i]);
-  vals.sort((a, b) => a - b);
-  return vals[vals.length >> 1] ?? 0;
-}
-
-function satApply(rec) {
-  const ref = (satGroundRef ?? 200) - SAT_REF_MARGIN;
-  const out = rec.ctx.createImageData(rec.w, rec.h);
-  for (let i = 0; i < rec.raw.data.length; i += 4) {
-    const a = Math.min(1, Math.max(0, (ref - rec.raw.data[i]) / SAT_SPAN));
-    out.data[i] = out.data[i + 1] = out.data[i + 2] = 255;
-    out.data[i + 3] = Math.round(a * 225);
-  }
-  rec.ctx.putImageData(out, 0, 0);
-}
-
-function satTileFailed(src) {
-  if (satErrors === 0 && src) console.warn("[sgtemp] sat tile failed:", src);
-  satErrors++;
-  // the viewport only spans a couple of tiles at this zoom, so even two
-  // failures means the frame isn't there — step back 10 minutes
-  if (satErrors >= 2 && satBackoff < 9) {
-    satBackoff++;
-    setSatStatus(`seeking frame (-${30 + satBackoff * 10}min)…`);
-    fetchSatellite();
-  } else if (satBackoff >= 9) {
-    setSatStatus("tiles failing");
-  }
-}
-
-function makeCloudLayer(level) {
-  const CloudLayer = L.GridLayer.extend({
-    createTile(coords, done) {
-      const tile = document.createElement("canvas");
-      const size = this.getTileSize();
-      tile.width = size.x;
-      tile.height = size.y;
-      const img = new Image();
-      img.crossOrigin = "anonymous";
-      img.onload = () => {
-        const ctx = tile.getContext("2d", { willReadFrequently: true });
-        ctx.drawImage(img, 0, 0, tile.width, tile.height);
-        try {
-          const rec = {
-            ctx, w: tile.width, h: tile.height,
-            raw: ctx.getImageData(0, 0, tile.width, tile.height),
-          };
-          tile._satRec = rec;
-          satTiles.add(rec);
-          const med = satMedian(rec.raw);
-          if (satGroundRef == null || med > satGroundRef + 3) {
-            // a clearer (brighter) tile recalibrates the ground level
-            satGroundRef = Math.max(satGroundRef ?? 0, med);
-            for (const r of satTiles) satApply(r);
-          } else {
-            satApply(rec);
-          }
-        } catch { /* no CORS for pixels — leave the raw (hazy) tile */ }
-        done(null, tile);
-        setSatStatus(`live IR (${satFrameIso(satBackoff).slice(11, 16)}Z)`);
-      };
-      img.onerror = () => { done(null, tile); satTileFailed(img.src); };
-      img.src = satTileUrl(satMatrix, satFrameIso(satBackoff), coords.z, coords.y, coords.x);
-      return tile;
-    },
-  });
-  const layer = new CloudLayer({
-    pane: "clouds",
-    opacity: 0.85,
-    maxNativeZoom: level, // IR is coarse; Leaflet upscales beyond this
-    maxZoom: 18,
-    attribution: 'Clouds: <a href="https://earthdata.nasa.gov/gibs">NASA GIBS</a> / Himawari',
-  });
-  layer.on("tileunload", (e) => {
-    if (e.tile?._satRec) satTiles.delete(e.tile._satRec);
-  });
-  return layer;
-}
-
-function fetchSatellite() {
-  satErrors = 0;
+async function fetchSatellite() {
+  const res = await fetch429(RV_META_URL);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const json = await res.json();
+  const frames = json.radar?.past ?? [];
+  if (!frames.length) { setSatStatus("no radar frames"); return; }
+  const f = frames[frames.length - 1];
+  // colour scheme 6 = NEXRAD green/yellow/red; options 1_1 = smoothed
+  const url = `${json.host}${f.path}/256/{z}/{x}/{y}/6/1_1.png`;
+  satLabel = new Date((f.time ?? 0) * 1000).toLocaleTimeString("en-SG",
+    { timeZone: "Asia/Singapore", hour: "2-digit", minute: "2-digit" });
   if (!satLayer) {
-    const level = Number((satMatrix ?? "GoogleMapsCompatible_Level7").match(/\d+$/)[0]);
-    if (typeof L !== "undefined" && L.GridLayer && typeof Image !== "undefined") {
-      satLayer = makeCloudLayer(level);
-    } else {
-      // limited environment: plain tile layer, screen-blended to hide ground
-      const pane = map.getPane && map.getPane("clouds");
-      if (pane) pane.style.mixBlendMode = "screen";
-      satLayer = L.tileLayer(satTileUrl(satMatrix ?? SAT_MATRICES[0], satFrameIso(satBackoff), "{z}", "{y}", "{x}"), {
-        pane: "clouds", opacity: 0.5, maxNativeZoom: level, maxZoom: 18,
-      });
+    satLayer = L.tileLayer(url, {
+      pane: "clouds",
+      opacity: 0.7,
+      maxNativeZoom: 10,
+      maxZoom: 18,
+      attribution: 'Radar: <a href="https://www.rainviewer.com/">RainViewer</a>',
+    });
+    if (satLayer.on) {
+      satLayer.on("tileload", () => setSatStatus(`live radar (${satLabel})`));
+      satLayer.on("tileerror", () => setSatStatus("tiles failing"));
     }
     satLayer.addTo(map);
-    setSatStatus("loading tiles…");
-  } else if (satLayer.redraw) {
-    satTiles.clear(); // fresh frame, fresh calibration set
-    satLayer.redraw(); // re-requests tiles with the current frame time
+    setSatStatus("loading radar\u2026");
+  } else {
+    satLayer.setUrl(url);
   }
 }
 
 function pollSatellite() {
-  satBackoff = Math.max(0, satBackoff - 1); // drift back toward fresher frames
-  try { fetchSatellite(); } catch { setSatStatus("unavailable"); }
+  fetchSatellite().catch((e) => setSatStatus(`unreachable (${e.message})`));
 }
+
 
 // Bilinear sample over a WGRID-shaped array (row 0 = north); null on NaN.
 function gridSample2(arr, lat, lon) {
@@ -1660,7 +1537,7 @@ function renderAll() {
   renderWindStatus();
   renderWindPins();
   renderRain(); // rain follows the scrubber (24h series)
-  // satellite clouds describe "now" — only honest on the live view
+  // the radar layer describes "now" — only honest on the live view
   if (map && map.getPane) {
     const el = map.getPane("clouds");
     if (el) el.style.display = displayedT === null ? "" : "none";
@@ -2097,7 +1974,7 @@ startWind();
 refresh().then(loadHistory).then(() => {
   pollCommunity();
   pollRain();
-  satInit(); // probes the tile format, then starts its own refresh cycle
+  pollSatellite();
   // archives matter only for scrubbing/recency — let the visible stuff win
   setTimeout(() => loadWindHistory().catch(() => {}), 1500);
   if (!TEST_RAIN) {
@@ -2107,6 +1984,7 @@ refresh().then(loadHistory).then(() => {
 });
 pollWind();
 setInterval(pollRain, RAIN_POLL_MS);
+setInterval(pollSatellite, SAT_POLL_MS);
 setInterval(pollWind, POLL_MS);
 refreshModel();
 setInterval(refresh, POLL_MS);
