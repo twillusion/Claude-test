@@ -426,37 +426,61 @@ function buildWindGrid() {
   }
 }
 
-// ---------- rain (NEA rain gauges, live view only) ----------
+// ---------- rain (NEA rain gauges, 24h history, scrubbable) ----------
 
-/* 5-minute rainfall totals from ~60 gauges. A gauge is "wet" if it's raining
-   now OR rained in the last 30 minutes — a single 5-minute snapshot misses
-   showers that just ended, which reads as "the site says no rain but it
-   rained at my house". Each wet gauge gets a rain glyph and a translucent
-   circle estimating the splash zone (radius and colour grow with
-   intensity; recent-but-stopped rain shows faded). */
+/* 5-minute rainfall totals from ~60 gauges, kept as a 24-hour per-gauge
+   series (positive readings only — absence means dry). A gauge is "wet" at
+   a moment if it rained within the previous 30 minutes, so showers that
+   just ended still show (faded). The time scrubber replays the day's rain.
+   Each wet gauge gets a rain glyph and a translucent circle estimating the
+   splash zone (radius and colour grow with intensity). */
 const RAIN_RECENT_MS = 30 * 60_000;
-let rainReadings = []; // [{id, lat, lon, mm, recent}]
-let wetGauges = [];
-const rainHist = new Map(); // gauge id -> [{t, mm}] within the recent window
+let rainReadings = []; // latest poll: [{id, lat, lon, mm}]
+let wetGauges = [];    // wet list at "now"
+const rainSeries = new Map(); // gauge id -> [{t, mm>0}] sorted, ~25h window
+const rainLocs = new Map();   // gauge id -> {lat, lon}
 
-function pushRainHist(id, t, mm) {
-  const arr = rainHist.get(id) ?? [];
+function pushRainSeries(id, t, mm) {
+  if (!(mm > 0) || !Number.isFinite(t)) return;
+  const arr = rainSeries.get(id) ?? [];
   if (arr.some((p) => p.t === t)) return;
   arr.push({ t, mm });
   arr.sort((a, b) => a.t - b.t);
-  rainHist.set(id, arr);
+  rainSeries.set(id, arr);
+}
+
+function pruneRainSeries() {
+  const cutoff = Date.now() - (HISTORY_HOURS + 1) * 3600_000;
+  for (const [id, arr] of rainSeries) {
+    while (arr.length && arr[0].t < cutoff) arr.shift();
+    if (!arr.length) rainSeries.delete(id);
+  }
+}
+
+function rainSum(arr, from, to) {
+  let s = 0;
+  for (const p of arr) {
+    if (p.t > from && p.t <= to) s += p.mm;
+  }
+  return s;
+}
+
+// Gauges wet at a moment: rained in the 30 minutes before it.
+function wetList(t) {
+  const out = [];
+  for (const [id, arr] of rainSeries) {
+    const recent = rainSum(arr, t - RAIN_RECENT_MS, t);
+    if (recent <= 0.2) continue;
+    const loc = rainLocs.get(id);
+    if (!loc) continue;
+    out.push({ id, lat: loc.lat, lon: loc.lon, mm: rainSum(arr, t - 5.5 * 60_000, t), recent });
+  }
+  return out;
 }
 
 function recomputeWet() {
-  const cutoff = Date.now() - RAIN_RECENT_MS;
-  for (const [id, arr] of rainHist) {
-    while (arr.length && arr[0].t < cutoff) arr.shift();
-    if (!arr.length) rainHist.delete(id);
-  }
-  for (const g of rainReadings) {
-    g.recent = (rainHist.get(g.id) ?? []).reduce((s, p) => s + p.mm, 0);
-  }
-  wetGauges = rainReadings.filter((g) => g.mm > 0.05 || g.recent > 0.2);
+  pruneRainSeries();
+  wetGauges = wetList(Date.now());
 }
 
 async function fetchRainSnap(dt) {
@@ -465,8 +489,10 @@ async function fetchRainSnap(dt) {
   if (!res.ok) throw new Error(`rain HTTP ${res.status}`);
   const json = await res.json();
   const item = json.items?.[0] ?? { readings: [] };
+  for (const s of json.metadata?.stations ?? []) {
+    if (s.location) rainLocs.set(s.id, { lat: s.location.latitude, lon: s.location.longitude });
+  }
   return {
-    locs: new Map((json.metadata?.stations ?? []).map((s) => [s.id, s.location])),
     t: new Date(item.timestamp).getTime() || Date.now(),
     readings: item.readings ?? [],
   };
@@ -485,10 +511,10 @@ async function fetchRain() {
   const byId = new Map();
   for (const snap of snaps) {
     for (const r of snap.readings) {
-      const loc = snap.locs.get(r.station_id);
+      const loc = rainLocs.get(r.station_id);
       if (!loc || r.value == null || r.value < 0 || byId.has(r.station_id)) continue;
-      byId.set(r.station_id, { id: r.station_id, lat: loc.latitude, lon: loc.longitude, mm: r.value });
-      if (r.value > 0) pushRainHist(r.station_id, snap.t, r.value);
+      byId.set(r.station_id, { id: r.station_id, lat: loc.lat, lon: loc.lon, mm: r.value });
+      pushRainSeries(r.station_id, snap.t, r.value);
     }
   }
   rainReadings = [...byId.values()];
@@ -496,6 +522,35 @@ async function fetchRain() {
   console.info(`[sgtemp] rain: ${rainReadings.length} gauges reporting, ${wetGauges.length} wet`);
   renderRain();
   renderRainStatus();
+}
+
+// Full 24h rain history from the day files (today + yesterday), deferred —
+// it powers the time scrubber and settles "did it really not rain today?".
+let rainDayLoaded = false;
+
+async function loadRainHistory() {
+  if (rainDayLoaded) return;
+  rainDayLoaded = true;
+  for (const day of [sgtDate(new Date()), sgtDate(new Date(Date.now() - 86_400_000))]) {
+    try {
+      const res = await fetch429(`${RAIN_URL}?date=${day}`);
+      if (!res.ok) continue;
+      const json = await res.json();
+      for (const s of json.metadata?.stations ?? []) {
+        if (s.location) rainLocs.set(s.id, { lat: s.location.latitude, lon: s.location.longitude });
+      }
+      for (const item of json.items ?? []) {
+        const t = new Date(item.timestamp).getTime();
+        for (const r of item.readings ?? []) {
+          if (r.value > 0) pushRainSeries(r.station_id, t, r.value);
+        }
+      }
+    } catch { /* day files are best-effort */ }
+  }
+  recomputeWet();
+  renderRain();
+  renderRainStatus();
+  if (typeof localStorage !== "undefined") saveHistCache();
 }
 
 // Seed the 30-minute window so rain that fell before the page was opened
@@ -514,7 +569,7 @@ async function seedRainRecent() {
       const t = new Date(item.timestamp).getTime();
       if (!Number.isFinite(t)) continue;
       for (const r of item.readings ?? []) {
-        if (r.value > 0) pushRainHist(r.station_id, t, r.value);
+        if (r.value > 0) pushRainSeries(r.station_id, t, r.value);
       }
     } catch { /* seeding is best-effort */ }
   }
@@ -534,8 +589,10 @@ function rainColor(mm) {
 
 function renderRain() {
   if (typeof L === "undefined" || !map) return;
+  // live shows "now"; scrubbing replays the day's rain at the displayed time
+  const list = displayedT === null ? wetGauges : wetList(displayedTime() ?? Date.now());
   const seen = new Set();
-  for (const g of wetGauges) {
+  for (const g of list) {
     seen.add(g.id);
     const active = g.mm > 0.05; // raining now vs rained recently
     const intensity = Math.max(g.mm, (g.recent ?? 0) / 3);
@@ -580,12 +637,19 @@ function renderRain() {
 const TEST_RAIN = typeof location !== "undefined" && /testrain/.test(location.search);
 
 function injectTestRain() {
-  rainReadings = [
-    { id: "T1", lat: 1.34, lon: 103.78, mm: 6, recent: 12 },
-    { id: "T2", lat: 1.36, lon: 103.95, mm: 2.5, recent: 5 },
-    { id: "T3", lat: 1.29, lon: 103.85, mm: 0, recent: 9 }, // "rained recently" look
+  const now = Date.now();
+  const gauges = [
+    { id: "T1", lat: 1.34, lon: 103.78, mm: 6 },
+    { id: "T2", lat: 1.36, lon: 103.95, mm: 2.5 },
+    { id: "T3", lat: 1.29, lon: 103.85, mm: 0 }, // "rained 20 min ago" look
   ];
-  wetGauges = rainReadings.slice();
+  rainReadings = gauges;
+  for (const g of gauges) {
+    rainLocs.set(g.id, { lat: g.lat, lon: g.lon });
+    pushRainSeries(g.id, now, g.mm);
+    pushRainSeries(g.id, now - 20 * 60_000, 3);
+  }
+  recomputeWet();
   renderRain();
   const el = document.getElementById("rain-status");
   if (el) el.textContent = "TEST MODE — synthetic rain";
@@ -664,39 +728,86 @@ async function satInit() {
   setInterval(pollSatellite, SAT_POLL_MS);
 }
 
+/* IR assigns a brightness to everything — warm ground included — so drawing
+   the tiles raw envelops the whole map in haze. Each tile is therefore
+   drawn to a canvas and reprocessed per-pixel: brightness below CLOUD_FLOOR
+   (warm ground) becomes fully transparent, and the ramp up to CLOUD_CEIL
+   (cold cloud tops) fades in as soft white — clouds only, like the
+   commercial weather sites. */
+const CLOUD_FLOOR = 120;
+const CLOUD_CEIL = 215;
+
+function satTileFailed(src) {
+  if (satErrors === 0 && src) console.warn("[sgtemp] sat tile failed:", src);
+  satErrors++;
+  // the viewport only spans a couple of tiles at this zoom, so even two
+  // failures means the frame isn't there — step back 10 minutes
+  if (satErrors >= 2 && satBackoff < 9) {
+    satBackoff++;
+    setSatStatus(`seeking frame (-${30 + satBackoff * 10}min)…`);
+    fetchSatellite();
+  } else if (satBackoff >= 9) {
+    setSatStatus("tiles failing");
+  }
+}
+
+function makeCloudLayer(level) {
+  const CloudLayer = L.GridLayer.extend({
+    createTile(coords, done) {
+      const tile = document.createElement("canvas");
+      const size = this.getTileSize();
+      tile.width = size.x;
+      tile.height = size.y;
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = () => {
+        const ctx = tile.getContext("2d", { willReadFrequently: true });
+        ctx.drawImage(img, 0, 0, tile.width, tile.height);
+        try {
+          const d = ctx.getImageData(0, 0, tile.width, tile.height);
+          const px = d.data;
+          for (let i = 0; i < px.length; i += 4) {
+            const a = Math.min(1, Math.max(0, (px[i] - CLOUD_FLOOR) / (CLOUD_CEIL - CLOUD_FLOOR)));
+            px[i] = px[i + 1] = px[i + 2] = 255;
+            px[i + 3] = Math.round(a * 215);
+          }
+          ctx.putImageData(d, 0, 0);
+        } catch { /* no CORS for pixels — leave the raw (hazy) tile */ }
+        done(null, tile);
+        setSatStatus(`live IR (${satFrameIso(satBackoff).slice(11, 16)}Z)`);
+      };
+      img.onerror = () => { done(null, tile); satTileFailed(img.src); };
+      img.src = satTileUrl(satMatrix, satFrameIso(satBackoff), coords.z, coords.y, coords.x);
+      return tile;
+    },
+  });
+  return new CloudLayer({
+    pane: "clouds",
+    opacity: 0.85,
+    maxNativeZoom: level, // IR is coarse; Leaflet upscales beyond this
+    maxZoom: 18,
+    attribution: 'Clouds: <a href="https://earthdata.nasa.gov/gibs">NASA GIBS</a> / Himawari',
+  });
+}
+
 function fetchSatellite() {
-  const iso = satFrameIso(satBackoff);
-  const level = Number((satMatrix ?? "GoogleMapsCompatible_Level7").match(/\d+$/)[0]);
-  const url = satTileUrl(satMatrix ?? SAT_MATRICES[0], iso, "{z}", "{y}", "{x}");
   satErrors = 0;
   if (!satLayer) {
-    satLayer = L.tileLayer(url, {
-      pane: "clouds",
-      opacity: 0.6,
-      maxNativeZoom: level, // IR is coarse; Leaflet upscales beyond this
-      maxZoom: 18,
-      attribution: 'Clouds: <a href="https://earthdata.nasa.gov/gibs">NASA GIBS</a> / Himawari',
-    });
-    if (satLayer.on) {
-      satLayer.on("tileload", () => setSatStatus(`live IR (${satFrameIso(satBackoff).slice(11, 16)}Z)`));
-      satLayer.on("tileerror", (e) => {
-        if (satErrors === 0 && e?.tile?.src) console.warn("[sgtemp] sat tile failed:", e.tile.src);
-        satErrors++;
-        // the viewport only spans a couple of tiles at this zoom, so even
-        // two failures means the frame isn't there — step back 10 minutes
-        if (satErrors >= 2 && satBackoff < 9) {
-          satBackoff++;
-          setSatStatus(`seeking frame (-${30 + satBackoff * 10}min)…`);
-          fetchSatellite();
-        } else if (satBackoff >= 9) {
-          setSatStatus("tiles failing");
-        }
+    const level = Number((satMatrix ?? "GoogleMapsCompatible_Level7").match(/\d+$/)[0]);
+    if (typeof L !== "undefined" && L.GridLayer && typeof Image !== "undefined") {
+      satLayer = makeCloudLayer(level);
+    } else {
+      // limited environment: plain tile layer, screen-blended to hide ground
+      const pane = map.getPane && map.getPane("clouds");
+      if (pane) pane.style.mixBlendMode = "screen";
+      satLayer = L.tileLayer(satTileUrl(satMatrix ?? SAT_MATRICES[0], satFrameIso(satBackoff), "{z}", "{y}", "{x}"), {
+        pane: "clouds", opacity: 0.5, maxNativeZoom: level, maxZoom: 18,
       });
     }
     satLayer.addTo(map);
     setSatStatus("loading tiles…");
-  } else {
-    satLayer.setUrl(url);
+  } else if (satLayer.redraw) {
+    satLayer.redraw(); // re-requests tiles with the current frame time
   }
 }
 
@@ -1516,13 +1627,11 @@ function renderAll() {
   renderTimebar(t);
   renderWindStatus();
   renderWindPins();
-  // satellite clouds and rain describe "now" — only honest on the live view
+  renderRain(); // rain follows the scrubber (24h series)
+  // satellite clouds describe "now" — only honest on the live view
   if (map && map.getPane) {
-    const show = displayedT === null ? "" : "none";
-    for (const pane of ["clouds", "rain"]) {
-      const el = map.getPane(pane);
-      if (el) el.style.display = show;
-    }
+    const el = map.getPane("clouds");
+    if (el) el.style.display = displayedT === null ? "" : "none";
   }
 }
 
@@ -1768,7 +1877,7 @@ async function refresh() {
 // extracted per-station series are a few hundred KB — small enough for
 // localStorage. A reload within the freshness window restores instantly and
 // skips every archive download (live polls fill forward from there).
-const HIST_CACHE_KEY = "sgtemp-hist-v1";
+const HIST_CACHE_KEY = "sgtemp-hist-v2";
 const HIST_CACHE_MS = 15 * 60_000;
 let lastHistSave = 0;
 
@@ -1785,6 +1894,11 @@ function saveHistCache() {
         id: w.id, name: w.name, lat: w.lat, lon: w.lon,
         series: w.series.map((p) => [p.t, p.u, p.v]),
       })),
+      rain: [...rainSeries].map(([id, arr]) => {
+        const loc = rainLocs.get(id);
+        return { id, lat: loc?.lat, lon: loc?.lon, series: arr.map((p) => [p.t, p.mm]) };
+      }),
+      rainDone: rainDayLoaded,
     }));
   } catch { /* quota or unavailable — caching is best-effort */ }
 }
@@ -1810,6 +1924,11 @@ function loadHistCache() {
     // marking the archive "done" then locks in the degraded set (particles
     // swarm the one covered circle).
     if ((c.wind?.length ?? 0) >= 8) windDayLoaded = true;
+    for (const rc of c.rain ?? []) {
+      if (Number.isFinite(rc.lat)) rainLocs.set(rc.id, { lat: rc.lat, lon: rc.lon });
+      for (const [t, mm] of rc.series ?? []) pushRainSeries(rc.id, t, mm);
+    }
+    if (c.rainDone) rainDayLoaded = true;
     return (c.stations ?? []).length > 0;
   } catch {
     return false;
@@ -1891,7 +2010,6 @@ function initMap() {
   const cloudPane = map.createPane("clouds"); // satellite tiles
   cloudPane.style.zIndex = 430; // above the shading (400), below markers (600)
   cloudPane.style.pointerEvents = "none";
-  cloudPane.style.mixBlendMode = "screen"; // bright IR clouds glow; dark ground vanishes
   const rainPane = map.createPane("rain"); // gauge glyphs + splash circles
   rainPane.style.zIndex = 440;
   map.fitBounds(dataBounds);
@@ -1950,7 +2068,10 @@ refresh().then(loadHistory).then(() => {
   satInit(); // probes the tile format, then starts its own refresh cycle
   // archives matter only for scrubbing/recency — let the visible stuff win
   setTimeout(() => loadWindHistory().catch(() => {}), 1500);
-  if (!TEST_RAIN) setTimeout(() => seedRainRecent().catch(() => {}), 3000);
+  if (!TEST_RAIN) {
+    setTimeout(() => seedRainRecent().catch(() => {}), 3000);
+    setTimeout(() => loadRainHistory().catch(() => {}), 6000);
+  }
 });
 pollWind();
 setInterval(pollRain, RAIN_POLL_MS);
