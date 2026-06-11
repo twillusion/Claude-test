@@ -19,7 +19,7 @@ const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
 const HISTORY_HOURS = 24;
 // Shown in the footer; bump together with the ?v= stamps in index.html so a
 // glance settles "am I looking at the new build or a stale cache?"
-const APP_VERSION = "20260611u";
+const APP_VERSION = "20260611v";
 
 const SLIDER_STEP_MIN = 5; // scrubber granularity; underlying data is per-minute
 
@@ -1632,9 +1632,11 @@ function renderTimebar(t) {
   const future = isFutureView();
   label.textContent = t ? (future ? `≈ ${fmtTime(t)}` : fmtTime(t)) : "–";
   if (label.classList) label.classList.toggle("future", future);
-  if (slider.classList) {
-    // centre notch marks LIVE once the forecast half exists
-    slider.classList.toggle("has-forecast", sliderTicks.length - 1 > sliderLiveIdx);
+  // centre line marks LIVE once the forecast half exists (on the wrapper —
+  // native range tracks paint over the input's own background)
+  const wrap = slider.parentElement;
+  if (wrap && wrap.classList) {
+    wrap.classList.toggle("has-forecast", sliderTicks.length - 1 > sliderLiveIdx);
   }
   const f = dayFactor(t ?? Date.now());
   document.getElementById("sky-icon").textContent = f > 0.8 ? "☀️" : f < 0.2 ? "🌙" : "🌅";

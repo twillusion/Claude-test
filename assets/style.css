@@ -168,7 +168,8 @@ body { display: flex; flex-direction: column; }
 }
 
 
-#time-slider { flex: 1; accent-color: var(--accent); min-width: 0; }
+.slider-wrap { flex: 1; min-width: 0; position: relative; display: flex; align-items: center; }
+#time-slider { flex: 1; accent-color: var(--accent); min-width: 0; width: 100%; }
 
 #time-label {
   font-size: 0.72rem;
@@ -291,13 +292,19 @@ body { display: flex; flex-direction: column; }
 .temp-pill.fc { border-style: dashed; opacity: 0.92; } /* forecast, not observation */
 #time-label.future { color: var(--accent); }
 
-/* with a forecast half, LIVE sits at the centre — a dotted line marks it */
-#time-slider.has-forecast {
-  background-image: repeating-linear-gradient(180deg,
-    #7fe6a0 0 2px, transparent 2px 5px);
-  background-repeat: no-repeat;
-  background-position: center;
-  background-size: 2px 100%;
+/* with a forecast half, LIVE sits at the centre — a dotted line marks it.
+   Drawn on the wrapper, not the input: native range tracks paint over the
+   input's own background, which swallowed the previous attempt. */
+.slider-wrap.has-forecast::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: -3px;
+  bottom: -3px;
+  width: 0;
+  border-left: 2px dotted #7fe6a0;
+  transform: translateX(-1px);
+  pointer-events: none;
 }
 
 /* civilian sensors: small pin with a modest temperature chip above it */
