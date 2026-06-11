@@ -386,6 +386,59 @@ function updateWindField() {
     windVectors.push(vec);
     windVectorsById.set(st.id, vec);
   }
+  buildWindGrid();
+}
+
+/* The displayed-time wind field rasterized onto a coarse grid: built once
+   per field change (a few hundred cells × a dozen stations), so the
+   per-frame particle work drops from one IDW pass per particle per tick to
+   a cheap bilinear lookup. NaN cells mark "no data within coverage". */
+const WGRID = { nx: 24, ny: 16 };
+let windGridU = null, windGridV = null;
+
+function buildWindGrid() {
+  if (windVectors.length < 2) { windGridU = null; windGridV = null; return; }
+  const { nx, ny } = WGRID;
+  windGridU = new Float32Array(nx * ny);
+  windGridV = new Float32Array(nx * ny);
+  const cosLat = Math.cos((1.35 * Math.PI) / 180);
+  const cover2 = WIND_COVER_KM * WIND_COVER_KM;
+  for (let iy = 0; iy < ny; iy++) {
+    const lat = OVERLAY.latMax - ((iy + 0.5) / ny) * (OVERLAY.latMax - OVERLAY.latMin);
+    for (let ix = 0; ix < nx; ix++) {
+      const lon = OVERLAY.lonMin + ((ix + 0.5) / nx) * (OVERLAY.lonMax - OVERLAY.lonMin);
+      let wSum = 0, u = 0, v = 0, nearest = Infinity;
+      for (const p of windVectors) {
+        const dx = (lon - p.lon) * cosLat * KM_PER_DEG;
+        const dy = (lat - p.lat) * KM_PER_DEG;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < nearest) nearest = d2;
+        const w = 1 / (d2 + 0.5);
+        wSum += w; u += w * p.u; v += w * p.v;
+      }
+      const i = iy * nx + ix;
+      if (nearest > cover2) { windGridU[i] = NaN; windGridV[i] = NaN; }
+      else { windGridU[i] = u / wSum; windGridV[i] = v / wSum; }
+    }
+  }
+}
+
+// Bilinear sample over a WGRID-shaped array (row 0 = north); null on NaN.
+function gridSample2(arr, lat, lon) {
+  const { nx, ny } = WGRID;
+  let fy = ((OVERLAY.latMax - lat) / (OVERLAY.latMax - OVERLAY.latMin)) * ny - 0.5;
+  let fx = ((lon - OVERLAY.lonMin) / (OVERLAY.lonMax - OVERLAY.lonMin)) * nx - 0.5;
+  fy = Math.min(ny - 1, Math.max(0, fy));
+  fx = Math.min(nx - 1, Math.max(0, fx));
+  const cy = Math.min(ny - 2, Math.floor(fy));
+  const cx = Math.min(nx - 2, Math.floor(fx));
+  const ty = fy - cy, tx = fx - cx;
+  const v00 = arr[cy * nx + cx], v01 = arr[cy * nx + cx + 1];
+  const v10 = arr[(cy + 1) * nx + cx], v11 = arr[(cy + 1) * nx + cx + 1];
+  if (Number.isNaN(v00) || Number.isNaN(v01) || Number.isNaN(v10) || Number.isNaN(v11)) return null;
+  const top = v00 + (v01 - v00) * tx;
+  const bot = v10 + (v11 - v10) * tx;
+  return top + (bot - top) * ty;
 }
 
 function ensureWindField() {
@@ -554,21 +607,13 @@ function pollWind() {
   fetchWind().catch(() => renderWindStatus());
 }
 
-function idwWind(lat, lon) {
-  const cosLat = Math.cos((1.35 * Math.PI) / 180);
-  let wSum = 0, uSum = 0, vSum = 0;
-  for (const p of windVectors) {
-    const dx = (lon - p.lon) * cosLat * KM_PER_DEG;
-    const dy = (lat - p.lat) * KM_PER_DEG;
-    const w = 1 / (dx * dx + dy * dy + 0.5);
-    wSum += w; uSum += w * p.u; vSum += w * p.v;
-  }
-  return { u: uSum / wSum, v: vSum / wSum };
-}
-
 function windVecAt(lat, lon) {
   ensureWindField();
-  if (windVectors.length >= 2) return idwWind(lat, lon); // observed at displayed time
+  if (windGridU) { // observed at displayed time, precomputed grid
+    const u = gridSample2(windGridU, lat, lon);
+    const v = gridSample2(windGridV, lat, lon);
+    return u == null || v == null ? null : { u, v };
+  }
   if (!windU) return null; // fall back to the model field if we have one
   const u = gridSample(windU, lat, lon);
   const v = gridSample(windV, lat, lon);
@@ -1226,6 +1271,7 @@ let windParts = [];
 // Particles only where there's actual wind data nearby — the IDW field happily
 // extrapolates over Malaysia, but that's invention, not data.
 function windCovered(lat, lon) {
+  if (windGridU) return gridSample2(windGridU, lat, lon) != null;
   const pts = windStations.size
     ? [...windStations.values()]
     : [...stations.values()].filter((s) => s.kind === "nea" && Number.isFinite(s.lat));
