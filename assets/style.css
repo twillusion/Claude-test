@@ -125,11 +125,6 @@ body { display: flex; flex-direction: column; }
   50% { opacity: 0.25; }
 }
 
-@keyframes pill-pulse {
-  0%, 100% { box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5); }
-  50% { box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5), 0 0 10px 2px var(--pill); }
-}
-
 /* wind streaklines: above tiles and shading (z 200/400), below markers (600) */
 #wind {
   position: absolute;
@@ -233,7 +228,6 @@ body { display: flex; flex-direction: column; }
   transform: translate(-50%, -50%);
 }
 .temp-pill.selected { outline: 2px solid #fff; }
-.temp-pill.live { animation: pill-pulse 3.5s ease-in-out infinite; }
 
 /* civilian sensors: small pin with a modest temperature chip above it */
 .civ-marker {

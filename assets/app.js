@@ -385,7 +385,8 @@ function renderWindStatus() {
   u /= n; v /= n;
   const speed = Math.hypot(u, v);
   const from = (Math.atan2(-u, -v) * 180 / Math.PI + 360) % 360;
-  el.textContent = `${speed.toFixed(0)} km/h from ${COMPASS[Math.round(from / 22.5) % 16]}`;
+  const src = displayedT === null && neaWind ? ` (${neaWind.length} stations)` : " (model)";
+  el.textContent = `${speed.toFixed(0)} km/h from ${COMPASS[Math.round(from / 22.5) % 16]}${src}`;
 }
 
 // Bilinear sample of a blended grid at a coordinate.
@@ -642,9 +643,7 @@ function renderMarker(s, v) {
       `<span class="civ-temp">${fmt(v)}</span>` +
       `<span class="civ-dot" style="--pill:${tempColor(v)}"></span></span>`;
   } else {
-    let cls = "temp-pill";
-    if (s.id === selectedId) cls += " selected";
-    if (displayedT === null) cls += " live"; // gentle pulse on current readings
+    const cls = s.id === selectedId ? "temp-pill selected" : "temp-pill";
     key = cls;
     html = `<span class="${cls}" style="--pill:${tempColor(v)}">${fmt(v)}</span>`;
   }
@@ -767,7 +766,7 @@ function renderDetail(values, t) {
    Opacity scales with distance from the middle of the colour scale: average
    areas are transparent (map stays readable), only genuine hot and cold
    anomalies get painted. */
-const OVERLAY_MAX_ALPHA = 0.55;
+const OVERLAY_MAX_ALPHA = 0.48;
 
 // Steep curve: fully transparent only in a thin band at the scale midpoint
 // (a wide band produced visible "transparency stripes" along the contour
@@ -922,11 +921,14 @@ function selectStation(id) {
 // the map. Particles live in geographic space and are re-projected every
 // frame, so panning and zooming stay correct; trails fade via destination-out.
 // ~170 particles is far cheaper than one overlay rasterization per frame.
-const WIND_N = 150;
-// visual exaggeration: °lat per second per km/h. Too low and per-frame
-// segments go sub-pixel — the fade erases them before they read as streaks.
-const WIND_DEG_PER_S = 0.004;
-const WIND_LOOKAHEAD_S = 0.12; // segment length: a beat ahead of the particle
+// Star-trail look: many slow particles whose trails persist for seconds
+// before fading, so the wind reads as long delicate streaks rather than
+// darting sparks.
+const WIND_N = 240;
+const WIND_DEG_PER_S = 0.0015; // visual exaggeration: °lat per second per km/h
+const WIND_LOOKAHEAD_S = 0.05; // small lead keeps slow segments above sub-pixel
+const WIND_FADE = 0.009; // per-frame trail fade (lower = longer trails)
+const WIND_AGE_S = [12, 30]; // particle lifetime range
 
 function startWind() {
   if (typeof window === "undefined") return;
@@ -947,7 +949,7 @@ function startWind() {
   const spawn = (p = {}) => {
     p.lat = OVERLAY.latMin + Math.random() * (OVERLAY.latMax - OVERLAY.latMin);
     p.lon = OVERLAY.lonMin + Math.random() * (OVERLAY.lonMax - OVERLAY.lonMin);
-    p.age = 3 + Math.random() * 6;
+    p.age = WIND_AGE_S[0] + Math.random() * (WIND_AGE_S[1] - WIND_AGE_S[0]);
     return p;
   };
   const parts = Array.from({ length: WIND_N }, () => spawn());
@@ -960,11 +962,11 @@ function startWind() {
     last = ts;
 
     ctx.globalCompositeOperation = "destination-out";
-    ctx.fillStyle = "rgba(0,0,0,0.04)";
+    ctx.fillStyle = `rgba(0,0,0,${WIND_FADE})`;
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.globalCompositeOperation = "source-over";
-    ctx.strokeStyle = "rgba(220, 237, 255, 0.7)";
-    ctx.lineWidth = 2;
+    ctx.strokeStyle = "rgba(220, 237, 255, 0.32)";
+    ctx.lineWidth = 1.2;
     ctx.lineCap = "round";
     ctx.beginPath();
     for (const p of parts) {
