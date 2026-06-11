@@ -728,14 +728,35 @@ async function satInit() {
   setInterval(pollSatellite, SAT_POLL_MS);
 }
 
-/* IR assigns a brightness to everything — warm ground included — so drawing
-   the tiles raw envelops the whole map in haze. Each tile is therefore
-   drawn to a canvas and reprocessed per-pixel: brightness below CLOUD_FLOOR
-   (warm ground) becomes fully transparent, and the ramp up to CLOUD_CEIL
-   (cold cloud tops) fades in as soft white — clouds only, like the
-   commercial weather sites. */
-const CLOUD_FLOOR = 120;
-const CLOUD_CEIL = 215;
+/* IR assigns a brightness to everything — and in this product warm ground
+   renders BRIGHT while cold cloud tops render DARK (field-verified: raw
+   tiles whitened the ground and left holes exactly where the clouds were).
+   Each tile is drawn to a canvas and reprocessed per-pixel: whiteness is
+   how much darker (colder) the pixel is than the ground level, which is
+   self-calibrated from the brightest tile median seen this frame, so the
+   layer adapts to day/night without hardcoded thresholds. */
+const SAT_REF_MARGIN = 12; // ignore this much noise below the ground level
+const SAT_SPAN = 110;      // brightness drop for a fully opaque cloud
+let satGroundRef = null;
+const satTiles = new Set(); // {ctx, raw, w, h} of current-frame tiles
+
+function satMedian(raw) {
+  const vals = [];
+  for (let i = 0; i < raw.data.length; i += 256) vals.push(raw.data[i]);
+  vals.sort((a, b) => a - b);
+  return vals[vals.length >> 1] ?? 0;
+}
+
+function satApply(rec) {
+  const ref = (satGroundRef ?? 200) - SAT_REF_MARGIN;
+  const out = rec.ctx.createImageData(rec.w, rec.h);
+  for (let i = 0; i < rec.raw.data.length; i += 4) {
+    const a = Math.min(1, Math.max(0, (ref - rec.raw.data[i]) / SAT_SPAN));
+    out.data[i] = out.data[i + 1] = out.data[i + 2] = 255;
+    out.data[i + 3] = Math.round(a * 225);
+  }
+  rec.ctx.putImageData(out, 0, 0);
+}
 
 function satTileFailed(src) {
   if (satErrors === 0 && src) console.warn("[sgtemp] sat tile failed:", src);
@@ -764,14 +785,20 @@ function makeCloudLayer(level) {
         const ctx = tile.getContext("2d", { willReadFrequently: true });
         ctx.drawImage(img, 0, 0, tile.width, tile.height);
         try {
-          const d = ctx.getImageData(0, 0, tile.width, tile.height);
-          const px = d.data;
-          for (let i = 0; i < px.length; i += 4) {
-            const a = Math.min(1, Math.max(0, (px[i] - CLOUD_FLOOR) / (CLOUD_CEIL - CLOUD_FLOOR)));
-            px[i] = px[i + 1] = px[i + 2] = 255;
-            px[i + 3] = Math.round(a * 215);
+          const rec = {
+            ctx, w: tile.width, h: tile.height,
+            raw: ctx.getImageData(0, 0, tile.width, tile.height),
+          };
+          tile._satRec = rec;
+          satTiles.add(rec);
+          const med = satMedian(rec.raw);
+          if (satGroundRef == null || med > satGroundRef + 3) {
+            // a clearer (brighter) tile recalibrates the ground level
+            satGroundRef = Math.max(satGroundRef ?? 0, med);
+            for (const r of satTiles) satApply(r);
+          } else {
+            satApply(rec);
           }
-          ctx.putImageData(d, 0, 0);
         } catch { /* no CORS for pixels — leave the raw (hazy) tile */ }
         done(null, tile);
         setSatStatus(`live IR (${satFrameIso(satBackoff).slice(11, 16)}Z)`);
@@ -781,13 +808,17 @@ function makeCloudLayer(level) {
       return tile;
     },
   });
-  return new CloudLayer({
+  const layer = new CloudLayer({
     pane: "clouds",
     opacity: 0.85,
     maxNativeZoom: level, // IR is coarse; Leaflet upscales beyond this
     maxZoom: 18,
     attribution: 'Clouds: <a href="https://earthdata.nasa.gov/gibs">NASA GIBS</a> / Himawari',
   });
+  layer.on("tileunload", (e) => {
+    if (e.tile?._satRec) satTiles.delete(e.tile._satRec);
+  });
+  return layer;
 }
 
 function fetchSatellite() {
@@ -807,6 +838,7 @@ function fetchSatellite() {
     satLayer.addTo(map);
     setSatStatus("loading tiles…");
   } else if (satLayer.redraw) {
+    satTiles.clear(); // fresh frame, fresh calibration set
     satLayer.redraw(); // re-requests tiles with the current frame time
   }
 }
