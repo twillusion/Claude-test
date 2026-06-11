@@ -260,6 +260,15 @@ body { display: flex; flex-direction: column; }
 }
 .civ-marker.selected .civ-dot { outline: 2px solid #fff; }
 
+/* anemometer sites: tiny arrow pointing downwind */
+.wind-pin {
+  display: inline-block;
+  font-size: 10px;
+  line-height: 1;
+  color: rgba(159, 208, 255, 0.85);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
+}
+
 .leaflet-container { font: inherit; }
 
 /* daytime gently brightens the dark basemap (driven by --day-boost) */

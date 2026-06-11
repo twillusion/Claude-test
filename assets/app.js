@@ -328,7 +328,7 @@ async function fetchWindAt(dt) {
     return res.json();
   }));
   const locs = new Map();
-  for (const s of [...spd.metadata.stations, ...dir.metadata.stations]) locs.set(s.id, s.location);
+  for (const s of [...spd.metadata.stations, ...dir.metadata.stations]) locs.set(s.id, s);
   return {
     locs,
     speeds: new Map(spd.items[0].readings.map((r) => [r.station_id, r.value])),
@@ -341,14 +341,46 @@ function joinWind(snaps) {
   for (const s of snaps) {
     for (const [id, kn] of s.speeds) {
       const deg = s.dirs.get(id);
-      const loc = s.locs.get(id);
-      if (kn == null || deg == null || !loc || merged.has(id)) continue;
+      const st = s.locs.get(id);
+      if (kn == null || deg == null || !st?.location || merged.has(id)) continue;
       const kmh = kn * KNOTS_TO_KMH;
       const rad = (deg * Math.PI) / 180; // direction the wind comes FROM
-      merged.set(id, { lat: loc.latitude, lon: loc.longitude, u: -kmh * Math.sin(rad), v: -kmh * Math.cos(rad) });
+      merged.set(id, {
+        id, name: st.name || `Wind station ${id}`,
+        lat: st.location.latitude, lon: st.location.longitude,
+        u: -kmh * Math.sin(rad), v: -kmh * Math.cos(rad),
+      });
     }
   }
   return [...merged.values()];
+}
+
+// Small arrow pins at the anemometer sites, pointing downwind.
+const windPins = new Map();
+
+function renderWindPins() {
+  if (typeof L === "undefined" || !map) return;
+  const seen = new Set();
+  for (const p of neaWind ?? []) {
+    seen.add(p.id);
+    const kmh = Math.hypot(p.u, p.v);
+    const toward = (Math.atan2(p.u, p.v) * 180 / Math.PI + 360) % 360;
+    const from = (toward + 180) % 360;
+    let m = windPins.get(p.id);
+    if (!m) {
+      m = L.marker([p.lat, p.lon], { keyboard: false }).addTo(map);
+      windPins.set(p.id, m);
+    }
+    m.setIcon(L.divIcon({
+      className: "",
+      html: `<span class="wind-pin" style="transform:translate(-50%,-50%) rotate(${toward.toFixed(0)}deg)">▲</span>`,
+      iconSize: [0, 0],
+    }));
+    m.bindTooltip(`${p.name} · ${kmh.toFixed(0)} km/h from ${COMPASS[Math.round(from / 22.5) % 16]}`);
+  }
+  for (const [id, m] of windPins) {
+    if (!seen.has(id)) { m.remove(); windPins.delete(id); }
+  }
 }
 
 async function fetchWind() {
@@ -364,6 +396,7 @@ async function fetchWind() {
   }
   neaWind = out.length ? out : null;
   renderWindStatus();
+  renderWindPins();
 }
 
 function pollWind() {
@@ -947,7 +980,7 @@ function selectStation(id) {
    tails every frame, so panning keeps the streaks glued to the land — only
    the zoom animation (where Leaflet's projection jumps at the end) gets a
    brief fade. Toggled by the WIND button. */
-const WIND_N = 220;
+const WIND_N = 400;
 const WIND_TAIL = 20;          // tail samples per particle (pushed every 2nd tick)
 const WIND_TICK_MS = 33;       // ~30fps
 const WIND_DEG_PER_S = 0.0018; // visual exaggeration: °lat per second per km/h
@@ -1045,7 +1078,7 @@ function startWind() {
         pt = map.latLngToContainerPoint(p.hist[i]);
         windCtx.lineTo(pt.x, pt.y);
       }
-      windCtx.strokeStyle = "rgba(214, 233, 255, 0.13)";
+      windCtx.strokeStyle = "rgba(214, 233, 255, 0.08)";
       windCtx.lineWidth = 1;
       windCtx.stroke();
       const headStart = Math.max(0, p.hist.length - 4);
@@ -1056,7 +1089,7 @@ function startWind() {
         pt = map.latLngToContainerPoint(p.hist[i]);
         windCtx.lineTo(pt.x, pt.y);
       }
-      windCtx.strokeStyle = "rgba(222, 240, 255, 0.35)";
+      windCtx.strokeStyle = "rgba(222, 240, 255, 0.24)";
       windCtx.lineWidth = 1.5;
       windCtx.stroke();
     }
