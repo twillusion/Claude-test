@@ -8,10 +8,12 @@
   <link rel="preconnect" href="https://api.data.gov.sg" crossorigin>
   <link rel="preconnect" href="https://api-open.data.gov.sg" crossorigin>
   <link rel="preconnect" href="https://a.basemaps.cartocdn.com" crossorigin>
-  <link rel="preconnect" href="https://unpkg.com" crossorigin>
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
-  <link rel="stylesheet" href="assets/style.css">
+  <!-- Leaflet is vendored: same-origin assets can't be rate-limited by a
+       third-party CDN, which used to break the whole layout -->
+  <link rel="stylesheet" href="assets/vendor/leaflet/leaflet.css">
+  <!-- bump ?v= whenever style.css or app.js changes: stale cached assets
+       under a fresh index.html render a broken hybrid of old and new -->
+  <link rel="stylesheet" href="assets/style.css?v=20260611b">
 </head>
 <body>
   <header class="topbar">
@@ -88,8 +90,7 @@
     · refreshes every minute
   </footer>
 
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-  <script src="assets/app.js"></script>
+  <script src="assets/vendor/leaflet/leaflet.js"></script>
+  <script src="assets/app.js?v=20260611b"></script>
 </body>
 </html>
