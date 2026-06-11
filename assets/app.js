@@ -477,19 +477,25 @@ async function fetchRain() {
   renderRainStatus();
 }
 
-// Seed the 30-minute window from today's archive, so rain that fell before
-// the page was opened still shows (one deferred request).
+// Seed the 30-minute window so rain that fell before the page was opened
+// still shows. Rainfall publishes on exact 5-minute marks (unlike wind), so
+// six small spot-snapshots beat downloading the multi-MB day file.
 async function seedRainRecent() {
-  const res = await fetch429(`${RAIN_URL}?date=${sgtDate(new Date())}`);
-  if (!res.ok) return;
-  const json = await res.json();
-  const cutoff = Date.now() - RAIN_RECENT_MS;
-  for (const item of json.items) {
-    const t = new Date(item.timestamp).getTime();
-    if (!Number.isFinite(t) || t < cutoff) continue;
-    for (const r of item.readings) {
-      if (r.value > 0) pushRainHist(r.station_id, t, r.value);
-    }
+  for (let back = 5; back <= 30; back += 5) {
+    const m = new Date(Date.now() - back * 60_000);
+    m.setSeconds(0, 0);
+    m.setMinutes(Math.floor(m.getMinutes() / 5) * 5);
+    try {
+      const res = await fetch429(`${RAIN_URL}?date_time=${encodeURIComponent(sgtStamp(m))}`);
+      if (!res.ok) continue;
+      const item = (await res.json()).items?.[0];
+      if (!item) continue;
+      const t = new Date(item.timestamp).getTime();
+      if (!Number.isFinite(t)) continue;
+      for (const r of item.readings ?? []) {
+        if (r.value > 0) pushRainHist(r.station_id, t, r.value);
+      }
+    } catch { /* seeding is best-effort */ }
   }
   recomputeWet();
   renderRain();
@@ -618,23 +624,44 @@ function fetchSatellite() {
       attribution: 'Clouds: <a href="https://earthdata.nasa.gov/gibs">NASA GIBS</a> / Himawari',
     });
     if (satLayer.on) {
-      satLayer.on("tileload", () => setSatStatus(`live IR (${iso.slice(11, 16)}Z)`));
-      satLayer.on("tileerror", () => {
-        // frame not published yet — step back 10 min and retry
-        if (++satErrors >= 4 && satBackoff < 9) {
+      satLayer.on("tileload", () => setSatStatus(`live IR (${satFrameIso(satBackoff).slice(11, 16)}Z)`));
+      satLayer.on("tileerror", (e) => {
+        if (satErrors === 0 && e?.tile?.src) console.warn("[sgtemp] sat tile failed:", e.tile.src);
+        satErrors++;
+        // frame likely not published yet — step back 10 min and retry
+        if (satErrors >= 4 && satBackoff < 9) {
           satBackoff++;
-          setSatStatus("seeking frame…");
+          setSatStatus(`seeking frame (-${30 + satBackoff * 10}min)…`);
           fetchSatellite();
         } else if (satBackoff >= 9) {
           setSatStatus("tiles failing");
+        } else {
+          setSatStatus(`tile errors (${satErrors})`);
         }
       });
     }
     satLayer.addTo(map);
     setSatStatus("loading tiles…");
+    startSatProbe(iso);
   } else {
     satLayer.setUrl(url);
   }
+}
+
+// If neither tileload nor tileerror fires within 8s, the requests are being
+// stalled or blocked silently. A bare Image() probe against one known tile
+// tells us whether the host is reachable at all.
+function startSatProbe(iso) {
+  if (typeof Image === "undefined") return;
+  setTimeout(() => {
+    const el = document.getElementById("sat-status");
+    if (!el || !/loading tiles/.test(el.textContent)) return; // events arrived
+    const img = new Image();
+    img.onload = () => setSatStatus("probe ok — layer silent?");
+    img.onerror = () => setSatStatus("probe failed — host blocked?");
+    img.src = "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/" +
+      `${GIBS_LAYER}/default/${iso}/GoogleMapsCompatible_Level7/6/31/50.png`;
+  }, 8000);
 }
 
 function pollSatellite() {
