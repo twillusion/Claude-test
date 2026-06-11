@@ -364,7 +364,6 @@ async function fetchWind() {
   }
   neaWind = out.length ? out : null;
   renderWindStatus();
-  rebuildStreamlines();
 }
 
 function pollWind() {
@@ -924,7 +923,6 @@ function renderAll() {
   renderOverlay(values, grid);
   renderTimebar(t);
   renderWindStatus();
-  rebuildStreamlines(); // wind source can differ per displayed time
 }
 
 // Coalesce slider-drag renders to animation frames.
@@ -941,22 +939,25 @@ function selectStation(id) {
   renderAll();
 }
 
-// ---------- wind vector map ----------
+// ---------- wind particles ----------
 
-/* Short streamlines seeded on a fixed screen grid: each integrates a few
-   steps through the wind field and is drawn as a faint hairline with a
-   brighter dash flowing along it. Deterministic full-map coverage (it cannot
-   be invisible the way sparse particles can), low-key transparency, and the
-   only animation is the slow dash drift. Toggled by the WIND button. */
-const WIND_SEED_PX = 46;  // grid spacing between streamline seeds
-const WIND_STEPS = 8;     // integration steps per streamline
-const WIND_STEP_PX = 6.5; // pixels per step (line length ≈ steps × step)
-const WIND_FLOW_PX_S = 20; // dash drift speed along the line
-const WIND_COVER_KM = 12; // no streaks farther than this from a real sensor
+/* A real particle system in geographic space: particles spawn inside data
+   coverage, advect along the wind field, and carry their recent path as a
+   list of lat/lon points. The whole canvas is redrawn from those geographic
+   tails every frame, so panning keeps the streaks glued to the land — only
+   the zoom animation (where Leaflet's projection jumps at the end) gets a
+   brief fade. Toggled by the WIND button. */
+const WIND_N = 220;
+const WIND_TAIL = 20;          // tail samples per particle (pushed every 2nd tick)
+const WIND_TICK_MS = 33;       // ~30fps
+const WIND_DEG_PER_S = 0.0018; // visual exaggeration: °lat per second per km/h
+const WIND_AGE_S = [8, 20];    // particle lifetime range
+const WIND_COVER_KM = 12;      // no particles farther than this from a real sensor
 
-let windOn = true, windCanvas = null, windCtx = null, windLines = [], windHidden = false;
+let windOn = true, windCanvas = null, windCtx = null, windHidden = false;
+let windParts = [];
 
-// Streaks only where there's actual wind data nearby — the IDW field happily
+// Particles only where there's actual wind data nearby — the IDW field happily
 // extrapolates over Malaysia, but that's invention, not data.
 function windCovered(lat, lon) {
   const pts = neaWind ||
@@ -971,40 +972,20 @@ function windCovered(lat, lon) {
   return false;
 }
 
-function rebuildStreamlines() {
-  if (!windCtx || !map || !map.getSize) return;
-  windLines = [];
-  if (!windOn) return;
-  const size = map.getSize();
-  for (let y = WIND_SEED_PX / 2; y < size.y; y += WIND_SEED_PX) {
-    for (let x = WIND_SEED_PX / 2; x < size.x; x += WIND_SEED_PX) {
-      const seed = map.containerPointToLatLng([x, y]);
-      if (!windCovered(seed.lat, seed.lng)) continue;
-      const pts = [[x, y]];
-      let px = x, py = y;
-      let speedSum = 0;
-      for (let s = 0; s < WIND_STEPS; s++) {
-        const ll = map.containerPointToLatLng([px, py]);
-        const w = windVecAt(ll.lat, ll.lng);
-        if (!w || !Number.isFinite(w.u)) { pts.length = 1; break; }
-        const sp = Math.hypot(w.u, w.v);
-        if (sp < 0.1) break;
-        speedSum += sp;
-        px += (w.u / sp) * WIND_STEP_PX;
-        py -= (w.v / sp) * WIND_STEP_PX; // screen y grows southward
-        pts.push([px, py]);
-      }
-      if (pts.length > 2) {
-        windLines.push({ pts, speed: speedSum / (pts.length - 1), phase: Math.random() * 100 });
-      }
-    }
+function spawnPart(p = {}) {
+  for (let i = 0; i < 8; i++) {
+    const lat = OVERLAY.latMin + Math.random() * (OVERLAY.latMax - OVERLAY.latMin);
+    const lon = OVERLAY.lonMin + Math.random() * (OVERLAY.lonMax - OVERLAY.lonMin);
+    if (!windCovered(lat, lon)) continue;
+    p.lat = lat;
+    p.lon = lon;
+    p.age = WIND_AGE_S[0] + Math.random() * (WIND_AGE_S[1] - WIND_AGE_S[0]);
+    p.hist = [[lat, lon]];
+    return p;
   }
-}
-
-function tracePath(ctx, pts) {
-  ctx.beginPath();
-  ctx.moveTo(pts[0][0], pts[0][1]);
-  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  p.hist = [];
+  p.age = 0.5; // no coverage found this round; retry shortly
+  return p;
 }
 
 function startWind() {
@@ -1019,38 +1000,66 @@ function startWind() {
     const size = map.getSize();
     windCanvas.width = size.x;
     windCanvas.height = size.y;
-    rebuildStreamlines();
   };
   fit();
-  // seeds live in screen space and can't follow the map mid-gesture, so the
-  // layer fades out during pan/zoom and fades back in once the view settles
-  map.on("movestart zoomstart", () => { windHidden = true; windCanvas.style.opacity = "0"; });
-  map.on("moveend zoomend resize", () => { fit(); windHidden = false; windCanvas.style.opacity = "1"; });
+  // tails are geographic and redraw every frame, so panning needs no special
+  // handling; only the zoom animation gets a fade while projections settle
+  map.on("zoomstart", () => { windHidden = true; windCanvas.style.opacity = "0"; });
+  map.on("zoomend resize", () => { fit(); windHidden = false; windCanvas.style.opacity = "1"; });
 
-  let lastT = 0;
+  windParts = Array.from({ length: WIND_N }, () => spawnPart());
+  const cosLat = Math.cos((1.35 * Math.PI) / 180);
+  let last = 0, tick = 0;
+
   function frame(ts) {
     requestAnimationFrame(frame);
-    if (!windOn || windHidden || document.hidden || !windLines.length) return;
-    if (ts - lastT < 33) return; // ~30fps is plenty for a slow drift
-    lastT = ts;
+    if (!windOn || windHidden || document.hidden) { last = ts; return; }
+    if (ts - last < WIND_TICK_MS) return;
+    const dt = Math.min(0.1, (ts - last) / 1000);
+    last = ts;
+    tick++;
+
     windCtx.clearRect(0, 0, windCanvas.width, windCanvas.height);
-    // the static "vector map": faint hairlines everywhere
-    windCtx.setLineDash([]);
-    windCtx.strokeStyle = "rgba(214, 233, 255, 0.09)";
-    windCtx.lineWidth = 1;
-    for (const l of windLines) { tracePath(windCtx, l.pts); windCtx.stroke(); }
-    // flow: a brighter dash drifting along each line, faster in faster wind
-    windCtx.strokeStyle = "rgba(222, 240, 255, 0.28)";
-    windCtx.lineWidth = 1.4;
     windCtx.lineCap = "round";
-    windCtx.setLineDash([3, 17]);
-    const t = ts / 1000;
-    for (const l of windLines) {
-      windCtx.lineDashOffset = -(t * WIND_FLOW_PX_S * (0.5 + l.speed / 12) + l.phase);
-      tracePath(windCtx, l.pts);
+    for (const p of windParts) {
+      const w = p.hist.length ? windVecAt(p.lat, p.lon) : null;
+      if (p.hist.length && w && Number.isFinite(w.u)) {
+        p.lat += w.v * WIND_DEG_PER_S * dt;
+        p.lon += (w.u * WIND_DEG_PER_S * dt) / cosLat;
+        if (tick % 2 === 0) {
+          p.hist.push([p.lat, p.lon]);
+          if (p.hist.length > WIND_TAIL) p.hist.shift();
+        }
+      }
+      p.age -= dt;
+      if (p.age <= 0 || !p.hist.length || !windCovered(p.lat, p.lon)) {
+        spawnPart(p);
+        continue;
+      }
+      if (p.hist.length < 2) continue;
+      // faint full tail, brighter head
+      windCtx.beginPath();
+      let pt = map.latLngToContainerPoint(p.hist[0]);
+      windCtx.moveTo(pt.x, pt.y);
+      for (let i = 1; i < p.hist.length; i++) {
+        pt = map.latLngToContainerPoint(p.hist[i]);
+        windCtx.lineTo(pt.x, pt.y);
+      }
+      windCtx.strokeStyle = "rgba(214, 233, 255, 0.13)";
+      windCtx.lineWidth = 1;
+      windCtx.stroke();
+      const headStart = Math.max(0, p.hist.length - 4);
+      windCtx.beginPath();
+      pt = map.latLngToContainerPoint(p.hist[headStart]);
+      windCtx.moveTo(pt.x, pt.y);
+      for (let i = headStart + 1; i < p.hist.length; i++) {
+        pt = map.latLngToContainerPoint(p.hist[i]);
+        windCtx.lineTo(pt.x, pt.y);
+      }
+      windCtx.strokeStyle = "rgba(222, 240, 255, 0.35)";
+      windCtx.lineWidth = 1.5;
       windCtx.stroke();
     }
-    windCtx.setLineDash([]);
   }
   requestAnimationFrame(frame);
 }
@@ -1163,7 +1172,6 @@ document.getElementById("wind-btn").addEventListener("click", () => {
   windOn = !windOn;
   try { localStorage.setItem("sgtemp-wind", windOn ? "on" : "off"); } catch { /* fine */ }
   if (windCtx) windCtx.clearRect(0, 0, windCanvas.width, windCanvas.height);
-  rebuildStreamlines();
   updateWindBtn();
 });
 
