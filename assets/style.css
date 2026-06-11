@@ -100,7 +100,7 @@ body { display: flex; flex-direction: column; }
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
 }
 
-#live-btn, #wind-btn {
+#live-btn, #wind-btn, #radar-btn {
   background: var(--panel-2);
   color: var(--muted);
   border: 1px solid var(--border);
@@ -112,7 +112,34 @@ body { display: flex; flex-direction: column; }
   cursor: pointer;
 }
 #live-btn.active { background: #1d4a2c; color: #7fe6a0; border-color: #2c6e42; }
-#wind-btn.active { background: #1d3a5c; color: var(--accent); border-color: #2c5a8e; }
+#wind-btn.active, #radar-btn.active { background: #1d3a5c; color: var(--accent); border-color: #2c5a8e; }
+
+#panel-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.8rem;
+  line-height: 1.2;
+  padding: 1px 7px;
+  margin-right: 1rem;
+}
+
+#panel-show {
+  position: absolute;
+  top: 50%;
+  right: 10px;
+  transform: translateY(-50%);
+  z-index: 900;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 7px;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
 #live-btn.active::before {
   content: "●";
   margin-right: 4px;

@@ -684,6 +684,13 @@ function renderRainStatus() {
    latest frame with the classic NEXRAD palette, smoothed. */
 const RV_META_URL = "https://api.rainviewer.com/public/weather-maps.json";
 let satLayer = null, satLabel = "";
+let radarOn = true;
+try { radarOn = localStorage.getItem("sgtemp-radar") !== "off"; } catch { /* default on */ }
+
+function updateRadarBtn() {
+  const b = document.getElementById("radar-btn");
+  if (b && b.classList) b.classList.toggle("active", radarOn);
+}
 
 function setSatStatus(text) {
   const el = document.getElementById("sat-status");
@@ -691,6 +698,7 @@ function setSatStatus(text) {
 }
 
 async function fetchSatellite() {
+  if (!radarOn) { setSatStatus("off"); return; }
   const res = await fetch429(RV_META_URL);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const json = await res.json();
@@ -705,7 +713,9 @@ async function fetchSatellite() {
     satLayer = L.tileLayer(url, {
       pane: "clouds",
       opacity: 0.7,
-      maxNativeZoom: 10,
+      // RainViewer's free tiles stop here; beyond it they serve a literal
+      // "Zoom Level Not Supported" image, so Leaflet must upscale instead
+      maxNativeZoom: 7,
       maxZoom: 18,
       attribution: 'Radar: <a href="https://www.rainviewer.com/">RainViewer</a>',
     });
@@ -1961,6 +1971,41 @@ filterSel.addEventListener("change", () => {
   try { localStorage.setItem("sgtemp-filter", listFilter); } catch { /* fine */ }
   renderAll();
 });
+
+document.getElementById("radar-btn").addEventListener("click", () => {
+  radarOn = !radarOn;
+  try { localStorage.setItem("sgtemp-radar", radarOn ? "on" : "off"); } catch { /* fine */ }
+  updateRadarBtn();
+  if (!radarOn) {
+    if (satLayer && satLayer.remove) satLayer.remove();
+    setSatStatus("off");
+  } else if (satLayer) {
+    satLayer.addTo(map);
+    setSatStatus(satLabel ? `live radar (${satLabel})` : "loading radar…");
+  } else {
+    pollSatellite();
+  }
+});
+updateRadarBtn();
+
+// Collapsible station panel: hide to give the map the full width; a slim
+// handle on the map edge brings it back. The map must re-measure after.
+let panelOpen = true;
+try { panelOpen = localStorage.getItem("sgtemp-panel") !== "closed"; } catch { /* default open */ }
+
+function setPanel(open) {
+  panelOpen = open;
+  const panel = document.getElementById("side-panel");
+  const show = document.getElementById("panel-show");
+  if (panel && panel.classList) panel.classList.toggle("hidden", !open);
+  if (show && show.classList) show.classList.toggle("hidden", open);
+  try { localStorage.setItem("sgtemp-panel", open ? "open" : "closed"); } catch { /* fine */ }
+  if (map && map.invalidateSize) map.invalidateSize();
+}
+
+document.getElementById("panel-btn").addEventListener("click", () => setPanel(false));
+document.getElementById("panel-show").addEventListener("click", () => setPanel(true));
+if (!panelOpen) setPanel(false);
 
 document.getElementById("wind-btn").addEventListener("click", () => {
   windOn = !windOn;
