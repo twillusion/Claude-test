@@ -19,7 +19,7 @@ const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
 const HISTORY_HOURS = 24;
 // Shown in the footer; bump together with the ?v= stamps in index.html so a
 // glance settles "am I looking at the new build or a stale cache?"
-const APP_VERSION = "20260611w";
+const APP_VERSION = "20260611x";
 
 const SLIDER_STEP_MIN = 5; // scrubber granularity; underlying data is per-minute
 
@@ -716,7 +716,7 @@ function renderRainStatus() {
    radar composite (only its satellite product was retired), so we draw the
    latest frame with the classic NEXRAD palette, smoothed. */
 const RV_META_URL = "https://api.rainviewer.com/public/weather-maps.json";
-let satLayer = null, satLabel = "";
+let satLabel = "";
 let radarOn = true;
 try { radarOn = localStorage.getItem("sgtemp-radar") !== "off"; } catch { /* default on */ }
 
@@ -732,8 +732,8 @@ function setSatStatus(text) {
 
 let radarFrames = []; // [{time: sec, path}] \u2014 RainViewer keeps ~2h of past frames
 let radarHost = "";
-let radarPath = null;
-let satBack = null; // hidden twin layer for flicker-free frame swaps
+const radarLayers = new Map(); // frame path -> persistent preloaded layer
+let radarShown = null;         // frame path currently visible
 
 function radarUrl(path) {
   // 512px tiles double the resolution at the same zoom cap;
@@ -741,8 +741,8 @@ function radarUrl(path) {
   return `${radarHost}${path}/512/{z}/{x}/{y}/6/1_1.png`;
 }
 
-function makeRadarLayer() {
-  const l = L.tileLayer("", {
+function makeRadarLayer(url) {
+  const l = L.tileLayer(url, {
     pane: "clouds",
     opacity: 0,
     tileSize: 512,
@@ -753,7 +753,19 @@ function makeRadarLayer() {
     maxZoom: 18,
     attribution: 'Radar: <a href="https://www.rainviewer.com/">RainViewer</a>',
   });
-  if (l.on) l.on("tileerror", () => setSatStatus("tiles failing"));
+  if (l.on) {
+    l.on("load", () => { l._warm = true; });
+    l.on("tileerror", () => setSatStatus("tiles failing"));
+  }
+  return l;
+}
+
+function layerFor(path) {
+  let l = radarLayers.get(path);
+  if (!l) {
+    l = makeRadarLayer(radarUrl(path)).addTo(map);
+    radarLayers.set(path, l);
+  }
   return l;
 }
 
@@ -766,13 +778,14 @@ function radarFrameFor(tMs) {
   return bestD <= 15 * 60_000 ? best : null;
 }
 
-// Show the frame matching the displayed time: latest when live, the nearest
-// archive frame when scrubbing the last ~2h, hidden (with an honest status)
-// beyond the archive. Frames load into the hidden twin layer and the two
-// swap opacity only once the new one has fully loaded \u2014 no blank flash or
-// fade-in while scrubbing across frame boundaries.
+/* Show the frame matching the displayed time: latest when live, the nearest
+   archive frame when scrubbing the last ~2h, hidden (with an honest status)
+   beyond the archive. Every frame is a persistent preloaded layer, so a
+   scrub is just an opacity flip between layers that are already on the map
+   \u2014 no network, nothing to fade. A cold (not yet loaded) frame defers its
+   flip until loaded, keeping the previous frame visible meanwhile. */
 function applyRadarFrame() {
-  if (!satLayer || !radarOn || !radarFrames.length) return;
+  if (!radarOn || !radarHost || !radarFrames.length) return;
   const pane = map.getPane && map.getPane("clouds");
   const f = displayedT === null
     ? radarFrames[radarFrames.length - 1]
@@ -783,23 +796,18 @@ function applyRadarFrame() {
     return;
   }
   if (pane) pane.style.display = "";
-  if (f.path === radarPath) return;
-  radarPath = f.path;
+  if (f.path === radarShown) return;
+  radarShown = f.path;
   satLabel = new Date(f.time * 1000).toLocaleTimeString("en-SG",
     { timeZone: "Asia/Singapore", hour: "2-digit", minute: "2-digit" });
-  const target = satBack ?? satLayer;
-  target.setUrl(radarUrl(f.path));
-  if (!target.once) { target.setOpacity(0.7); setSatStatus(`radar ${satLabel}`); return; }
-  target.once("load", () => {
-    if (radarPath !== f.path) return; // superseded by a newer scrub position
-    target.setOpacity(0.7);
-    if (satBack && target === satBack) {
-      satLayer.setOpacity(0);
-      satBack = satLayer;
-      satLayer = target;
-    }
+  const l = layerFor(f.path);
+  const finalize = () => {
+    if (radarShown !== f.path) return; // the scrub has moved on
+    for (const [p, ly] of radarLayers) ly.setOpacity(p === f.path ? 0.7 : 0);
     setSatStatus(`radar ${satLabel}`);
-  });
+  };
+  if (l._warm || !l.once) finalize();
+  else l.once("load", finalize);
 }
 
 async function fetchSatellite() {
@@ -812,13 +820,20 @@ async function fetchSatellite() {
   // forecast steps still show projected rain
   radarFrames = [...(json.radar?.past ?? []), ...(json.radar?.nowcast ?? [])];
   if (!radarFrames.length) { setSatStatus("no radar frames"); return; }
-  if (!satLayer) {
-    satLayer = makeRadarLayer().addTo(map);
-    satBack = makeRadarLayer().addTo(map);
-    setSatStatus("loading radar\u2026");
+  const valid = new Set(radarFrames.map((f) => f.path));
+  for (const [p, ly] of radarLayers) {
+    if (!valid.has(p)) {
+      ly.remove();
+      radarLayers.delete(p);
+      if (radarShown === p) radarShown = null;
+    }
   }
-  radarPath = null; // force re-apply with the fresh frame list
+  if (!radarLayers.size) setSatStatus("loading radar\u2026");
   applyRadarFrame();
+  // warm every frame in the background so scrubbing flips instantly
+  setTimeout(() => {
+    if (radarOn && radarHost) for (const f of radarFrames) layerFor(f.path);
+  }, 2500);
 }
 
 function pollSatellite() {
@@ -2107,13 +2122,11 @@ document.getElementById("radar-btn").addEventListener("click", () => {
   try { localStorage.setItem("sgtemp-radar", radarOn ? "on" : "off"); } catch { /* fine */ }
   updateRadarBtn();
   if (!radarOn) {
-    if (satLayer && satLayer.remove) satLayer.remove();
-    if (satBack && satBack.remove) satBack.remove();
+    for (const ly of radarLayers.values()) ly.remove();
     setSatStatus("off");
-  } else if (satLayer) {
-    satLayer.addTo(map);
-    if (satBack) satBack.addTo(map);
-    radarPath = null;
+  } else if (radarLayers.size) {
+    for (const ly of radarLayers.values()) ly.addTo(map);
+    radarShown = null;
     applyRadarFrame();
   } else {
     pollSatellite();
