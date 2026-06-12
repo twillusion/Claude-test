@@ -19,7 +19,7 @@ const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
 const HISTORY_HOURS = 24;
 // Shown in the footer; bump together with the ?v= stamps in index.html so a
 // glance settles "am I looking at the new build or a stale cache?"
-const APP_VERSION = "20260611v";
+const APP_VERSION = "20260611w";
 
 const SLIDER_STEP_MIN = 5; // scrubber granularity; underlying data is per-minute
 
@@ -733,10 +733,28 @@ function setSatStatus(text) {
 let radarFrames = []; // [{time: sec, path}] \u2014 RainViewer keeps ~2h of past frames
 let radarHost = "";
 let radarPath = null;
+let satBack = null; // hidden twin layer for flicker-free frame swaps
 
 function radarUrl(path) {
+  // 512px tiles double the resolution at the same zoom cap;
   // colour scheme 6 = NEXRAD green/yellow/red; options 1_1 = smoothed
-  return `${radarHost}${path}/256/{z}/{x}/{y}/6/1_1.png`;
+  return `${radarHost}${path}/512/{z}/{x}/{y}/6/1_1.png`;
+}
+
+function makeRadarLayer() {
+  const l = L.tileLayer("", {
+    pane: "clouds",
+    opacity: 0,
+    tileSize: 512,
+    zoomOffset: -1, // 512px tiles: view zoom 8 fetches URL zoom 7
+    // RainViewer's free tiles stop at URL zoom 7; beyond that they serve a
+    // literal "Zoom Level Not Supported" image, so Leaflet must upscale
+    maxNativeZoom: 8,
+    maxZoom: 18,
+    attribution: 'Radar: <a href="https://www.rainviewer.com/">RainViewer</a>',
+  });
+  if (l.on) l.on("tileerror", () => setSatStatus("tiles failing"));
+  return l;
 }
 
 function radarFrameFor(tMs) {
@@ -750,7 +768,9 @@ function radarFrameFor(tMs) {
 
 // Show the frame matching the displayed time: latest when live, the nearest
 // archive frame when scrubbing the last ~2h, hidden (with an honest status)
-// beyond the archive.
+// beyond the archive. Frames load into the hidden twin layer and the two
+// swap opacity only once the new one has fully loaded \u2014 no blank flash or
+// fade-in while scrubbing across frame boundaries.
 function applyRadarFrame() {
   if (!satLayer || !radarOn || !radarFrames.length) return;
   const pane = map.getPane && map.getPane("clouds");
@@ -763,13 +783,23 @@ function applyRadarFrame() {
     return;
   }
   if (pane) pane.style.display = "";
-  if (f.path !== radarPath) {
-    radarPath = f.path;
-    satLabel = new Date(f.time * 1000).toLocaleTimeString("en-SG",
-      { timeZone: "Asia/Singapore", hour: "2-digit", minute: "2-digit" });
-    satLayer.setUrl(radarUrl(f.path));
+  if (f.path === radarPath) return;
+  radarPath = f.path;
+  satLabel = new Date(f.time * 1000).toLocaleTimeString("en-SG",
+    { timeZone: "Asia/Singapore", hour: "2-digit", minute: "2-digit" });
+  const target = satBack ?? satLayer;
+  target.setUrl(radarUrl(f.path));
+  if (!target.once) { target.setOpacity(0.7); setSatStatus(`radar ${satLabel}`); return; }
+  target.once("load", () => {
+    if (radarPath !== f.path) return; // superseded by a newer scrub position
+    target.setOpacity(0.7);
+    if (satBack && target === satBack) {
+      satLayer.setOpacity(0);
+      satBack = satLayer;
+      satLayer = target;
+    }
     setSatStatus(`radar ${satLabel}`);
-  }
+  });
 }
 
 async function fetchSatellite() {
@@ -783,20 +813,8 @@ async function fetchSatellite() {
   radarFrames = [...(json.radar?.past ?? []), ...(json.radar?.nowcast ?? [])];
   if (!radarFrames.length) { setSatStatus("no radar frames"); return; }
   if (!satLayer) {
-    satLayer = L.tileLayer(radarUrl(radarFrames[radarFrames.length - 1].path), {
-      pane: "clouds",
-      opacity: 0.7,
-      // RainViewer's free tiles stop here; beyond it they serve a literal
-      // "Zoom Level Not Supported" image, so Leaflet must upscale instead
-      maxNativeZoom: 7,
-      maxZoom: 18,
-      attribution: 'Radar: <a href="https://www.rainviewer.com/">RainViewer</a>',
-    });
-    if (satLayer.on) {
-      satLayer.on("tileload", () => setSatStatus(`radar ${satLabel}`));
-      satLayer.on("tileerror", () => setSatStatus("tiles failing"));
-    }
-    satLayer.addTo(map);
+    satLayer = makeRadarLayer().addTo(map);
+    satBack = makeRadarLayer().addTo(map);
     setSatStatus("loading radar\u2026");
   }
   radarPath = null; // force re-apply with the fresh frame list
@@ -2090,9 +2108,11 @@ document.getElementById("radar-btn").addEventListener("click", () => {
   updateRadarBtn();
   if (!radarOn) {
     if (satLayer && satLayer.remove) satLayer.remove();
+    if (satBack && satBack.remove) satBack.remove();
     setSatStatus("off");
   } else if (satLayer) {
     satLayer.addTo(map);
+    if (satBack) satBack.addTo(map);
     radarPath = null;
     applyRadarFrame();
   } else {
