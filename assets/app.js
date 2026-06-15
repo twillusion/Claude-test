@@ -19,7 +19,7 @@ const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
 const HISTORY_HOURS = 24;
 // Shown in the footer; bump together with the ?v= stamps in index.html so a
 // glance settles "am I looking at the new build or a stale cache?"
-const APP_VERSION = "20260611x";
+const APP_VERSION = "20260611y";
 
 const SLIDER_STEP_MIN = 5; // scrubber granularity; underlying data is per-minute
 
@@ -2091,6 +2091,19 @@ function initMap() {
   // filter on the tile pane (no second tile set, no hue clash with the
   // temperature ramp)
   L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", tileOpts).addTo(map);
+
+  // Mobile browsers finish laying out the container (vh units, the dynamic
+  // address bar) after L.map() has already measured it — leaving the map
+  // sized to 0 and the tiles blank forever. Re-measure once things settle,
+  // and on orientation/resize; each invalidateSize fires "resize", which
+  // re-runs lockMinZoom against the now-correct size.
+  const remeasure = () => { if (map) map.invalidateSize(); };
+  setTimeout(remeasure, 200);
+  setTimeout(remeasure, 1000);
+  if (typeof window !== "undefined") {
+    window.addEventListener("load", remeasure);
+    window.addEventListener("orientationchange", () => setTimeout(remeasure, 300));
+  }
 }
 
 document.getElementById("detail-close").addEventListener("click", () => selectStation(selectedId));
