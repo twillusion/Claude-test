@@ -398,4 +398,19 @@ body { display: flex; flex-direction: column; }
   #map { flex: 1; height: auto; }
   .panel { width: 100%; flex: 1 1 auto; border-left: none; border-top: 1px solid var(--border); }
   .refresh { width: 100%; text-align: left; min-width: 0; }
+
+  /* the controls + slider don't fit one row on a phone, so wrap: buttons and
+     the time on the top row, the slider full-width on its own row below */
+  .timebar {
+    flex-wrap: wrap;
+    width: 94%;
+    bottom: 10px;
+    gap: 0.5rem 0.45rem;
+    padding: 0.55rem 0.7rem;
+  }
+  #sky-icon { margin-left: auto; } /* push the clock to the right edge of row 1 */
+  .slider-wrap { order: 2; flex: 1 0 100%; height: 30px; } /* full-width, taller hit area */
+  #time-slider { height: 30px; }
+  #live-btn, #wind-btn, #radar-btn { font-size: 0.74rem; padding: 7px 12px; }
+  #time-label { font-size: 0.8rem; }
 }
