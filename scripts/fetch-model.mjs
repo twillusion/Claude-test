@@ -39,7 +39,7 @@ const results = [];
 for (let i = 0; i < lats.length; i += CHUNK) {
   const url = `https://api.open-meteo.com/v1/forecast?latitude=${lats.slice(i, i + CHUNK).join(",")}` +
     `&longitude=${lons.slice(i, i + CHUNK).join(",")}` +
-    `&hourly=temperature_2m,wind_speed_10m,wind_direction_10m` +
+    `&hourly=temperature_2m,wind_speed_10m,wind_direction_10m,precipitation` +
     `&past_days=1&forecast_days=2&timeformat=unixtime&timezone=UTC`;
   const j = await fetchRetry(url);
   results.push(...(Array.isArray(j) ? j : [j]));
