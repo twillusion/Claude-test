@@ -72,15 +72,16 @@ static page, no backend, no hosting costs.
   polls. Only the number displays refresh (no overlay re-rasterization),
   and it pauses when the tab is hidden.
 - Rain: 5-minute rainfall totals from NEA's ~60 gauges (polled every 5
-  minutes) are rasterized onto the same coarse grid as the wind; falling
-  streaks render near wet gauges from the existing particle loop, leaning
-  with the local wind and lengthening with intensity. Live view only —
-  there's no archived rain series yet. The footer shows wet-gauge count
-  and peak intensity.
-- Clouds: NEA's 2-hour forecast names ~47 areas; cloudy/rainy/stormy ones
-  get a blurred drifting sprite at the area's label point (CSS-animated in
-  its own map pane, zero per-frame JS). Hidden while scrubbing, since the
-  forecast only describes now.
+  minutes, kept as a 24h series) render as a glyph + intensity-coloured
+  splash circle per wet gauge; a gauge stays marked (faded) for 30 minutes
+  after rain stops. The time scrubber replays the day's rain; scrubbing
+  into the future switches to the Open-Meteo precipitation forecast,
+  drawn as larger dashed patches at the model's ~10km cells. The footer
+  shows wet-gauge count and peak intensity.
+- Radar: RainViewer's precipitation composite (smoothed NEXRAD palette,
+  512px tiles) as preloaded per-frame layers — the scrubber flips between
+  the ~2h archive and ~30min nowcast with no reload flicker; the RADAR
+  button toggles it.
 - The wind field is precomputed onto a 24×16 grid once per change, so
   particles and rain sample it with one bilinear lookup per tick instead
   of per-particle IDW.

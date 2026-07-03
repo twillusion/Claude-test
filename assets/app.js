@@ -19,7 +19,7 @@ const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
 const HISTORY_HOURS = 24;
 // Shown in the footer; bump together with the ?v= stamps in index.html so a
 // glance settles "am I looking at the new build or a stale cache?"
-const APP_VERSION = "20260702a";
+const APP_VERSION = "20260702b";
 
 const SLIDER_STEP_MIN = 5; // scrubber granularity; underlying data is per-minute
 
@@ -205,19 +205,23 @@ function pollCommunity() {
 
 // ---------- Open-Meteo model grid ----------
 
-// Hourly 2m-temperature + 10m wind for the whole sample grid, yesterday
-// through tomorrow — the scrubber's past window plus the forecast horizon.
+// Hourly 2m-temperature, 10m wind, and precipitation for the whole sample
+// grid, yesterday through tomorrow — the scrubber's past window plus the
+// forecast horizon.
 function buildModelFromResults(results) {
   const times = results[0].hourly.time.map((s) => s * 1000);
-  const grids = [], uGrids = [], vGrids = [];
+  const grids = [], uGrids = [], vGrids = [], pGrids = [];
   times.forEach((_, k) => {
     const g = new Float32Array(results.length);
     const gu = new Float32Array(results.length);
     const gv = new Float32Array(results.length);
+    const gp = new Float32Array(results.length);
     for (let i = 0; i < results.length; i++) {
       const h = results[i].hourly;
       const v = h.temperature_2m[k];
       g[i] = v == null ? NaN : v;
+      const pr = h.precipitation?.[k]; // mm in that hour
+      gp[i] = pr == null ? NaN : pr;
       const ws = h.wind_speed_10m?.[k], wd = h.wind_direction_10m?.[k];
       if (ws == null || wd == null) { gu[i] = NaN; gv[i] = NaN; continue; }
       // meteorological direction = where the wind comes FROM
@@ -225,9 +229,9 @@ function buildModelFromResults(results) {
       gu[i] = -ws * Math.sin(rad); // eastward, km/h
       gv[i] = -ws * Math.cos(rad); // northward, km/h
     }
-    grids.push(g); uGrids.push(gu); vGrids.push(gv);
+    grids.push(g); uGrids.push(gu); vGrids.push(gv); pGrids.push(gp);
   });
-  model = { times, grids, uGrids, vGrids };
+  model = { times, grids, uGrids, vGrids, pGrids };
 }
 
 // Primary source: data/model.json, committed by the scheduled GitHub Action
@@ -257,7 +261,7 @@ async function fetchModel() {
   for (let i = 0; i < lats.length; i += CHUNK) {
     const url = `${OM_URL}?latitude=${lats.slice(i, i + CHUNK).join(",")}` +
       `&longitude=${lons.slice(i, i + CHUNK).join(",")}` +
-      `&hourly=temperature_2m,wind_speed_10m,wind_direction_10m` +
+      `&hourly=temperature_2m,wind_speed_10m,wind_direction_10m,precipitation` +
       `&past_days=1&forecast_days=2&timeformat=unixtime&timezone=UTC`;
     requests.push(fetch(url).then(async (res) => {
       if (!res.ok) throw new Error(`open-meteo HTTP ${res.status}`);
@@ -273,14 +277,18 @@ async function fetchModel() {
 // Cache the model in localStorage so page reloads within the refresh window
 // don't re-hit Open-Meteo — rapid reloads are how free-tier rate limits get
 // burned, which then takes the model (and wind) down for everyone-you.
-const MODEL_CACHE_KEY = "sgtemp-model-v1";
+const MODEL_CACHE_KEY = "sgtemp-model-v2"; // v2: adds precipitation grids
 
 function loadModelCache() {
   try {
     const c = JSON.parse(localStorage.getItem(MODEL_CACHE_KEY));
     if (!c || Date.now() - c.at > MODEL_REFRESH_MS) return false;
     const revive = (arr) => arr.map((g) => Float32Array.from(g, (x) => (x == null ? NaN : x)));
-    model = { times: c.times, grids: revive(c.grids), uGrids: revive(c.uGrids), vGrids: revive(c.vGrids) };
+    model = {
+      times: c.times, grids: revive(c.grids),
+      uGrids: revive(c.uGrids), vGrids: revive(c.vGrids),
+      pGrids: revive(c.pGrids ?? []),
+    };
     return true;
   } catch {
     return false;
@@ -293,6 +301,7 @@ function saveModelCache() {
     localStorage.setItem(MODEL_CACHE_KEY, JSON.stringify({
       at: Date.now(), times: model.times,
       grids: pack(model.grids), uGrids: pack(model.uGrids), vGrids: pack(model.vGrids),
+      pGrids: pack(model.pGrids ?? []),
     }));
   } catch { /* storage full or unavailable — not worth failing over */ }
 }
@@ -620,16 +629,45 @@ function rainColor(mm) {
   return `rgb(${c0.map((v, i) => Math.round(v + (c1[i] - v) * t)).join(",")})`;
 }
 
+// Forecast rain: cells of the model's precipitation grid above a drizzle
+// threshold at the displayed (future) time, rendered as dashed patches.
+// Grid cells are ~10km apart — that IS the model's honest resolution.
+function forecastRainList(t) {
+  if (!model?.pGrids?.length) return [];
+  const p = blendGrids(model.pGrids, t);
+  const out = [];
+  for (let iy = 0; iy < GRID_NLAT; iy++) {
+    for (let ix = 0; ix < GRID_NLON; ix++) {
+      const mm = p[iy * GRID_NLON + ix];
+      if (!(mm >= 0.15)) continue; // NaN or dry
+      out.push({
+        id: `fc-${iy}-${ix}`,
+        lat: OVERLAY.latMin + (iy * (OVERLAY.latMax - OVERLAY.latMin)) / (GRID_NLAT - 1),
+        lon: OVERLAY.lonMin + (ix * (OVERLAY.lonMax - OVERLAY.lonMin)) / (GRID_NLON - 1),
+        mm, recent: mm * 3, fc: true,
+      });
+    }
+  }
+  return out;
+}
+
 function renderRain() {
   if (typeof L === "undefined" || !map) return;
-  // live shows "now"; scrubbing replays the day's rain at the displayed time
-  const list = displayedT === null ? wetGauges : wetList(displayedTime() ?? Date.now());
+  // live shows "now"; scrubbing the past replays the day's gauges; the
+  // future shows the model's precipitation forecast, dashed
+  const list = displayedT === null ? wetGauges
+    : isFutureView() ? forecastRainList(displayedTime() ?? Date.now())
+    : wetList(displayedTime() ?? Date.now());
   const seen = new Set();
   for (const g of list) {
     seen.add(g.id);
+    const fc = !!g.fc;
     const active = g.mm > 0.05; // raining now vs rained recently
     const intensity = Math.max(g.mm, (g.recent ?? 0) / 3);
-    const radius = 1200 + Math.min(8, intensity) * 350; // metres — a rough splash zone
+    // forecast patches represent a ~10km model cell, gauges a splash zone
+    const radius = fc
+      ? 2800 + Math.min(6, intensity) * 450
+      : 1200 + Math.min(8, intensity) * 350;
     const col = rainColor(intensity);
     let e = rainLayer.get(g.id);
     if (!e) {
@@ -648,17 +686,20 @@ function renderRain() {
     if (e.circle.setStyle) {
       e.circle.setStyle({
         color: col, fillColor: col,
-        opacity: active ? 0.4 : 0.2,
-        fillOpacity: active ? 0.14 : 0.06,
+        opacity: fc ? 0.35 : active ? 0.4 : 0.2,
+        fillOpacity: fc ? 0.1 : active ? 0.14 : 0.06,
+        dashArray: fc ? "5 7" : null,
       });
     }
+    const dim = fc || !active;
     e.icon.setIcon(L.divIcon({
       className: "",
-      html: `<span class="rain-icon"${active ? "" : ' style="opacity:0.5"'}>🌧️</span>`,
+      html: `<span class="rain-icon"${dim ? ' style="opacity:0.55"' : ""}>🌧️</span>`,
       iconSize: [0, 0],
     }));
-    e.icon.bindTooltip(
-      `${g.mm.toFixed(1)} mm now · ${(g.recent ?? 0).toFixed(1)} mm last 30 min`);
+    e.icon.bindTooltip(fc
+      ? `forecast ≈ ${g.mm.toFixed(1)} mm/h`
+      : `${g.mm.toFixed(1)} mm now · ${(g.recent ?? 0).toFixed(1)} mm last 30 min`);
   }
   for (const [id, e] of rainLayer) {
     if (!seen.has(id)) { e.circle.remove(); e.icon.remove(); rainLayer.delete(id); }
