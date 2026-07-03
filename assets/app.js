@@ -19,7 +19,7 @@ const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
 const HISTORY_HOURS = 24;
 // Shown in the footer; bump together with the ?v= stamps in index.html so a
 // glance settles "am I looking at the new build or a stale cache?"
-const APP_VERSION = "20260611z";
+const APP_VERSION = "20260702a";
 
 const SLIDER_STEP_MIN = 5; // scrubber granularity; underlying data is per-minute
 
@@ -1817,17 +1817,26 @@ function startWind() {
   const cosLat = Math.cos((1.35 * Math.PI) / 180);
   let last = 0, tick = 0, spawnedFor = -1;
 
-  // Until the anemometer set is in, the coverage mask is one small circle
-  // around whichever station reported first — all 400 particles would swarm
-  // it. Hold rendering until the archive lands (or enough stations join),
-  // and re-scatter whenever the network grows meaningfully so the swarm
-  // can never persist.
-  const windReady = () => windDayLoaded || windStations.size >= 8;
+  // Particle budget scales with actual data coverage: with one or two
+  // stations known, only a proportional handful of particles render around
+  // them (constant density, so no swarm), and the field fills out as the
+  // network loads — no more waiting for the whole archive before anything
+  // moves. Re-scatter whenever the network grows meaningfully.
+  const windBudget = () => {
+    if (!windGridU) return 0; // fewer than 2 stations: no field to draw
+    let covered = 0;
+    for (let i = 0; i < windGridU.length; i++) {
+      if (!Number.isNaN(windGridU[i])) covered++;
+    }
+    return Math.round((WIND_N * covered) / windGridU.length);
+  };
 
   function frame(ts) {
     requestAnimationFrame(frame);
     if (!windOn || document.hidden) { last = ts; return; }
-    if (!windReady()) { last = ts; return; }
+    ensureWindField();
+    const budget = windBudget();
+    if (!budget) { last = ts; return; }
     if (spawnedFor < 0 || windStations.size >= spawnedFor + 3) {
       spawnedFor = windStations.size;
       windParts.forEach((p) => spawnPart(p));
@@ -1846,7 +1855,8 @@ function startWind() {
     if (!ref) L.DomUtil.setPosition(windCanvas, map.containerPointToLayerPoint([0, 0]));
     windCtx.clearRect(0, 0, windCanvas.width, windCanvas.height);
     windCtx.lineCap = "round";
-    for (const p of windParts) {
+    for (let pi = 0; pi < budget; pi++) {
+      const p = windParts[pi];
       const w = p.hist.length ? windVecAt(p.lat, p.lon) : null;
       if (p.hist.length && w && Number.isFinite(w.u)) {
         p.lat += w.v * WIND_DEG_PER_S * dt;
@@ -1965,6 +1975,26 @@ function saveHistCache() {
       rainDone: rainDayLoaded,
     }));
   } catch { /* quota or unavailable — caching is best-effort */ }
+}
+
+// Wind stations get seeded from the cache even when it's too stale for
+// temperatures (up to 12h): live semantics are already last-known-reading,
+// per-minute polls replace each station as fresh data arrives, and the
+// archive refetch (windDayLoaded stays false) heals the history. This makes
+// the particle field full-coverage within a second on any revisit.
+function seedWindFromCache() {
+  try {
+    const c = JSON.parse(localStorage.getItem(HIST_CACHE_KEY));
+    if (!c || Date.now() - c.at > 12 * 3600_000) return;
+    for (const wc of c.wind ?? []) {
+      if (windStations.has(wc.id) || !wc.series?.length) continue;
+      windStations.set(wc.id, {
+        id: wc.id, name: wc.name, lat: wc.lat, lon: wc.lon,
+        series: wc.series.map(([t, u, v]) => ({ t, u, v })),
+      });
+    }
+    if (windStations.size) updateWindField();
+  } catch { /* best-effort */ }
 }
 
 function loadHistCache() {
@@ -2180,17 +2210,22 @@ document.getElementById("wind-btn").addEventListener("click", () => {
 }
 initMap();
 startWind();
-refresh().then(loadHistory).then(() => {
+refresh().then(() => {
+  // the wind archive is what the particles ultimately feed on — fetch it in
+  // parallel with the temperature history instead of after it (its four day
+  // files used to queue behind temp's two, delaying particles 20-30s)
+  setTimeout(() => loadWindHistory().catch(() => {}), 800);
+  return loadHistory();
+}).then(() => {
   pollCommunity();
   pollRain();
   pollSatellite();
-  // archives matter only for scrubbing/recency — let the visible stuff win
-  setTimeout(() => loadWindHistory().catch(() => {}), 1500);
   if (!TEST_RAIN) {
     setTimeout(() => seedRainRecent().catch(() => {}), 3000);
     setTimeout(() => loadRainHistory().catch(() => {}), 6000);
   }
 });
+if (typeof localStorage !== "undefined") seedWindFromCache();
 pollWind();
 setInterval(pollRain, RAIN_POLL_MS);
 setInterval(pollSatellite, SAT_POLL_MS);
