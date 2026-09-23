@@ -144,7 +144,7 @@ const h = new Function(src + `
     futureView: () => isFutureView(),
     windVecAt, fetchWind, fetchRain, fetchRadar, fetchCommunity, extremeness, dayFactor,
     rainCount: () => rainLayer.size,
-    fcRain: () => ({ shown: !!fcRainLayer && fcRainLayer.opacity > 0, max: fcRainMax }),
+    fcRain: () => ({ icons: [...rainLayer.keys()].filter((k) => k.startsWith("fc-")).length, max: fcRainMax }),
     radarLayerCount: () => radarLayers.size,
     windGridOk: () => { ensureWindField(); return !!windGridU; },
     rainOutlookText, fcRainStrength,
@@ -195,20 +195,20 @@ const h = new Function(src + `
   // particles need a grid far into the future too (it used to go empty past
   // +90 min, freezing the animation on its last frame)
   console.assert(h.windGridOk(), "forecast wind grid exists at +24h");
-  // model rain is one continuous field, not a marker per grid node (that
-  // tiled the map with a lattice of circles on widespread-rain hours)
+  // model rain: a sparse set of glyphs even when every node is wet (one
+  // per node tiled the map with a lattice on widespread-rain hours)
   const fr = h.fcRain();
-  console.assert(fr.shown && Math.abs(fr.max - 2) < 0.01, "forecast rain field:", fr);
-  console.assert(h.rainCount() === 0, "no per-cell rain markers in the future:", h.rainCount());
+  console.assert(fr.icons >= 3 && fr.icons <= 10 && Math.abs(fr.max - 2) < 0.01, "forecast rain glyphs:", fr);
+  console.assert(h.rainCount() === fr.icons, "no gauge glyphs in the future:", h.rainCount());
   // +15 min: past the fixture's last reading (day files run to now+10min),
   // still within 15 min of the newest radar frame
   h.scrubTo(h.liveIdx() + 3);
-  console.assert(h.futureView() && !h.fcRain().shown, "radar beats model rain near now");
+  console.assert(h.futureView() && h.fcRain().icons === 0, "radar beats model rain near now");
   h.goLive();
   console.assert(h.rainCount() === 1, "back to observed rain at live:", h.rainCount());
-  console.assert(!h.fcRain().shown, "forecast rain hidden at live");
+  console.assert(h.fcRain().icons === 0, "forecast rain hidden at live");
 
-  // forecast rain must be clearly visible at typical model rates (a 10km
+  // forecast glyphs must register at typical model rates (a 10km
   // cell averages a shower down to ~0.3-1 mm/h), and show in the outlook
   console.assert(h.fcRainStrength(0.3) > 0.3 && h.fcRainStrength(1) > 0.55, "model rain visibility");
   console.assert(/^model: showers now–/.test(h.rainOutlookText()), "rain outlook:", h.rainOutlookText());
