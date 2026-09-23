@@ -37,7 +37,8 @@ static page, no backend, no hosting costs.
   it falls back to station-only IDW shading that fades out away from
   sensors. The model grid refreshes every 30 minutes (the models themselves
   update hourly) and covers the full 24h scrubber window.
-- Forecast: the slider extends ~24 hours past LIVE in hourly steps. Future
+- Forecast: the slider extends 24 hours past LIVE (5-minute steps that
+  interpolate the hourly model). Future
   pills show the Open-Meteo model field at each station, bias-corrected by
   the station's current offset from the model, and render dashed with a
   "≈" time label to mark them as forecast; the shading, wind socks, and
@@ -46,9 +47,9 @@ static page, no backend, no hosting costs.
   `data/model.json`, committed every 3 hours by a GitHub Action
   (`scripts/fetch-model.mjs`) so the page reads it same-origin — run the
   "Refresh forecast model" workflow once manually after merging to seed it.
-- The time slider scrubs the 24-hour window in 5-minute steps
-  (`SLIDER_STEP_MIN` in `assets/app.js`); the LIVE button snaps back to the
-  newest reading. Displayed series use a centered 15-minute rolling mean so
+- The time slider runs from 24h ago to 24h ahead in 5-minute steps
+  (`SLIDER_STEP_MIN` in `assets/app.js`), with LIVE at the centre marked by
+  a dotted line; the LIVE button snaps back to the newest reading. Displayed series use a centered 15-minute rolling mean so
   per-minute sensor jitter doesn't flash colours while scrubbing, and the
   colour scale eases toward its target rather than jumping.
 - The basemap follows the sun: daytime lifts the dark basemap's
@@ -56,10 +57,11 @@ static page, no backend, no hosting costs.
   set, no hue clash with the temperature ramp) through two-hour dawn/dusk
   ramps at the displayed time, with a sun/moon icon next to the clock.
 - Wind particles (WIND button toggles them, remembered in localStorage):
-  ~220 particles spawn inside sensor coverage and advect along the wind
-  field, each carrying its recent path as geographic points — the canvas
-  redraws those tails every frame, so streaks stay glued to the land
-  while panning (zoom gets a brief fade while projections settle). Live
+  up to 400 particles (scaled to how much of the map has sensor coverage)
+  advect along the wind field, each carrying its recent path as geographic
+  points — the canvas redraws those tails every frame and follows Leaflet's
+  zoom animation, so streaks stay glued to the land while panning and
+  zooming. Live
   data comes from NEA's observed wind stations (data.gov.sg
   wind-speed/wind-direction). Per-station wind history is built from the
   day files at startup and appended by the per-minute polls, so the time
@@ -105,7 +107,8 @@ static page, no backend, no hosting costs.
    minutes.
 
 To preview locally instead: `python3 -m http.server` in the repo root, then
-open <http://localhost:8000>.
+open <http://localhost:8000>. Run `node tests/smoke.js` to check the data
+paths against mocked APIs. Development notes live in `CLAUDE.md`.
 
 ## Data attribution
 
