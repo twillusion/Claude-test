@@ -19,7 +19,7 @@ const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
 const HISTORY_HOURS = 24;
 // Shown in the footer; bump together with the ?v= stamps in index.html so a
 // glance settles "am I looking at the new build or a stale cache?"
-const APP_VERSION = "20260923d";
+const APP_VERSION = "20260923e";
 
 // CARTO basemap key. Since Aug 2026 basemaps.cartocdn.com answers keyless
 // requests with HTTP 200 tiles that have "API KEY REQUIRED" burned in, so
@@ -649,58 +649,26 @@ async function seedRainRecent() {
   renderRain();
 }
 
-const rainLayer = new Map(); // gauge id -> {circle, icon}
+const rainLayer = new Map(); // id -> {circle (gauges only), icon}
 
-// Light drizzle = light blue, downpour = deep blue.
-function rainRGB(mm) {
-  const t = Math.min(1, Math.max(0, (mm - 0.2) / 8));
-  const c0 = [158, 212, 255], c1 = [16, 86, 200];
-  return c0.map((v, i) => Math.round(v + (c1[i] - v) * t));
-}
-
-function rainColor(mm) {
-  return `rgb(${rainRGB(mm).join(",")})`;
-}
-
-/* Forecast rain: the model's precipitation grid as one continuous field.
-   It used to be one dashed circle + glyph per wet grid node, which on a
-   widespread-rain hour (40-54 of the 54 nodes wet is common) tiled the
-   whole map with a lattice of circles. Now the grid is interpolated
-   (bicubic, so no bilinear diamonds at the ~10km node spacing) onto a small
-   raster in the rain pane, in the radar's green-yellow-red language (the
-   first version was pale blue — the same hue as the cool end of the
-   temperature ramp, so a forecast shower read as "slightly cooler"),
-   striped by CSS so it reads as a forecast, not radar.
-   A 10km model cell averages a local shower down to 0.3-1 mm/h, so the
-   opacity has to be clearly visible from ~0.3 mm/h, not ramp up at 5+. */
-const FC_RAIN = { w: 148, h: 94 };  // raster; stretched over OVERLAY bounds
-const FC_RAIN_MIN_MM = 0.1;         // mm/h below which the model is "dry"
-const FC_RAIN_MAX_ALPHA = 0.6;
-
-// mm/h -> radar-like colour (RainViewer's NEXRAD scheme runs green -> red)
-const FC_RAIN_STOPS = [
-  [0.1, [150, 230, 150]], [1, [72, 200, 88]], [3, [30, 150, 64]],
-  [6, [240, 210, 60]], [12, [240, 138, 36]], [25, [215, 50, 45]],
-];
-
-function fcRainRGB(mm) {
-  const S = FC_RAIN_STOPS;
-  if (mm <= S[0][0]) return S[0][1];
-  for (let i = 1; i < S.length; i++) {
-    if (mm <= S[i][0]) {
-      const t = (mm - S[i - 1][0]) / (S[i][0] - S[i - 1][0]);
-      return S[i - 1][1].map((c, k) => Math.round(c + (S[i][1][k] - c) * t));
-    }
-  }
-  return S[S.length - 1][1];
-}
+/* Rain is drawn with 🌧️ rain-cloud glyphs, never with colour: on this map
+   colour means temperature and nothing else. Intensity is carried by the
+   glyph's size and opacity (plus a neutral splash ring around observed
+   gauges); forecast glyphs are dimmer and ringed with a dashed outline —
+   the same "estimate" mark as the dashed forecast pills. */
+const RAIN_RING = "rgb(222, 229, 239)"; // neutral, deliberately not a hue
 
 // 0..1 visibility of a forecast rain rate: ~0.35 at 0.3 mm/h, ~0.6 at
-// 1 mm/h, ~0.95 from 4 mm/h
+// 1 mm/h, ~0.95 from 4 mm/h (a 10km model cell averages a local shower
+// down to 0.3-1 mm/h, so that range has to register clearly)
 function fcRainStrength(mm) {
   return smooth01((mm - 0.08) / 0.35) * (0.55 + 0.45 * smooth01(mm / 5));
 }
-let fcRainLayer = null, fcRainCanvas = null, fcRainMax = 0, fcRainByRadar = false;
+
+const FC_RAIN_MIN_MM = 0.3;     // model mm/h worth a forecast glyph
+const FC_ICON_SPACING_KM = 14;  // glyphs at least this far apart
+const FC_ICON_MAX = 10;         // per view
+let fcRainMax = 0, fcRainByRadar = false;
 
 // Open-Meteo's hourly precipitation is the total over the PRECEDING hour,
 // so the value stamped 08:00 is the 07:00-08:00 rate: sample half an hour
@@ -710,131 +678,117 @@ function forecastRainGrid(t) {
   return blendGrids(model.pGrids, t + 30 * 60_000);
 }
 
-// Catmull-Rom sample of a model-shaped grid (clamped at the edges).
-function gridSampleCubic(grid, lat, lon) {
-  const fy = ((lat - OVERLAY.latMin) / (OVERLAY.latMax - OVERLAY.latMin)) * (GRID_NLAT - 1);
-  const fx = ((lon - OVERLAY.lonMin) / (OVERLAY.lonMax - OVERLAY.lonMin)) * (GRID_NLON - 1);
-  const iy = Math.floor(fy), ix = Math.floor(fx);
-  const ty = fy - iy, tx = fx - ix;
-  const at = (y, x) => {
-    const v = grid[Math.min(GRID_NLAT - 1, Math.max(0, y)) * GRID_NLON +
-                   Math.min(GRID_NLON - 1, Math.max(0, x))];
-    return Number.isNaN(v) ? 0 : v;
-  };
-  const cr = (p0, p1, p2, p3, t) =>
-    p1 + 0.5 * t * (p2 - p0 + t * (2 * p0 - 5 * p1 + 4 * p2 - p3 + t * (3 * (p1 - p2) + p3 - p0)));
-  const row = (y) => cr(at(y, ix - 1), at(y, ix), at(y, ix + 1), at(y, ix + 2), tx);
-  return cr(row(iy - 1), row(iy), row(iy + 1), row(iy + 2), ty);
-}
-
-function renderForecastRain(show) {
-  const p = show ? forecastRainGrid(displayedTime() ?? Date.now()) : null;
+/* Forecast glyphs at a sparse set of grid nodes — never one per wet node:
+   on widespread-rain hours 40-54 of the 54 nodes are wet and that tiled
+   the map with a lattice. Greedy pick among the nodes inside the current
+   view (the wettest nodes often sit on the grid's outer edge, which a
+   phone never shows): the wettest node, then the next wettest at least
+   FC_ICON_SPACING_KM from every earlier pick. Node ids are stable, so a
+   glyph stays put while its node stays picked; panning/zooming re-picks. */
+function forecastRainIcons(t) {
+  const p = forecastRainGrid(t);
   fcRainMax = 0;
-  if (p) for (const v of p) if (v > fcRainMax) fcRainMax = v;
-  if (!p || fcRainMax < FC_RAIN_MIN_MM) {
-    if (fcRainLayer) fcRainLayer.setOpacity(0);
-    return;
+  if (!p) return [];
+  // visible area, inset a little so glyphs aren't clipped at the edge
+  let view = null;
+  if (map && map.getBounds) {
+    const b = map.getBounds(), dLat = (b.getNorth() - b.getSouth()) * 0.06,
+      dLon = (b.getEast() - b.getWest()) * 0.06;
+    view = { s: b.getSouth() + dLat, n: b.getNorth() - dLat, w: b.getWest() + dLon, e: b.getEast() - dLon };
   }
-  if (!fcRainCanvas) {
-    fcRainCanvas = document.createElement("canvas");
-    fcRainCanvas.width = FC_RAIN.w;
-    fcRainCanvas.height = FC_RAIN.h;
-  }
-  if (typeof fcRainCanvas.getContext !== "function") return;
-  const ctx = fcRainCanvas.getContext("2d");
-  const img = ctx.createImageData(FC_RAIN.w, FC_RAIN.h);
-  const edgePx = Math.round(FC_RAIN.w * 0.05);
-  for (let py = 0; py < FC_RAIN.h; py++) {
-    const lat = OVERLAY.latMax - ((py + 0.5) / FC_RAIN.h) * (OVERLAY.latMax - OVERLAY.latMin);
-    for (let px = 0; px < FC_RAIN.w; px++) {
-      const lon = OVERLAY.lonMin + ((px + 0.5) / FC_RAIN.w) * (OVERLAY.lonMax - OVERLAY.lonMin);
-      const mm = gridSampleCubic(p, lat, lon);
-      if (!(mm > FC_RAIN_MIN_MM)) continue;
-      const k = fcRainStrength(mm);
-      const edge = Math.min(1, Math.min(px, FC_RAIN.w - 1 - px, py, FC_RAIN.h - 1 - py) / edgePx);
-      const [r, g, b] = fcRainRGB(mm);
-      const o = (py * FC_RAIN.w + px) * 4;
-      img.data[o] = r; img.data[o + 1] = g; img.data[o + 2] = b;
-      img.data[o + 3] = Math.round(FC_RAIN_MAX_ALPHA * k * edge * 255);
+  const nodes = [];
+  for (let iy = 0; iy < GRID_NLAT; iy++) {
+    for (let ix = 0; ix < GRID_NLON; ix++) {
+      const mm = p[iy * GRID_NLON + ix];
+      if (!(mm >= 0)) continue; // NaN
+      if (mm > fcRainMax) fcRainMax = mm;
+      if (mm < FC_RAIN_MIN_MM) continue;
+      // Each glyph stands for its ~10km model cell; a fixed per-node offset
+      // within the cell keeps uniform rain from reading as a regular grid
+      // (and never moves between scrub steps).
+      const dLat = (OVERLAY.latMax - OVERLAY.latMin) / (GRID_NLAT - 1);
+      const dLon = (OVERLAY.lonMax - OVERLAY.lonMin) / (GRID_NLON - 1);
+      const j1 = Math.sin((iy * 12.9898 + ix * 78.233) * 43.758) * 1e4 % 1;
+      const j2 = Math.sin((iy * 39.346 + ix * 11.135) * 23.421) * 1e4 % 1;
+      const lat = OVERLAY.latMin + iy * dLat + j1 * 0.35 * dLat;
+      const lon = OVERLAY.lonMin + ix * dLon + j2 * 0.35 * dLon;
+      if (view && (lat < view.s || lat > view.n || lon < view.w || lon > view.e)) continue;
+      nodes.push({ id: `fc-${iy}-${ix}`, mm, fc: true, lat, lon });
     }
   }
-  ctx.putImageData(img, 0, 0);
-  const url = fcRainCanvas.toDataURL();
-  if (!fcRainLayer) {
-    fcRainLayer = L.imageOverlay(url,
-      [[OVERLAY.latMin, OVERLAY.lonMin], [OVERLAY.latMax, OVERLAY.lonMax]],
-      { pane: "rain", opacity: 1, interactive: false, className: "rain-forecast" }).addTo(map);
-  } else {
-    fcRainLayer.setUrl(url);
-    fcRainLayer.setOpacity(1);
+  nodes.sort((a, b) => b.mm - a.mm);
+  const cosLat = Math.cos((1.35 * Math.PI) / 180);
+  const km = (a, b) => Math.hypot((a.lon - b.lon) * cosLat, a.lat - b.lat) * KM_PER_DEG;
+  const picked = [];
+  for (const n of nodes) {
+    if (picked.length >= FC_ICON_MAX) break;
+    if (picked.every((q) => km(q, n) >= FC_ICON_SPACING_KM)) picked.push(n);
   }
+  return picked;
 }
-
-// Gauge glyph: a small droplet (an emoji rendered differently on every
-// platform, and looked cartoonish on Android).
-const DROP_SVG = '<svg viewBox="0 0 12 16" width="10" height="13" aria-hidden="true">' +
-  '<path d="M6 0.8C6 0.8 1 7 1 10.2a5 5 0 0 0 10 0C11 7 6 0.8 6 0.8z"/></svg>';
 
 function renderRain() {
   if (typeof L === "undefined" || !map) return;
   // live shows "now"; scrubbing the past replays the day's gauges; the
-  // future shows the model's precipitation field instead — unless a radar
-  // nowcast frame covers that moment, which beats the model outright
+  // future shows the model's rain instead — unless a radar nowcast frame
+  // covers that moment, which beats the model outright
   const future = isFutureView();
   fcRainByRadar = !!(future && radarOn && radarHost &&
     radarFrameFor(displayedTime() ?? Date.now()));
-  renderForecastRain(future && !fcRainByRadar);
+  const t = displayedTime() ?? Date.now();
   const list = displayedT === null ? wetGauges
-    : future ? []
-    : wetList(displayedTime() ?? Date.now());
+    : future ? (fcRainByRadar ? [] : forecastRainIcons(t))
+    : wetList(t);
   const seen = new Set();
   for (const g of list) {
     seen.add(g.id);
-    const active = g.mm > 0.05; // raining now vs rained recently
-    const intensity = Math.max(g.mm, (g.recent ?? 0) / 3);
-    const radius = 1200 + Math.min(8, intensity) * 350; // splash zone
-    const col = rainColor(intensity);
+    const fc = !!g.fc;
+    const active = fc || g.mm > 0.05; // raining now vs rained recently
+    const intensity = fc ? g.mm : Math.max(g.mm, (g.recent ?? 0) / 3);
+    const k = fc ? fcRainStrength(intensity) : Math.min(1, intensity / 8);
+    const size = Math.round(14 + 8 * k);
+    const opacity = fc ? 0.5 + 0.3 * k : active ? 1 : 0.55;
     let e = rainLayer.get(g.id);
     if (!e) {
       e = {
-        circle: L.circle([g.lat, g.lon], {
-          pane: "rain", radius,
-          color: col, weight: 1,
-          fillColor: col,
-          interactive: false,
+        // gauges get a neutral splash ring; forecast glyphs mark a ~10km
+        // model cell, which a ring would overstate
+        circle: fc ? null : L.circle([g.lat, g.lon], {
+          pane: "rain", radius: 1200, color: RAIN_RING, weight: 1,
+          fillColor: RAIN_RING, interactive: false,
         }).addTo(map),
-        icon: L.marker([g.lat, g.lon], { pane: "rain", keyboard: false }).addTo(map),
-        dim: null,
+        icon: L.marker([g.lat, g.lon], {
+          pane: "rain", keyboard: false,
+          icon: L.divIcon({
+            className: "",
+            html: `<span class="rain-icon${fc ? " fc" : ""}">🌧️</span>`,
+            iconSize: [0, 0],
+          }),
+        }).addTo(map),
       };
       e.icon.bindTooltip("");
       rainLayer.set(g.id, e);
     }
-    e.circle.setRadius(radius);
-    if (e.circle.setStyle) {
-      e.circle.setStyle({
-        color: col, fillColor: col,
-        opacity: active ? 0.4 : 0.2,
-        fillOpacity: active ? 0.14 : 0.06,
-      });
+    if (e.circle) {
+      e.circle.setRadius(1200 + Math.min(8, intensity) * 350);
+      if (e.circle.setStyle) {
+        e.circle.setStyle({ opacity: active ? 0.35 : 0.18, fillOpacity: active ? 0.07 : 0.03 });
+      }
     }
-    // rebuilding a divIcon replaces its DOM node (a visible blink while
-    // scrubbing), so only do it when the look actually changes
-    const dim = !active;
-    if (e.dim !== dim) {
-      e.icon.setIcon(L.divIcon({
-        className: "",
-        html: `<span class="rain-icon${dim ? " dim" : ""}">${DROP_SVG}</span>`,
-        iconSize: [0, 0],
-      }));
-      e.dim = dim;
+    // restyle in place: a fresh divIcon per scrub step blinks the glyph
+    const el = e.icon.getElement && e.icon.getElement()?.querySelector(".rain-icon");
+    if (el && el.style) {
+      el.style.fontSize = `${size}px`;
+      el.style.opacity = opacity.toFixed(2);
     }
     if (e.icon.setTooltipContent) {
-      e.icon.setTooltipContent(
-        `${g.mm.toFixed(1)} mm now · ${(g.recent ?? 0).toFixed(1)} mm last 30 min`);
+      e.icon.setTooltipContent(fc
+        ? `forecast ≈ ${g.mm.toFixed(1)} mm/h (model)`
+        : `${g.mm.toFixed(1)} mm now · ${(g.recent ?? 0).toFixed(1)} mm last 30 min`);
     }
   }
   for (const [id, e] of rainLayer) {
-    if (!seen.has(id)) { e.circle.remove(); e.icon.remove(); rainLayer.delete(id); }
+    if (!seen.has(id)) { e.circle?.remove(); e.icon.remove(); rainLayer.delete(id); }
   }
   renderRainStatus();
 }
@@ -916,7 +870,8 @@ function rainOutlookText() {
   return `model: showers ${start}–${fmtHour(hours[j].to)}`;
 }
 
-// Forecast rain hours painted onto the slider track (CSS --rain-track),
+// Forecast rain hours marked on the slider track in neutral grey (CSS
+// --rain-track; colour stays reserved for temperature),
 // positioned the way the thumb travels (half a thumb in at each end).
 function renderRainTrack(wrap) {
   if (!wrap?.style?.setProperty) return;
@@ -929,7 +884,7 @@ function renderRainTrack(wrap) {
   for (const h of rainOutlook()) {
     const k = fcRainStrength(h.mm);
     if (k < 0.15) continue;
-    const c = `rgba(${fcRainRGB(h.mm).join(",")},${(0.35 + 0.65 * k).toFixed(2)})`;
+    const c = `rgba(222, 229, 239, ${(0.25 + 0.6 * k).toFixed(2)})`; // neutral, not a hue
     const a = pos(Math.max(h.from, sliderTicks[sliderLiveIdx])), b = pos(h.to);
     stops.push(`transparent ${a}`, `${c} ${a}`, `${c} ${b}`, `transparent ${b}`);
   }
@@ -945,7 +900,7 @@ function renderRainStatus() {
   if (isFutureView()) {
     el.textContent = fcRainByRadar ? "radar nowcast"
       : !model?.pGrids?.length ? "no model rain"
-      : fcRainMax >= FC_RAIN_MIN_MM ? `model ≈ up to ${fcRainMax.toFixed(1)} mm/h`
+      : fcRainMax >= 0.1 ? `model ≈ up to ${fcRainMax.toFixed(1)} mm/h`
       : "model: dry";
     return;
   }
@@ -1258,7 +1213,7 @@ function renderWindPins() {
     seen.add(p.id);
     const kmh = Math.hypot(p.u, p.v);
     const from = (tailGeom(p).rot + 90 + 180) % 360;
-    const col = "rgba(159, 208, 255, 0.9)";
+    const col = "rgba(222, 229, 239, 0.9)"; // neutral: colour means temperature
     let m = windPins.get(p.id);
     if (!m) {
       m = L.marker([p.lat, p.lon], {
@@ -2392,6 +2347,8 @@ function initMap() {
   const rainPane = map.createPane("rain"); // gauge glyphs + splash circles
   rainPane.style.zIndex = 440;
   map.fitBounds(dataBounds);
+  // forecast rain glyphs are picked from the nodes in view
+  map.on("moveend", () => { if (isFutureView()) renderRain(); });
   // Fully zoomed out = screen completely filled by the data window
   // (inside=true), so the map can never show past the data edge. Recompute
   // when the container changes shape, or a resize would reopen the gap.

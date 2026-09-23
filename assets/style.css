@@ -285,8 +285,8 @@ body { display: flex; flex-direction: column; }
   font-size: 0.72rem;
   color: var(--muted);
 }
-.wind-arrow { width: 14px; height: 14px; fill: var(--accent); flex-shrink: 0; }
-.wind-row .wind-speed { color: var(--accent); font-weight: 600; }
+.wind-arrow { width: 14px; height: 14px; fill: #c9d2df; flex-shrink: 0; }
+.wind-row .wind-speed { color: var(--text); font-weight: 600; } /* not a temperature hue */
 .civ-row .station-name { color: var(--muted); }
 
 #station-list { list-style: none; margin: 0; padding: 0 0 0.5rem; }
@@ -409,21 +409,20 @@ body { display: flex; flex-direction: column; }
 }
 .civ-marker.selected .civ-dot { outline: 2px solid #fff; }
 
-/* rain gauges: droplet centred on the gauge, splash circle drawn by Leaflet */
+/* rain: 🌧️ glyph centred on the gauge (size/opacity set inline by
+   intensity); no colour — colour on the map means temperature only */
 .rain-icon {
   display: inline-block;
-  line-height: 0;
+  font-size: 15px;
+  line-height: 1;
   transform: translate(-50%, -50%);
   filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.7));
 }
-.rain-icon svg { fill: #9ed4ff; stroke: rgba(255, 255, 255, 0.85); stroke-width: 1.2; }
-.rain-icon.dim { opacity: 0.55; }
-
-/* model precipitation (future half): fine diagonal stripes mark it as a
-   forecast field rather than a radar image */
-.rain-forecast {
-  -webkit-mask-image: repeating-linear-gradient(135deg, #000 0 6px, rgba(0, 0, 0, 0.62) 6px 8px);
-  mask-image: repeating-linear-gradient(135deg, #000 0 6px, rgba(0, 0, 0, 0.62) 6px 8px);
+/* forecast glyph: dashed ring, the same "estimate" mark as .temp-pill.fc */
+.rain-icon.fc {
+  padding: 3px;
+  border: 1.5px dashed rgba(222, 229, 239, 0.7);
+  border-radius: 50%;
 }
 
 /* wind direction: a windsock wedge growing out from under the marker,
@@ -448,7 +447,7 @@ body { display: flex; flex-direction: column; }
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: #9fd0ff;
+  background: #dee5ef; /* neutral: colour means temperature */
   border: 1.5px solid rgba(255, 255, 255, 0.85);
   transform: translate(-50%, -50%);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);

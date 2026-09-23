@@ -100,18 +100,19 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
   count scales with covered grid cells (so no "swarm" at low coverage).
 - **Hybrid markers**: NEA stations reporting both temp and wind get a
   temperature-coloured "windsock" wedge on the pill.
-- **Rain**: glyph + intensity-coloured circle per wet gauge (24h series,
-  scrubbable); future = one bicubic-interpolated model-precipitation raster
-  (`renderForecastRain`, CSS-striped `.rain-forecast`) in radar-like
-  green→yellow→red (`fcRainRGB`; the first pale-blue version was mistaken
-  for "cool" temperature shading), visible from ~0.3 mm/h (`fcRainStrength`
-  — a 10km cell averages showers down that low), suppressed while a radar
-  nowcast frame covers the time. `rainOutlook()` paints forecast rain hours
-  onto the slider track (`--rain-track`) and the footer ("model: showers
-  ~12 pm–4 pm"), so it's visible from the live view. Never go back to a marker per grid
-  node: widespread-rain hours wet 40-54 of the 54 nodes and the map turns
-  into a lattice of circles. `?testrain` URL param injects
-  synthetic gauges for visual testing.
+- **Rain**: 🌧️ glyphs only, sized/faded by intensity — **no rain colour**
+  (owner's rule: colour means temperature). Observed gauges get a glyph +
+  neutral grey splash ring (24h series, scrubbable). Future = sparse model
+  glyphs with a dashed ring (`forecastRainIcons`): greedy wettest-first
+  pick among grid nodes in the current view, ≥14 km apart, max 10, fixed
+  per-node offset so uniform rain doesn't read as a grid; re-picked on
+  `moveend`. Never one glyph per node (widespread-rain hours wet 40-54 of
+  54 → lattice). Suppressed while a radar nowcast frame covers the time.
+  Tried and rejected: a pale-blue raster (read as "cool"), then a
+  radar-palette raster (owner: colours are for temperature only).
+  `rainOutlook()` marks forecast rain hours on the slider track in neutral
+  grey (`--rain-track`) and the footer ("model: showers ~12 pm–4 pm").
+  `?testrain` URL param injects synthetic gauges for visual testing.
 - **Radar**: one persistent preloaded Leaflet layer per frame; scrubbing only
   flips opacity (anything that reloads tiles on scrub causes visible fading).
 - **Mobile**: `invalidateSize()` after layout settles (else the map stays
@@ -124,6 +125,9 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
   gull, waves, travelling ripple, playback timelapse, cloud sprites).
 - Wants honest data: forecast/estimates visibly marked, gaps shown as gaps.
 - Dark map; subtle, low-opacity overlays; real-looking imagery.
+- **Colour on the map means temperature, strictly.** Rain is glyphs, wind
+  pins and list wind rows are neutral grey. (The RainViewer radar layer
+  is the one exception — its own palette, toggleable.)
 - Uses the site a lot on a phone — check the mobile layout for UI changes.
   The phone timebar's first row must fit the "≈ Wed 06:05 pm" forecast
   label, or the bar grows a row whenever you scrub into the future.
