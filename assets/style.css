@@ -179,8 +179,8 @@ body { display: flex; flex-direction: column; }
 }
 
 /* Custom track: observed past solid, forecast future striped (the same
-   "estimate" language as the dashed pills and the model rain), with faint
-   6-hour ticks. */
+   "estimate" language as the dashed pills and the model rain); hours with
+   forecast rain are painted over it in the rain colours (--rain-track). */
 #time-slider {
   -webkit-appearance: none;
   appearance: none;
@@ -198,6 +198,7 @@ body { display: flex; flex-direction: column; }
   height: 6px;
   border-radius: 3px;
   background:
+    var(--rain-track, linear-gradient(transparent, transparent)),
     linear-gradient(90deg, #3d5a80 0 var(--live-x), transparent var(--live-x)),
     repeating-linear-gradient(135deg, #34405e 0 3px, #222b42 3px 6px);
 }
@@ -205,6 +206,7 @@ body { display: flex; flex-direction: column; }
   height: 6px;
   border-radius: 3px;
   background:
+    var(--rain-track, linear-gradient(transparent, transparent)),
     linear-gradient(90deg, #3d5a80 0 var(--live-x), transparent var(--live-x)),
     repeating-linear-gradient(135deg, #34405e 0 3px, #222b42 3px 6px);
 }

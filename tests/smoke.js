@@ -147,6 +147,7 @@ const h = new Function(src + `
     fcRain: () => ({ shown: !!fcRainLayer && fcRainLayer.opacity > 0, max: fcRainMax }),
     radarLayerCount: () => radarLayers.size,
     windGridOk: () => { ensureWindField(); return !!windGridU; },
+    rainOutlookText, fcRainStrength,
   };`)();
 
 (async () => {
@@ -206,6 +207,11 @@ const h = new Function(src + `
   h.goLive();
   console.assert(h.rainCount() === 1, "back to observed rain at live:", h.rainCount());
   console.assert(!h.fcRain().shown, "forecast rain hidden at live");
+
+  // forecast rain must be clearly visible at typical model rates (a 10km
+  // cell averages a shower down to ~0.3-1 mm/h), and show in the outlook
+  console.assert(h.fcRainStrength(0.3) > 0.3 && h.fcRainStrength(1) > 0.55, "model rain visibility");
+  console.assert(/^model: showers now–/.test(h.rainOutlookText()), "rain outlook:", h.rainOutlookText());
 
   // CARTO serves watermarked tiles (HTTP 200, no error) without a key
   const baseUrl = tileUrls.find((u) => u.includes("basemaps.cartocdn.com"));
