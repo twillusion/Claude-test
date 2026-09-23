@@ -19,7 +19,13 @@ const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
 const HISTORY_HOURS = 24;
 // Shown in the footer; bump together with the ?v= stamps in index.html so a
 // glance settles "am I looking at the new build or a stale cache?"
-const APP_VERSION = "20260923a";
+const APP_VERSION = "20260923b";
+
+// CARTO basemap key. Since Aug 2026 basemaps.cartocdn.com answers keyless
+// requests with HTTP 200 tiles that have "API KEY REQUIRED" burned in, so
+// Leaflet sees no error. Free key: carto.com/basemaps/apikey. Tile keys are
+// public by design (every tile URL carries it), so it lives here.
+const CARTO_KEY = "";
 
 const SLIDER_STEP_MIN = 5; // scrubber granularity; underlying data is per-minute
 
@@ -312,6 +318,7 @@ function setShadeMode(text) {
 
 function modelLoaded(source) {
   if (typeof localStorage !== "undefined") saveModelCache();
+  windFieldT = NaN; // a forecast wind grid may have been built from the old model
   setShadeMode(`Open-Meteo model + station correction (${source})`);
   rebuild(); // the slider grows its forecast ticks from the model times
   scheduleRender();
@@ -325,6 +332,7 @@ async function refreshModel() {
   } catch { /* no data file yet, or stale — fall through */ }
   if (!model && typeof localStorage !== "undefined" && loadModelCache()) {
     setShadeMode("Open-Meteo model + station correction (cached)");
+    windFieldT = NaN;
     rebuild();
     scheduleRender();
     return; // fresh enough; the next interval tick refetches
@@ -412,6 +420,10 @@ function updateWindField() {
   windFieldT = displayedT === null ? Infinity : displayedT;
   windVectors = [];
   windVectorsById.clear();
+  // The future is the model's, like temperature. Station readings used to
+  // persist 90 min into it and then the grid went empty — the particle
+  // loop stopped drawing and left its last frame frozen on screen.
+  if (isFutureView()) { buildModelWindGrid(); return; }
   for (const st of windStations.values()) {
     const arr = st.series;
     if (!arr.length) continue;
@@ -464,6 +476,26 @@ function buildWindGrid() {
       const i = iy * nx + ix;
       if (nearest > cover2) { windGridU[i] = NaN; windGridV[i] = NaN; }
       else { windGridU[i] = u / wSum; windGridV[i] = v / wSum; }
+    }
+  }
+}
+
+// Forecast wind: the model field at the displayed time, resampled onto the
+// same grid so particles, socks and pins read it exactly like observations.
+function buildModelWindGrid() {
+  if (!model?.uGrids?.length || displayedT === null) { windGridU = null; windGridV = null; return; }
+  const u = blendGrids(model.uGrids, displayedT), v = blendGrids(model.vGrids, displayedT);
+  const { nx, ny } = WGRID;
+  windGridU = new Float32Array(nx * ny);
+  windGridV = new Float32Array(nx * ny);
+  for (let iy = 0; iy < ny; iy++) {
+    const lat = OVERLAY.latMax - ((iy + 0.5) / ny) * (OVERLAY.latMax - OVERLAY.latMin);
+    for (let ix = 0; ix < nx; ix++) {
+      const lon = OVERLAY.lonMin + ((ix + 0.5) / nx) * (OVERLAY.lonMax - OVERLAY.lonMin);
+      const uu = gridSample(u, lat, lon), vv = gridSample(v, lat, lon);
+      const i = iy * nx + ix;
+      windGridU[i] = uu ?? NaN;
+      windGridV[i] = vv ?? NaN;
     }
   }
 }
@@ -1183,6 +1215,9 @@ function renderWindStatus() {
   if (windVectors.length) {
     for (const p of windVectors) { u += p.u; v += p.v; n++; }
     src = ` (${windVectors.length} stations)`;
+  } else if (displayedT !== null && !isFutureView()) {
+    el.textContent = "no observations at this time"; // the particles stop too
+    return;
   } else if (windU) {
     for (let i = 0; i < windU.length; i++) {
       if (!Number.isNaN(windU[i]) && !Number.isNaN(windV[i])) { u += windU[i]; v += windV[i]; n++; }
@@ -1980,7 +2015,13 @@ function startWind() {
     if (!windOn || document.hidden) { last = ts; return; }
     ensureWindField();
     const budget = windBudget();
-    if (!budget) { last = ts; return; }
+    if (!budget) {
+      // no field here (e.g. a past hour with no observations): show nothing
+      // rather than leaving the last frame frozen on screen
+      windCtx.clearRect(0, 0, windCanvas.width, windCanvas.height);
+      last = ts;
+      return;
+    }
     if (spawnedFor < 0 || windStations.size >= spawnedFor + 3) {
       spawnedFor = windStations.size;
       windParts.forEach((p) => spawnPart(p));
@@ -2264,7 +2305,12 @@ function initMap() {
   // single dark basemap; daytime just brightens it slightly via a CSS
   // filter on the tile pane (no second tile set, no hue clash with the
   // temperature ramp)
-  L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", tileOpts).addTo(map);
+  L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png" +
+    (CARTO_KEY ? `?key=${encodeURIComponent(CARTO_KEY)}` : ""), tileOpts).addTo(map);
+  // the watermarked tiles load "fine", so say it out loud
+  const baseEl = document.getElementById("basemap-status");
+  if (baseEl) baseEl.textContent = CARTO_KEY ? "CARTO" : "CARTO — no API key, tiles watermarked";
+  if (!CARTO_KEY) console.warn("[sgtemp] CARTO_KEY is empty: basemap tiles will show an API KEY REQUIRED watermark");
 
   // Mobile browsers finish laying out the container (vh units, the dynamic
   // address bar) after L.map() has already measured it — leaving the map
