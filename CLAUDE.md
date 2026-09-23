@@ -41,6 +41,11 @@ humans; this file is the working knowledge for continuing development.
 6. Tell the owner the new version string; the footer shows it, so they can
    confirm the deploy (phones: fully close and reopen the tab).
 
+Visual checks: Playwright + the pre-installed Chromium work in the sandbox.
+Serve the repo locally and `page.route` every external host to mocks (the
+smoke test's fixtures are a good start); screenshot desktop and a 390px
+phone viewport, live and scrubbed into the forecast.
+
 The sandbox **cannot reach** data.gov.sg, Open-Meteo, RainViewer, GitHub
 Pages or githack (proxy allowlist). All API behaviour is verified via the
 smoke test's mocks plus the owner's reports — ask them to read the footer.
@@ -87,7 +92,11 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
 - **Hybrid markers**: NEA stations reporting both temp and wind get a
   temperature-coloured "windsock" wedge on the pill.
 - **Rain**: glyph + intensity-coloured circle per wet gauge (24h series,
-  scrubbable); future = dashed model patches. `?testrain` URL param injects
+  scrubbable); future = one bicubic-interpolated model-precipitation raster
+  (`renderForecastRain`, CSS-striped `.rain-forecast`), suppressed while a
+  radar nowcast frame covers the time. Never go back to a marker per grid
+  node: widespread-rain hours wet 40-54 of the 54 nodes and the map turns
+  into a lattice of circles. `?testrain` URL param injects
   synthetic gauges for visual testing.
 - **Radar**: one persistent preloaded Leaflet layer per frame; scrubbing only
   flips opacity (anything that reloads tiles on scrub causes visible fading).
@@ -102,6 +111,8 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
 - Wants honest data: forecast/estimates visibly marked, gaps shown as gaps.
 - Dark map; subtle, low-opacity overlays; real-looking imagery.
 - Uses the site a lot on a phone — check the mobile layout for UI changes.
+  The phone timebar's first row must fit the "≈ Wed 06:05 pm" forecast
+  label, or the bar grows a row whenever you scrub into the future.
 - Iterates via screenshots; give a short explanation of *why* something
   broke along with the fix.
 

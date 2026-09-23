@@ -74,12 +74,14 @@ static page, no backend, no hosting costs.
   polls. Only the number displays refresh (no overlay re-rasterization),
   and it pauses when the tab is hidden.
 - Rain: 5-minute rainfall totals from NEA's ~60 gauges (polled every 5
-  minutes, kept as a 24h series) render as a glyph + intensity-coloured
+  minutes, kept as a 24h series) render as a droplet + intensity-coloured
   splash circle per wet gauge; a gauge stays marked (faded) for 30 minutes
   after rain stops. The time scrubber replays the day's rain; scrubbing
   into the future switches to the Open-Meteo precipitation forecast,
-  drawn as larger dashed patches at the model's ~10km cells. The footer
-  shows wet-gauge count and peak intensity.
+  drawn as one smooth, faintly striped blue field interpolated from the
+  model's ~10km grid (hidden while a RainViewer nowcast frame covers the
+  time). The footer shows wet-gauge count and peak intensity, or the
+  model's peak rate in the future.
 - Radar: RainViewer's precipitation composite (smoothed NEXRAD palette,
   512px tiles) as preloaded per-frame layers — the scrubber flips between
   the ~2h archive and ~30min nowcast with no reload flicker; the RADAR

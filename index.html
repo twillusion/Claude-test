@@ -3,23 +3,25 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SG Temp — Live Singapore Temperature</title>
-  <meta name="description" content="Live air temperature across Singapore's weather stations, with a 24-hour rolling view. Data from NEA via data.gov.sg.">
+  <title>SG Temp — Live Singapore Weather</title>
+  <meta name="description" content="Live temperature, wind, rain and radar across Singapore, with 24 hours of history and a 24-hour forecast. Data from NEA via data.gov.sg and Open-Meteo.">
+  <meta name="theme-color" content="#161d2e">
   <link rel="preconnect" href="https://api.data.gov.sg" crossorigin>
   <link rel="preconnect" href="https://api-open.data.gov.sg" crossorigin>
-  <link rel="preconnect" href="https://a.basemaps.cartocdn.com" crossorigin>
+  <link rel="preconnect" href="https://a.basemaps.cartocdn.com">
+  <link rel="preconnect" href="https://tilecache.rainviewer.com">
   <!-- Leaflet is vendored: same-origin assets can't be rate-limited by a
        third-party CDN, which used to break the whole layout -->
   <link rel="stylesheet" href="assets/vendor/leaflet/leaflet.css">
   <!-- bump ?v= whenever style.css or app.js changes: stale cached assets
        under a fresh index.html render a broken hybrid of old and new -->
-  <link rel="stylesheet" href="assets/style.css?v=20260702b">
+  <link rel="stylesheet" href="assets/style.css?v=20260923a">
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
       <h1>SG Temp</h1>
-      <span class="subtitle">live island temperature</span>
+      <span class="subtitle">live island weather</span>
     </div>
     <div class="summary" id="summary">
       <div class="stat"><span class="stat-value" id="stat-min">–</span><span class="stat-label">coolest</span></div>
@@ -86,19 +88,18 @@
   </main>
 
   <footer class="footer">
-    Data: <a href="https://data.gov.sg" target="_blank" rel="noopener">NEA via data.gov.sg</a>
-    (<a href="https://data.gov.sg/open-data-licence" target="_blank" rel="noopener">Singapore Open Data Licence</a>)
-    · shading: <span id="shade-mode">stations only</span>,
-    model grid by <a href="https://open-meteo.com" target="_blank" rel="noopener">Open-Meteo</a>
-    · wind <span id="wind-status">–</span>
-    · rain <span id="rain-status">…</span>
-    · radar <span id="sat-status">…</span>
-    · community <span id="civ-status">…</span>
-    · refreshes every minute
-    · v<span id="app-version">?</span>
+    <span class="fi">Data: <a href="https://data.gov.sg" target="_blank" rel="noopener">NEA via data.gov.sg</a>
+      (<a href="https://data.gov.sg/open-data-licence" target="_blank" rel="noopener">licence</a>),
+      model <a href="https://open-meteo.com" target="_blank" rel="noopener">Open-Meteo</a></span>
+    <span class="fi"><b>shading</b> <span id="shade-mode">stations only</span></span>
+    <span class="fi"><b>wind</b> <span id="wind-status">–</span></span>
+    <span class="fi"><b>rain</b> <span id="rain-status">…</span></span>
+    <span class="fi"><b>radar</b> <span id="radar-status">…</span></span>
+    <span class="fi"><b>community</b> <span id="civ-status">…</span></span>
+    <span class="fi version">v<span id="app-version">?</span></span>
   </footer>
 
   <script src="assets/vendor/leaflet/leaflet.js"></script>
-  <script src="assets/app.js?v=20260702b"></script>
+  <script src="assets/app.js?v=20260923a"></script>
 </body>
 </html>
