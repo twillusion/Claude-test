@@ -70,6 +70,10 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
   tier: URL zoom capped at 7 (beyond → a literal "Zoom Level Not Supported"
   tile); we use 512px tiles + `zoomOffset -1`. ~2h past frames + ~30min
   nowcast. Its satellite product is retired ("no frames").
+- **CARTO basemap** (`dark_all`): since Aug 2026 keyless requests get
+  HTTP 200 tiles with "API KEY REQUIRED" burned in — no tileerror, so it
+  fails silently. Key goes in `CARTO_KEY` (app.js, public by design; free
+  at carto.com/basemaps/apikey). Footer "basemap" item says when it's missing.
 - **Sensor.Community**: wired in, but has no sensors in Singapore
   (footer: "community none in range").
 - NASA GIBS Himawari IR was tried for clouds and abandoned (2km blocks,
@@ -81,7 +85,10 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
   (`sliderLiveIdx`, marked by a dotted green line on `.slider-wrap::after`).
   `displayedT === null` means live. `isFutureView()` switches pills to the
   model (bias-corrected by each station's current offset, dashed `.fc`
-  pills, "≈" time label), wind to the model field, rain to model patches.
+  pills, "≈" time label), wind to the model field (`buildModelWindGrid`,
+  from the first future tick), rain to the model raster. Every view must
+  yield a wind grid or an empty canvas — an empty grid once left the
+  particle canvas frozen on its last frame past +90 min.
 - **Temperature shading**: model grid + IDW station residuals, rasterized to
   a canvas image overlay; colour ramp normalized to on-screen min/max with a
   2°C minimum span; alpha is ~0 near the scale midpoint (transparent middle).

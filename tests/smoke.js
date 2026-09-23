@@ -144,6 +144,7 @@ const h = new Function(src + `
     rainCount: () => rainLayer.size,
     fcRain: () => ({ shown: !!fcRainLayer && fcRainLayer.opacity > 0, max: fcRainMax }),
     radarLayerCount: () => radarLayers.size,
+    windGridOk: () => { ensureWindField(); return !!windGridU; },
   };`)();
 
 (async () => {
@@ -188,6 +189,9 @@ const h = new Function(src + `
   for (const v of fut.values()) console.assert(Math.abs(v - MODEL_TEMP) < 3, "forecast temp:", v);
   const fw = h.windVecAt(1.35, 103.85);
   console.assert(fw && Math.abs(fw.u + 10) < 0.5, "future wind from model:", fw);
+  // particles need a grid far into the future too (it used to go empty past
+  // +90 min, freezing the animation on its last frame)
+  console.assert(h.windGridOk(), "forecast wind grid exists at +24h");
   // model rain is one continuous field, not a marker per grid node (that
   // tiled the map with a lattice of circles on widespread-rain hours)
   const fr = h.fcRain();
