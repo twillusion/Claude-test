@@ -75,6 +75,12 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
   the grid dimensions into the file (`grid: {nlat, nlon}`) and the page
   adopts them (`GRID_NLAT/NLON` are `let`); a file without `grid` is the
   legacy 6×9. `OVERLAY` must match in both files.
+- **Radar sources** (`RADAR_SOURCES`, first whose pixels decode wins):
+  **LibreWXR** public instance (`api.librewxr.net/public/weather-maps.json`,
+  open-source RainViewer-compatible API; MET Malaysia 12-radar composite
+  for Peninsular Malaysia + Singapore, ~2.5 km, 10-min), then RainViewer.
+  We ignore LibreWXR's own 60-min nowcast frames (they'd seam against
+  ours). Footer names the source and any fallback reason.
 - **RainViewer** radar. Free tier since Jan 2026: ~2h of past frames only
   (**no nowcast frames**), zoom ≤ 7, possibly a single colour scheme, PNG.
   We fetch colour scheme 0 (dBZ in red: `(R & 127) − 32`) as two z7 512px
@@ -114,13 +120,21 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
   temperature-coloured "windsock" wedge on the pill.
 - **Rain clouds** (`renderClouds`, pane `clouds`): one neutral grey-white
   raster aligned to the radar pixels, from `rainContext(t)`:
-  past/live = the decoded radar frame; future = **our own nowcast** —
-  block-matching the latest frame against the one ~20 min earlier
-  (`blockMotion`/`motionField`, 4× downsampled) and advecting the latest
-  frame along it (`nowcastRate`, semi-Lagrangian, e-folding 100 min),
-  blended into the model from +45 min to +2h, then model only (bicubic,
-  `gridSampleCubic`). It can't create new storms — that's the model's job.
-  The owner wants to *see rain roll over the island*: this is the feature.
+  past/live = the decoded radar frame; future = **our own nowcast**:
+  motion by block-matching the latest frame against the one ~20 min
+  earlier (`blockMotion`/`motionField`, 4× downsampled), then **ANVIL**
+  (`buildAnvil`, Pulkkinen et al. 2020, ported from pySTEPS
+  `nowcasts/anvil.py`): last 4 frames → Lagrangian coords → 6-level FFT
+  Gaussian cascade → per-level ARI(2,1) on frame differences with
+  moving-window (σ≈50 km) correlations → iterated every 10 min to +2h on a
+  512×256 grid (~1.2 km), growth capped at 1.5× the observed peak, no new
+  rain outside observed areas (ANVIL's rainrate mask). Display advects the
+  Lagrangian field by the lead time (`nowcastRate`). Before 4 frames exist:
+  plain advection with fading. Blended into the model +45 min → +2h, then
+  model only (bicubic). Why ANVIL: pure advection "looked wonky" (no
+  growth/decay); S-PROG smooths features away; LINDA (cell-based) is ~5×
+  the code; DGMR/MetNet need GPUs + weights. The owner wants to *see rain
+  roll over the island and grow/decay*: this is the feature.
 - **Rain glyphs**: 🌧️ at the real gauge positions, **no rain colour**
   (owner's rule: colour means temperature). Past/live = observed gauges
   (glyph + neutral grey ring). Future = gauges the cloud field reaches at

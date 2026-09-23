@@ -83,7 +83,7 @@ global.fetch = async (url) => {
     });
     return ok([mk(777, 29.5, 60_000), mk(888, 39.0, 60_000), mk(999, 55, 60_000, "humidity")]);
   }
-  if (u.host === "api.rainviewer.com") {
+  if (u.host === "api.rainviewer.com" || u.host === "api.librewxr.net") {
     const now = Math.floor(Date.now() / 1000);
     return ok({ host: "https://tilecache.rainviewer.com",
       radar: { past: [{ time: now - 600, path: "/v2/radar/a" }, { time: now, path: "/v2/radar/b" }] } });
@@ -149,6 +149,41 @@ const h = new Function(src + `
     windGridOk: () => { ensureWindField(); return !!windGridU; },
     rainOutlookText, fcRainStrength,
     gaugeCount: () => rainLocs.size,
+    // ANVIL: four frames 10 min apart, one cell intensifying, one fading,
+    // both drifting east 1 px/min
+    anvilTest: async () => {
+      radarMode = "pixels";
+      radarHost = "synthetic";
+      const cells = (k) => [[300 + 10 * k, 200, 30 + 6 * k], [600 + 10 * k, 300, 48 - 6 * k]];
+      const mk = (k) => {
+        const g = new Uint8Array(RV_W * RV_H);
+        for (const [cx, cy, dbz] of cells(k)) {
+          for (let y = cy - 40; y <= cy + 40; y++) {
+            for (let x = cx - 40; x <= cx + 40; x++) {
+              const d = Math.hypot(x - cx, y - cy);
+              if (d < 30) g[y * RV_W + x] = Math.round(dbz - 12 * (d / 30) ** 2) + 32;
+            }
+          }
+        }
+        return g;
+      };
+      const now = Math.floor(Date.now() / 1000);
+      radarFrames = [0, 1, 2, 3].map((k) => ({ time: now - (3 - k) * 600, path: "q" + k }));
+      radarGrids.clear();
+      radarFrames.forEach((f, k) => radarGrids.set(f.path, mk(k)));
+      radarMotion = null; anvilCast = null;
+      updateMotion();
+      await updateAnvil();
+      displayedT = now * 1000 + 30 * 60_000;
+      const ctx = rainContext(displayedT);
+      const at = (x, y) => ctx.rate(rvLat(y), rvLon(x));
+      const last = radarGrids.get("q3");
+      return {
+        anvil: ctx.anvil,
+        growNow: RATE_LUT[last[200 * RV_W + 330]], growFc: at(360, 200),
+        fadeNow: RATE_LUT[last[300 * RV_W + 630]], fadeFc: at(660, 300),
+      };
+    },
     // three synthetic radar frames: a round cell moving 1 px/min east
     nowcastTest: () => {
       radarMode = "pixels";
@@ -239,6 +274,14 @@ const h = new Function(src + `
   console.assert(Math.abs(nc.vx - 1) < 0.15 && Math.abs(nc.vy) < 0.15, "nowcast motion ~1 px/min east:", nc);
   console.assert(Math.abs(nc.kmh - 36.7) < 5, "nowcast speed ~37 km/h:", nc.kmh);
   console.assert(nc.src === "nowcast" && nc.ahead > 3 && nc.behind === 0, "cell advected east at +30 min:", nc);
+  h.goLive();
+
+  // ANVIL: growth and decay carry on along the motion
+  const an = await h.anvilTest();
+  console.assert(an.anvil, "ANVIL nowcast built:", an);
+  console.assert(an.growFc > an.growNow * 1.15, "intensifying cell keeps growing:", an);
+  console.assert(an.fadeFc < an.fadeNow * 0.85, "fading cell keeps decaying:", an);
+  console.assert(an.growFc <= 1.5 * 36.5 + 5 + 0.01, "growth capped at 1.5x the observed peak:", an);
   h.goLive();
 
   // CARTO serves watermarked tiles (HTTP 200, no error) without a key
