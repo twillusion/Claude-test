@@ -72,8 +72,9 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
   nowcast. Its satellite product is retired ("no frames").
 - **CARTO basemap** (`dark_all`): since Aug 2026 keyless requests get
   HTTP 200 tiles with "API KEY REQUIRED" burned in — no tileerror, so it
-  fails silently. Key goes in `CARTO_KEY` (app.js, public by design; free
-  at carto.com/basemaps/apikey). Footer "basemap" item says when it's missing.
+  fails silently. The owner's free key is in `CARTO_KEY` (app.js; public by
+  design, free tier 5M tiles/month); the smoke test asserts the tile URL
+  carries it, and the footer "basemap" item says when it's missing.
 - **Sensor.Community**: wired in, but has no sensors in Singapore
   (footer: "community none in range").
 - NASA GIBS Himawari IR was tried for clouds and abandoned (2km blocks,

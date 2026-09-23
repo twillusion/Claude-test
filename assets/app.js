@@ -19,13 +19,13 @@ const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
 const HISTORY_HOURS = 24;
 // Shown in the footer; bump together with the ?v= stamps in index.html so a
 // glance settles "am I looking at the new build or a stale cache?"
-const APP_VERSION = "20260923b";
+const APP_VERSION = "20260923c";
 
 // CARTO basemap key. Since Aug 2026 basemaps.cartocdn.com answers keyless
 // requests with HTTP 200 tiles that have "API KEY REQUIRED" burned in, so
 // Leaflet sees no error. Free key: carto.com/basemaps/apikey. Tile keys are
 // public by design (every tile URL carries it), so it lives here.
-const CARTO_KEY = "";
+const CARTO_KEY = "cb1_3ukn_1_5f35370e75fa8d0784a66b5a";
 
 const SLIDER_STEP_MIN = 5; // scrubber granularity; underlying data is per-minute
 

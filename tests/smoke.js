@@ -38,12 +38,14 @@ global.L = {
     getPane(n) { return this.panes[n]; },
   }),
   latLngBounds: () => ({ pad() { return this; } }),
-  tileLayer: () => ({ addTo() { return this; }, on() {}, once(e, fn) { fn(); }, remove() {}, setUrl() {}, setOpacity(v) { this.opacity = v; } }),
+  tileLayer: (url) => ({ url, addTo() { return this; }, on() {}, once(e, fn) { fn(); }, remove() {}, setUrl() {}, setOpacity(v) { this.opacity = v; } }),
   circle: () => ({ addTo() { return this; }, setRadius() {}, setStyle() {}, remove() {} }),
   divIcon: (o) => o,
   marker: () => ({ on() {}, addTo() { return this; }, setIcon() {}, bindTooltip() {}, remove() {} }),
   imageOverlay: () => ({ addTo() { return this; }, setUrl() {}, opacity: 1, setOpacity(v) { this.opacity = v; } }),
 };
+const tileUrls = [];
+{ const tl = global.L.tileLayer; global.L.tileLayer = (url, o) => { tileUrls.push(url); return tl(url, o); }; }
 global.setInterval = () => {};
 global.requestAnimationFrame = () => {}; // don't run the wind loop in tests
 
@@ -204,6 +206,10 @@ const h = new Function(src + `
   h.goLive();
   console.assert(h.rainCount() === 1, "back to observed rain at live:", h.rainCount());
   console.assert(!h.fcRain().shown, "forecast rain hidden at live");
+
+  // CARTO serves watermarked tiles (HTTP 200, no error) without a key
+  const baseUrl = tileUrls.find((u) => u.includes("basemaps.cartocdn.com"));
+  console.assert(baseUrl && /[?&]key=[^&]+/.test(baseUrl), "CARTO basemap URL carries the key:", baseUrl);
 
   // day/night: noon SGT bright, midnight SGT dark
   const base = Math.floor(Date.now() / 86400e3) * 86400e3; // 00:00 UTC = 08:00 SGT
