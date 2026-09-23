@@ -42,7 +42,7 @@ global.L = {
   circle: () => ({ addTo() { return this; }, setRadius() {}, setStyle() {}, remove() {} }),
   divIcon: (o) => o,
   marker: () => ({ on() {}, addTo() { return this; }, setIcon() {}, bindTooltip() {}, remove() {} }),
-  imageOverlay: () => ({ addTo() { return this; }, setUrl() {} }),
+  imageOverlay: () => ({ addTo() { return this; }, setUrl() {}, opacity: 1, setOpacity(v) { this.opacity = v; } }),
 };
 global.setInterval = () => {};
 global.requestAnimationFrame = () => {}; // don't run the wind loop in tests
@@ -140,8 +140,9 @@ const h = new Function(src + `
     goLive: () => { displayedT = null; renderAll(); return displayedValues(displayedTime()); },
     liveIdx: () => sliderLiveIdx,
     futureView: () => isFutureView(),
-    windVecAt, fetchWind, fetchRain, fetchSatellite, fetchCommunity, extremeness, dayFactor,
+    windVecAt, fetchWind, fetchRain, fetchRadar, fetchCommunity, extremeness, dayFactor,
     rainCount: () => rainLayer.size,
+    fcRain: () => ({ shown: !!fcRainLayer && fcRainLayer.opacity > 0, max: fcRainMax }),
     radarLayerCount: () => radarLayers.size,
   };`)();
 
@@ -172,7 +173,7 @@ const h = new Function(src + `
   console.assert(h.rainCount() === 1, "one wet gauge rendered:", h.rainCount());
 
   // radar: frame layers created
-  await h.fetchSatellite();
+  await h.fetchRadar();
   console.assert(h.radarLayerCount() >= 1, "radar frame layers:", h.radarLayerCount());
 
   // community: 1 kept, outlier and non-temperature dropped
@@ -180,16 +181,25 @@ const h = new Function(src + `
   console.assert(stations.has("civ-777") && !stations.has("civ-888") && !stations.has("civ-999"),
     "community filtering");
 
-  // forecast half: model temp, model wind, model precipitation patches
+  // forecast half: model temp, model wind, model precipitation field
   console.assert(sliderTicks.length > h.liveIdx() + 100, "forecast ticks:", sliderTicks.length);
   const fut = h.scrubTo(sliderTicks.length - 1);
   console.assert(h.futureView(), "future view");
   for (const v of fut.values()) console.assert(Math.abs(v - MODEL_TEMP) < 3, "forecast temp:", v);
   const fw = h.windVecAt(1.35, 103.85);
   console.assert(fw && Math.abs(fw.u + 10) < 0.5, "future wind from model:", fw);
-  console.assert(h.rainCount() >= 40, "forecast rain patches:", h.rainCount());
+  // model rain is one continuous field, not a marker per grid node (that
+  // tiled the map with a lattice of circles on widespread-rain hours)
+  const fr = h.fcRain();
+  console.assert(fr.shown && Math.abs(fr.max - 2) < 0.01, "forecast rain field:", fr);
+  console.assert(h.rainCount() === 0, "no per-cell rain markers in the future:", h.rainCount());
+  // +15 min: past the fixture's last reading (day files run to now+10min),
+  // still within 15 min of the newest radar frame
+  h.scrubTo(h.liveIdx() + 3);
+  console.assert(h.futureView() && !h.fcRain().shown, "radar beats model rain near now");
   h.goLive();
   console.assert(h.rainCount() === 1, "back to observed rain at live:", h.rainCount());
+  console.assert(!h.fcRain().shown, "forecast rain hidden at live");
 
   // day/night: noon SGT bright, midnight SGT dark
   const base = Math.floor(Date.now() / 86400e3) * 86400e3; // 00:00 UTC = 08:00 SGT

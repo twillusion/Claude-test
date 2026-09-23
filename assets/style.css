@@ -39,7 +39,7 @@ body { display: flex; flex-direction: column; }
 .stat-label { font-size: 0.65rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
 
 .refresh { font-size: 0.7rem; color: var(--muted); min-width: 7rem; text-align: right; }
-.refresh.loading { color: var(--accent); animation: blink 1.4s ease-in-out infinite; }
+.refresh.loading { color: var(--accent); }
 
 .banner {
   padding: 0.5rem 1rem;
@@ -144,18 +144,19 @@ body { display: flex; flex-direction: column; }
   cursor: pointer;
   font-size: 0.9rem;
 }
+/* steady dot, no blink: nothing on the page pulses */
 #live-btn.active::before {
-  content: "●";
-  margin-right: 4px;
-  animation: blink 2s ease-in-out infinite;
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  margin-right: 5px;
+  vertical-align: 1px;
 }
 
 #sky-icon { font-size: 0.85rem; line-height: 1; }
-
-@keyframes blink {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.25; }
-}
 
 /* wind streaklines: above tiles and shading (z 200/400), below markers (600) */
 /* lives inside the windParticles map pane; Leaflet positions it via
@@ -168,8 +169,66 @@ body { display: flex; flex-direction: column; }
 }
 
 
-.slider-wrap { flex: 1; min-width: 0; position: relative; display: flex; align-items: center; }
-#time-slider { flex: 1; accent-color: var(--accent); min-width: 0; width: 100%; }
+.slider-wrap {
+  flex: 1; min-width: 0; position: relative; display: flex; align-items: center;
+  /* LIVE position (0-1) along the track, set by renderTimebar; the thumb
+     centre travels from half a thumb in at each end, so map it the same way */
+  --live-frac: 1;
+  --thumb: 16px;
+  --live-x: calc(var(--thumb) / 2 + (100% - var(--thumb)) * var(--live-frac));
+}
+
+/* Custom track: observed past solid, forecast future striped (the same
+   "estimate" language as the dashed pills and the model rain), with faint
+   6-hour ticks. */
+#time-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: 1;
+  min-width: 0;
+  width: 100%;
+  height: 22px;
+  margin: 0;
+  background: transparent;
+  cursor: pointer;
+}
+#time-slider:focus { outline: none; }
+#time-slider:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 3px rgba(94, 193, 255, 0.35); }
+#time-slider::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 3px;
+  background:
+    linear-gradient(90deg, #3d5a80 0 var(--live-x), transparent var(--live-x)),
+    repeating-linear-gradient(135deg, #34405e 0 3px, #222b42 3px 6px);
+}
+#time-slider::-moz-range-track {
+  height: 6px;
+  border-radius: 3px;
+  background:
+    linear-gradient(90deg, #3d5a80 0 var(--live-x), transparent var(--live-x)),
+    repeating-linear-gradient(135deg, #34405e 0 3px, #222b42 3px 6px);
+}
+#time-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: var(--thumb);
+  height: var(--thumb);
+  margin-top: calc(3px - var(--thumb) / 2);
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid #0e1320;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+}
+#time-slider::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid #0e1320;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+}
+/* hollow thumb while viewing the forecast */
+.slider-wrap.future #time-slider::-webkit-slider-thumb { background: var(--bg); border: 3px solid var(--accent); }
+.slider-wrap.future #time-slider::-moz-range-thumb { background: var(--bg); border: 3px solid var(--accent); }
 
 #time-label {
   font-size: 0.72rem;
@@ -216,12 +275,15 @@ body { display: flex; flex-direction: column; }
 }
 
 .wind-row .wind-row-dir {
-  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
   width: 70px;
-  height: 14px;
   flex-shrink: 0;
+  font-size: 0.72rem;
+  color: var(--muted);
 }
-.wind-row .wind-row-dir .wind-sock { left: 26px; top: calc(50% - 6.5px); }
+.wind-arrow { width: 14px; height: 14px; fill: var(--accent); flex-shrink: 0; }
 .wind-row .wind-speed { color: var(--accent); font-weight: 600; }
 .civ-row .station-name { color: var(--muted); }
 
@@ -264,14 +326,22 @@ body { display: flex; flex-direction: column; }
 .detail-range { display: flex; justify-content: space-between; margin-top: 0.5rem; font-size: 0.75rem; color: var(--muted); }
 .detail-range strong { color: var(--text); font-variant-numeric: tabular-nums; }
 
+/* status line: one item per source, wrapping as whole items */
 .footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.15rem 1rem;
   padding: 0.4rem 1rem;
-  font-size: 0.7rem;
+  font-size: 0.68rem;
   color: var(--muted);
   background: var(--panel);
   border-top: 1px solid var(--border);
 }
 .footer a { color: var(--accent); text-decoration: none; }
+.footer .fi { white-space: nowrap; }
+.footer .fi b { font-weight: 600; color: #aab5c9; }
+.footer .fi > span { color: var(--text); }
+.footer .fi.version { margin-left: auto; }
 
 /* temperature pill markers on the map */
 .temp-pill {
@@ -298,9 +368,10 @@ body { display: flex; flex-direction: column; }
 .slider-wrap.has-forecast::after {
   content: "";
   position: absolute;
-  left: 50%;
-  top: -3px;
-  bottom: -3px;
+  /* the thumb centre travels between half a thumb from each end */
+  left: var(--live-x);
+  top: 2px;
+  bottom: 2px;
   width: 0;
   border-left: 2px dotted #7fe6a0;
   transform: translateX(-1px);
@@ -336,12 +407,21 @@ body { display: flex; flex-direction: column; }
 }
 .civ-marker.selected .civ-dot { outline: 2px solid #fff; }
 
-/* rain gauges: glyph centred on the gauge, splash circle drawn by Leaflet */
+/* rain gauges: droplet centred on the gauge, splash circle drawn by Leaflet */
 .rain-icon {
   display: inline-block;
-  font-size: 15px;
+  line-height: 0;
   transform: translate(-50%, -50%);
-  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.6));
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.7));
+}
+.rain-icon svg { fill: #9ed4ff; stroke: rgba(255, 255, 255, 0.85); stroke-width: 1.2; }
+.rain-icon.dim { opacity: 0.55; }
+
+/* model precipitation (future half): fine diagonal stripes mark it as a
+   forecast field rather than a radar image */
+.rain-forecast {
+  -webkit-mask-image: repeating-linear-gradient(135deg, #000 0 6px, rgba(0, 0, 0, 0.62) 6px 8px);
+  mask-image: repeating-linear-gradient(135deg, #000 0 6px, rgba(0, 0, 0, 0.62) 6px 8px);
 }
 
 /* wind direction: a windsock wedge growing out from under the marker,
@@ -373,6 +453,28 @@ body { display: flex; flex-direction: column; }
 }
 
 .leaflet-container { font: inherit; }
+
+/* Leaflet's stock controls and tooltips are white; match the dark theme */
+.leaflet-bar { border: 1px solid var(--border) !important; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4) !important; }
+.leaflet-bar a,
+.leaflet-bar a:hover {
+  background: rgba(22, 29, 46, 0.92);
+  color: var(--text);
+  border-bottom-color: var(--border);
+}
+.leaflet-bar a:hover { background: var(--panel-2); }
+.leaflet-bar a.leaflet-disabled { background: rgba(22, 29, 46, 0.92); color: #4a5670; }
+.leaflet-tooltip {
+  background: rgba(22, 29, 46, 0.95);
+  color: var(--text);
+  border: 1px solid var(--border);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+  font-size: 0.72rem;
+}
+.leaflet-tooltip-top::before { border-top-color: var(--border); }
+.leaflet-tooltip-bottom::before { border-bottom-color: var(--border); }
+.leaflet-tooltip-left::before { border-left-color: var(--border); }
+.leaflet-tooltip-right::before { border-right-color: var(--border); }
 
 /* attribution must stay visible (OSM/CARTO licence), but it can be subtle */
 .leaflet-control-attribution {
@@ -411,6 +513,11 @@ body { display: flex; flex-direction: column; }
   #sky-icon { margin-left: auto; } /* push the clock to the right edge of row 1 */
   .slider-wrap { order: 2; flex: 1 0 100%; height: 30px; } /* full-width, taller hit area */
   #time-slider { height: 30px; }
-  #live-btn, #wind-btn, #radar-btn { font-size: 0.74rem; padding: 7px 12px; }
+  .slider-wrap { --thumb: 20px; }
+  .slider-wrap.has-forecast::after { top: 5px; bottom: 5px; }
+  .footer { font-size: 0.62rem; gap: 0.1rem 0.8rem; }
+  /* sized so the "≈ Wed 06:05 pm" forecast label still fits row 1 — else
+     the bar grew a row (and jumped) whenever you scrubbed into the future */
+  #live-btn, #wind-btn, #radar-btn { font-size: 0.72rem; padding: 7px 9px; }
   #time-label { font-size: 0.8rem; }
 }
