@@ -78,7 +78,9 @@ static page, no backend, no hosting costs.
   Past and live, the cloud is RainViewer's radar (decoded from its
   dBZ-encoded tiles, ~0.6 km pixels) and the glyphs are real 5-minute gauge
   readings (radar from LibreWXR's MET Malaysia composite, RainViewer as
-  fallback). Into the future, the site runs its own nowcast: it measures
+  fallback). Further back than the ~2 h radar archive, the clouds are an
+  estimate: the model's own rain for that time, corrected toward what the
+  gauges measured, drawn lighter and labelled "estimated" in the footer. Into the future, the site runs its own nowcast: it measures
   how the rain is moving, then applies ANVIL (Pulkkinen et al. 2020, as in
   pySTEPS) — each spatial scale's recent growth or decay is extrapolated
   with an autoregressive model, locally, so cells keep intensifying or

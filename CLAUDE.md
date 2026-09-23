@@ -154,6 +154,16 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
   growth/decay); S-PROG smooths features away; LINDA (cell-based) is ~5×
   the code; DGMR/MetNet need GPUs + weights. The owner wants to *see rain
   roll over the island and grow/decay*: this is the feature.
+- **Past rain before the radar archive** (−24h … ~−2h, `rainAnalysis`):
+  the model's own rain for that moment corrected toward the NEA gauges
+  (residual IDW like the temperature shading: λ halves influence ~8 km
+  out, d0 2 km; gauge rates = 5-min totals, triangular ±10 min average).
+  Far from gauges (sea, Johor) = model at half strength. Correction built
+  on a 72×48 grid per frame (per-pixel × 60 gauges blew the frame budget;
+  a coarser 48×32 blurred a dry gauge next to a wet one — smoke test).
+  Drawn at 80% opacity, footer "estimated from N gauges + model"; cross-
+  fades into the oldest radar frame over 30 min. Source keys in the cloud
+  cache include `rainSeries.size` so it redraws when the archive lands.
 - **Rain glyphs**: 🌧️ at the real gauge positions, **no rain colour**
   (owner's rule: colour means temperature), each with a **circle of
   effect** (owner asked for it back): radius 0.8–5 km by intensity on one

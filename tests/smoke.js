@@ -151,6 +151,17 @@ const h = new Function(src + `
     windGridOk: () => { ensureWindField(); return !!windGridU; },
     rainOutlookText, fcRainStrength,
     gaugeCount: () => rainLocs.size,
+    // 5 h ago (before any radar frame): R1 wet (2 mm / 5 min), R2 dry,
+    // model 2 mm/h everywhere -> the analysis follows the gauges
+    analysisTest: () => {
+      const t0 = Math.floor((Date.now() - 5 * 3600_000) / 300_000) * 300_000;
+      pushRainSeries("R1", t0, 2);
+      displayedT = t0;
+      const ctx = rainContext(t0);
+      const r1 = rainLocs.get("R1"), r2 = rainLocs.get("R2");
+      return { src: ctx.src, gauges: ctx.gauges, atR1: ctx.rate(r1.lat, r1.lon), atR2: ctx.rate(r2.lat, r2.lon),
+        sea: ctx.rate(1.12, 104.18) };
+    },
     loadingLeft: () => [...loadingItems.keys()].filter((k) => k !== "tiles"),
     // newest radar frame newer than the viewed future moment (radar and
     // temperature feeds update out of step): must render, not throw
@@ -314,6 +325,13 @@ const h = new Function(src + `
   h.goLive();
 
   console.assert(h.loadingLeft().length === 0, "nothing left marked as loading:", h.loadingLeft());
+
+  // before the radar archive: gauges + model analysis
+  const ana = h.analysisTest();
+  console.assert(ana.src === "analysis" && ana.gauges === 2, "analysis before the radar archive:", ana);
+  console.assert(ana.atR1 > 8 && ana.atR2 < 1, "analysis follows the gauges (wet R1, dry R2):", ana);
+  console.assert(ana.sea > 0.5 && ana.sea < 2, "far from gauges: model at reduced strength:", ana);
+  h.goLive();
 
   // CARTO serves watermarked tiles (HTTP 200, no error) without a key
   const baseUrl = tileUrls.find((u) => u.includes("basemaps.cartocdn.com"));
