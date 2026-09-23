@@ -19,7 +19,7 @@ const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
 const HISTORY_HOURS = 24;
 // Shown in the footer; bump together with the ?v= stamps in index.html so a
 // glance settles "am I looking at the new build or a stale cache?"
-const APP_VERSION = "20260923f";
+const APP_VERSION = "20260923g";
 
 // CARTO basemap key. Since Aug 2026 basemaps.cartocdn.com answers keyless
 // requests with HTTP 200 tiles that have "API KEY REQUIRED" burned in, so
@@ -1160,11 +1160,291 @@ function updateMotion() {
   console.info(`[sgtemp] nowcast motion: ${radarMotion.kmh.toFixed(0)} km/h toward ${radarMotion.toward.toFixed(0)}° from ${radarMotion.vectors} blocks`);
 }
 
-// Extrapolated rate at a domain pixel, leadMin after the latest frame:
-// follow the motion backwards and read the latest frame there.
-function nowcastRate(grid, x, y, leadMin) {
+// ---- ANVIL nowcast: growth and decay ----
+
+/* Pure advection can only slide rain around. This is a browser port of
+   ANVIL (Pulkkinen et al. 2020, "Nowcasting of convective rainfall using
+   volumetric radar observations", IEEE TGRS; reference implementation in
+   pySTEPS, pysteps/nowcasts/anvil.py), which adds growth and decay:
+
+   1. the last four radar frames (10 min apart) are moved into the latest
+      frame's Lagrangian coordinates, so only intensity changes remain;
+   2. each frame is split into 6 spatial scales with Gaussian band-pass
+      filters in Fourier space (pySTEPS filter_gaussian, scale factor ~2.5);
+   3. per scale, the frame-to-frame *differences* follow an autoregressive
+      integrated ARI(2,1) model whose parameters come from lag-1/lag-2
+      correlations estimated in a ~50 km moving window — so a cell that
+      was intensifying keeps intensifying, one that was fading keeps
+      fading, region by region and scale by scale;
+   4. iterating the model gives the Lagrangian forecast every 10 min; the
+      display advects it along the motion field.
+   Like the original it doesn't create rain where none was observed (the
+   "rainrate mask"): brand-new storms stay the model's job.
+
+   Runs on a 2x downsampled grid (512x256, ~1.2 km) once per radar update. */
+const ANVIL = {
+  levels: 6,
+  stepMin: 10,
+  steps: 12,         // forecast out to +2h
+  windowPx: 40,      // moving-window sigma (~50 km at 1.2 km/px, as pySTEPS' 50 at 1 km)
+  maxRate: 150,      // mm/h clamp
+};
+const AW = RV_W / 2, AH = RV_H / 2; // 512 x 256
+let anvilCast = null; // {leads: [Float32Array], t0, key, grew, decayed}
+
+// In-place iterative radix-2 FFT (inv = inverse, unscaled).
+function fft1(re, im, off, stride, n, inv) {
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      const a = off + i * stride, b = off + j * stride;
+      let t = re[a]; re[a] = re[b]; re[b] = t;
+      t = im[a]; im[a] = im[b]; im[b] = t;
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = ((inv ? 2 : -2) * Math.PI) / len, wr = Math.cos(ang), wi = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let k = 0; k < len / 2; k++) {
+        const a = off + (i + k) * stride, b = off + (i + k + len / 2) * stride;
+        const xr = re[b] * cr - im[b] * ci, xi = re[b] * ci + im[b] * cr;
+        re[b] = re[a] - xr; im[b] = im[a] - xi;
+        re[a] += xr; im[a] += xi;
+        const ncr = cr * wr - ci * wi;
+        ci = cr * wi + ci * wr; cr = ncr;
+      }
+    }
+  }
+}
+
+function fft2(re, im, w, h, inv) {
+  for (let y = 0; y < h; y++) fft1(re, im, y * w, 1, w, inv);
+  for (let x = 0; x < w; x++) fft1(re, im, x, w, h, inv);
+  if (inv) { const s = 1 / (w * h); for (let i = 0; i < w * h; i++) { re[i] *= s; im[i] *= s; } }
+}
+
+// pySTEPS filter_gaussian: Gaussian weights in log-wavenumber, normalized
+// to sum to one per wavenumber; the mean goes to the largest scale. The y
+// wavenumber is rescaled so the non-square domain stays isotropic.
+function bandpassWeights(w, h, n) {
+  const L = Math.max(w, h), q = (0.5 * L) ** (1 / n);
+  const centres = Array.from({ length: n }, (_, k) => 0.5 * (q ** k + q ** (k + 1)));
+  const logq = (x) => Math.log(x) / Math.log(q);
+  const W = Array.from({ length: n }, () => new Float32Array(w * h));
+  for (let y = 0; y < h; y++) {
+    const ky = (y < h / 2 ? y : y - h) * (L / h);
+    for (let x = 0; x < w; x++) {
+      const kx = (x < w / 2 ? x : x - w) * (L / w);
+      const r = Math.hypot(kx, ky), i = y * w + x;
+      if (r === 0) { W[0][i] = 1; continue; }
+      let sum = 0;
+      const v = centres.map((c) => { const d = logq(r) - logq(c); const g = Math.exp(-(d * d) / (2 * 0.5 * 0.5)); sum += g; return g; });
+      for (let k = 0; k < n; k++) W[k][i] = v[k] / sum;
+    }
+  }
+  return W;
+}
+let anvilFilters = null;
+
+function decompose(field) {
+  const n = AW * AH, re = Float64Array.from(field), im = new Float64Array(n);
+  fft2(re, im, AW, AH, false);
+  anvilFilters ??= bandpassWeights(AW, AH, ANVIL.levels);
+  return anvilFilters.map((wk) => {
+    const r = new Float64Array(n), i2 = new Float64Array(n);
+    for (let i = 0; i < n; i++) { r[i] = re[i] * wk[i]; i2[i] = im[i] * wk[i]; }
+    fft2(r, i2, AW, AH, true);
+    return Float32Array.from(r);
+  });
+}
+
+// Gaussian blur (sigma px) as three box passes, zero outside the domain.
+function blurGauss(src, w, h, sigma) {
+  const n = 3, wIdeal = Math.sqrt((12 * sigma * sigma) / n + 1);
+  let wl = Math.floor(wIdeal); if (wl % 2 === 0) wl--;
+  const m = Math.round((12 * sigma * sigma - n * wl * wl - 4 * n * wl - 3 * n) / (-4 * wl - 4));
+  let a = Float32Array.from(src), b = new Float32Array(src.length);
+  for (let pass = 0; pass < n; pass++) {
+    const r = ((pass < m ? wl : wl + 2) - 1) / 2, norm = 1 / (2 * r + 1);
+    for (let y = 0; y < h; y++) { // horizontal
+      let acc = 0; const o = y * w;
+      for (let x = -r; x <= r; x++) if (x >= 0 && x < w) acc += a[o + x];
+      for (let x = 0; x < w; x++) {
+        b[o + x] = acc * norm;
+        const add = x + r + 1, sub = x - r;
+        if (add < w) acc += a[o + add];
+        if (sub >= 0) acc -= a[o + sub];
+      }
+    }
+    for (let x = 0; x < w; x++) { // vertical
+      let acc = 0;
+      for (let y = -r; y <= r; y++) if (y >= 0 && y < h) acc += b[y * w + x];
+      for (let y = 0; y < h; y++) {
+        a[y * w + x] = acc * norm;
+        const add = y + r + 1, sub = y - r;
+        if (add < h) acc += b[add * w + x];
+        if (sub >= 0) acc -= b[sub * w + x];
+      }
+    }
+  }
+  return a;
+}
+
+// Zero-mean correlation of x and y in a Gaussian moving window (ANVIL
+// Sec. II.G; pySTEPS _moving_window_corrcoef).
+function movingCorr(x, y, nWin, sigma) {
+  const len = x.length, xx = new Float32Array(len), yy = new Float32Array(len), xy = new Float32Array(len);
+  for (let i = 0; i < len; i++) { xx[i] = x[i] * x[i]; yy[i] = y[i] * y[i]; xy[i] = x[i] * y[i]; }
+  const sx = blurGauss(xx, AW, AH, sigma), sy = blurGauss(yy, AW, AH, sigma), sxy = blurGauss(xy, AW, AH, sigma);
+  const out = new Float32Array(len);
+  for (let i = 0; i < len; i++) {
+    const n = nWin[i], stdx = Math.sqrt(sx[i] / n), stdy = Math.sqrt(sy[i] / n);
+    out[i] = n > 1e-3 && stdx > 1e-8 && stdy > 1e-8 ? (sxy[i] / n) / (stdx * stdy) : 0;
+  }
+  return out;
+}
+
+// rain rate (mm/h) of a full-res frame, 2x2 mean -> AW x AH
+function halfRate(grid) {
+  const out = new Float32Array(AW * AH);
+  for (let y = 0; y < AH; y++) {
+    for (let x = 0; x < AW; x++) {
+      const i = 2 * y * RV_W + 2 * x;
+      out[y * AW + x] = 0.25 * (RATE_LUT[grid[i]] + RATE_LUT[grid[i + 1]] +
+        RATE_LUT[grid[i + RV_W]] + RATE_LUT[grid[i + RV_W + 1]]);
+    }
+  }
+  return out;
+}
+
+// Bilinear sample of a half-res field at half-res coordinates; 0 outside.
+function sampleHalf(f, x, y) {
+  x -= 0.5; y -= 0.5;
+  const x0 = Math.floor(x), y0 = Math.floor(y);
+  if (x0 < 0 || y0 < 0 || x0 >= AW - 1 || y0 >= AH - 1) return 0;
+  const tx = x - x0, ty = y - y0, i = y0 * AW + x0;
+  return (f[i] + (f[i + 1] - f[i]) * tx) * (1 - ty) + (f[i + AW] + (f[i + AW + 1] - f[i + AW]) * tx) * ty;
+}
+
+// Move a half-res field forward by `min` minutes along the motion field
+// (semi-Lagrangian: read where each pixel's rain came from).
+function advectHalf(f, min) {
+  const out = new Float32Array(AW * AH);
+  for (let y = 0; y < AH; y++) {
+    for (let x = 0; x < AW; x++) {
+      const m = radarMotion ? motionAt(2 * x + 1, 2 * y + 1) : { vx: 0, vy: 0 };
+      out[y * AW + x] = sampleHalf(f, x + 0.5 - (m.vx * min) / 2, y + 0.5 - (m.vy * min) / 2);
+    }
+  }
+  return out;
+}
+
+const pause = () => new Promise((r) => setTimeout(r, 0)); // let the UI breathe
+
+/* frames: the last four decoded grids, oldest first, ~10 min apart.
+   Returns Lagrangian forecasts (in the latest frame's coordinates) for
+   +10 ... +120 min; display advects them by the lead time. */
+async function buildAnvil(frames) {
+  const obs = frames.map(halfRate);
+  // into the latest frame's Lagrangian coordinates
+  const lag = obs.map((f, i) => (i === obs.length - 1 ? f : advectHalf(f, ANVIL.stepMin * (obs.length - 1 - i))));
+  await pause();
+  const dec = [];
+  for (const f of lag) { dec.push(decompose(f)); await pause(); }
+  const nWin = blurGauss(new Float32Array(AW * AH).fill(1), AW, AH, ANVIL.windowPx);
+  const phi = [];
+  for (let k = 0; k < ANVIL.levels; k++) {
+    // differences d1 (oldest) .. d3 (newest)
+    const d = [1, 2, 3].map((j) => { const a = dec[j][k], b = dec[j - 1][k], o = new Float32Array(a.length); for (let i = 0; i < a.length; i++) o[i] = a[i] - b[i]; return o; });
+    const g1 = movingCorr(d[2], d[1], nWin, ANVIL.windowPx);
+    const g2 = movingCorr(d[2], d[0], nWin, ANVIL.windowPx);
+    const p = [new Float32Array(g1.length), new Float32Array(g1.length), new Float32Array(g1.length)];
+    for (let i = 0; i < g1.length; i++) {
+      const a = Math.max(-0.999, Math.min(0.999, g1[i]));
+      let b = g2[i];
+      // pySTEPS adjust_lag2_corrcoef2: keep the AR(2) process stationary
+      b = Math.max(b, 2 * a * b - 1);
+      if (Math.abs(a) > 1e-6) b = Math.max(b, (3 * a * a - 2 + 2 * (1 - a * a) ** 1.5) / (a * a));
+      const pd1 = (a * (1 - b)) / (1 - a * a), pd2 = (b - a * a) / (1 - a * a);
+      p[0][i] = 1 + pd1; p[1][i] = -pd1 + pd2; p[2][i] = -pd2;
+    }
+    phi.push(p);
+    await pause();
+  }
+  // no new rain where none was observed (ANVIL's rainrate mask), with a
+  // pixel of slack so edges can breathe
+  const latest = obs[obs.length - 1];
+  const wet = blurGauss(Float32Array.from(latest, (v) => (v >= 0.1 ? 1 : 0)), AW, AH, 1.5);
+  // state per level: the last three Lagrangian fields
+  const state = Array.from({ length: ANVIL.levels }, (_, k) => [dec[1][k], dec[2][k], dec[3][k]]);
+  const leads = [];
+  // Extrapolated trends compound (a cell that doubled in 10 min would keep
+  // doubling), so cap growth at 1.5x the heaviest rain now observed.
+  let peak0 = 0; for (const v of latest) if (v > peak0) peak0 = v;
+  const cap = Math.min(ANVIL.maxRate, 1.5 * peak0 + 5);
+  for (let s = 0; s < ANVIL.steps; s++) {
+    const out = new Float32Array(AW * AH);
+    for (let k = 0; k < ANVIL.levels; k++) {
+      const [x2, x1, x0] = state[k], [p0, p1, p2] = phi[k];
+      const nx = new Float32Array(x0.length);
+      for (let i = 0; i < nx.length; i++) nx[i] = p0[i] * x0[i] + p1[i] * x1[i] + p2[i] * x2[i];
+      state[k] = [x1, x0, nx];
+      for (let i = 0; i < nx.length; i++) out[i] += nx[i];
+    }
+    for (let i = 0; i < out.length; i++) {
+      const v = wet[i] < 0.05 ? 0 : out[i];
+      out[i] = v < 0 ? 0 : v > cap ? cap : v;
+    }
+    leads.push(out);
+    if (s % 3 === 2) await pause();
+  }
+  return { leads, latest };
+}
+
+// Lagrangian ANVIL field at a fractional lead (minutes), linearly between
+// the 10-min steps (same coordinates, so no ghosting).
+function anvilAtLead(lead) {
+  const k = lead / ANVIL.stepMin;
+  const i = Math.floor(k), f = k - i;
+  const a = i <= 0 ? anvilCast.latest : anvilCast.leads[Math.min(i, ANVIL.steps) - 1];
+  const b = anvilCast.leads[Math.min(i + 1, ANVIL.steps) - 1];
+  return { a, b, f };
+}
+
+async function updateAnvil() {
+  const n = radarFrames.length;
+  if (radarMode !== "pixels" || n < 4) { anvilCast = null; return; }
+  const fr = radarFrames.slice(-4);
+  // needs a regular ~10-min series
+  for (let i = 1; i < 4; i++) {
+    const gap = fr[i].time - fr[i - 1].time;
+    if (gap < 8 * 60 || gap > 12 * 60) { anvilCast = null; return; }
+  }
+  const grids = fr.map((f) => radarGrids.get(f.path));
+  if (grids.some((g) => !g)) return;
+  const key = fr.map((f) => f.path).join(">") + `|${radarMotion?.key}`;
+  if (anvilCast?.key === key) return;
+  const t = performance.now?.() ?? Date.now();
+  const res = await buildAnvil(grids);
+  anvilCast = { ...res, t0: fr[3].time, key };
+  console.info(`[sgtemp] ANVIL nowcast built in ${Math.round((performance.now?.() ?? Date.now()) - t)} ms`);
+  scheduleRender();
+}
+
+// Forecast rate at a domain pixel, leadMin after the latest frame: follow
+// the motion backwards, then read the ANVIL field there (growth/decay) —
+// or, before ANVIL has run, the latest frame itself, fading.
+function nowcastRate(grid, x, y, leadMin, t0) {
   const m = radarMotion ? motionAt(x, y) : { vx: 0, vy: 0 };
-  return sampleRate(grid, x - m.vx * leadMin, y - m.vy * leadMin) * Math.exp(-leadMin / NOWCAST.decayMin);
+  const sx = x - m.vx * leadMin, sy = y - m.vy * leadMin;
+  if (anvilCast && anvilCast.t0 === t0) {
+    const { a, b, f } = anvilAtLead(leadMin);
+    return sampleHalf(a, sx / 2, sy / 2) * (1 - f) + sampleHalf(b, sx / 2, sy / 2) * f;
+  }
+  return sampleRate(grid, sx, sy) * Math.exp(-leadMin / NOWCAST.decayMin);
 }
 
 function latestRadar() {
@@ -1199,12 +1479,12 @@ function rainContext(t) {
   const modelRate = p ? (lat, lon) => Math.max(0, gridSampleCubic(p, lat, lon)) : null;
   const useRadar = !!latest && lead <= NOWCAST.horizonMin;
   if (!useRadar && !modelRate) return { src: "none" };
-  const radarRate = useRadar ? (lat, lon) => nowcastRate(latest.grid, rvX(lon), rvY(lat), lead) : null;
+  const radarRate = useRadar ? (lat, lon) => nowcastRate(latest.grid, rvX(lon), rvY(lat), lead, latest.f.time) : null;
   const w = !useRadar ? 1 : !modelRate ? 0
     : smooth01((lead - NOWCAST.blendFrom) / (NOWCAST.horizonMin - NOWCAST.blendFrom));
   const src = w >= 1 ? "model" : w <= 0 ? "nowcast" : "blend";
   return {
-    src, lead, frame: latest?.f,
+    src, lead, frame: latest?.f, anvil: !!anvilCast && anvilCast.t0 === latest?.f.time,
     rate: w >= 1 ? modelRate : w <= 0 ? radarRate
       : (lat, lon) => (1 - w) * radarRate(lat, lon) + w * modelRate(lat, lon),
   };
@@ -1246,9 +1526,10 @@ function renderClouds() {
   const note = radarModeNote ? ` · ${radarModeNote}` : "";
   const m = radarMotion;
   const motion = m && m.kmh >= 3 ? ` · rain moving ${m.kmh.toFixed(0)} km/h → ${COMPASS[Math.round(m.toward / 22.5) % 16]}` : "";
-  if (ctx.src === "radar") setRadarStatus(`frame ${fmtClock(ctx.frame.time)}${approx}${note}`);
-  else if (ctx.src === "nowcast") setRadarStatus(`nowcast +${Math.round(ctx.lead)} min${motion}${approx}`);
-  else if (ctx.src === "blend") setRadarStatus(`nowcast→model +${Math.round(ctx.lead)} min${motion}`);
+  const method = ctx.anvil ? "ANVIL" : "advection";
+  if (ctx.src === "radar") setRadarStatus(`${radarSource} frame ${fmtClock(ctx.frame.time)}${approx}${note}`);
+  else if (ctx.src === "nowcast") setRadarStatus(`nowcast (${method}) +${Math.round(ctx.lead)} min${motion}${approx}`);
+  else if (ctx.src === "blend") setRadarStatus(`nowcast (${method})→model +${Math.round(ctx.lead)} min${motion}`);
   else if (ctx.src === "model") {
     setRadarStatus(radarMode === "pixels" && latestRadar() ? "model rain (past the 2h nowcast)" : `model rain${note}`);
   }
@@ -1257,7 +1538,7 @@ function renderClouds() {
   // "tiles": applyTileFrame owns the status
   if (!ctx.rate) { hideClouds(); return; }
 
-  const key = `${t}|${ctx.src}|${ctx.frame?.path}|${radarMotion?.key}|${model?.times?.[0]}|${GRID_NLAT}`;
+  const key = `${t}|${ctx.src}|${ctx.frame?.path}|${radarMotion?.key}|${anvilCast?.key}|${model?.times?.[0]}|${GRID_NLAT}`;
   if (key === cloudKey) return;
   if (!cloudCanvas) {
     cloudCanvas = document.createElement("canvas");
@@ -1285,7 +1566,7 @@ function renderClouds() {
     cloudLayer = L.imageOverlay(url,
       [[rvLat(CLOUD.y0 + CLOUD.h), rvLon(CLOUD.x0)], [rvLat(CLOUD.y0), rvLon(CLOUD.x0 + CLOUD.w)]],
       { pane: "clouds", opacity: 1, interactive: false, className: "rain-clouds",
-        attribution: 'Radar: <a href="https://www.rainviewer.com/">RainViewer</a>' }).addTo(map);
+        attribution: 'Radar: <a href="https://librewxr.net/">LibreWXR</a> (MET Malaysia) / <a href="https://www.rainviewer.com/">RainViewer</a>' }).addTo(map);
   } else {
     cloudLayer.setUrl(url);
     cloudLayer.setOpacity(1);
@@ -1361,57 +1642,98 @@ function applyRadarFrame() {
   renderClouds();
 }
 
+// Radar sources, best first; both speak the RainViewer API. LibreWXR is an
+// open-source RainViewer replacement whose public instance carries MET
+// Malaysia's 12-radar composite (Peninsular Malaysia + Singapore, ~2.5 km,
+// 10-min); RainViewer is the fallback. The first source whose pixels
+// decode wins; if none do, the first reachable one is shown as tiles.
+const RADAR_SOURCES = [
+  { name: "LibreWXR", meta: "https://api.librewxr.net/public/weather-maps.json" },
+  { name: "RainViewer", meta: RV_META_URL },
+];
+let radarSource = "";
+
+function useRadarSource(name, json) {
+  if (name !== radarSource) {
+    radarGrids.clear();
+    radarMotion = null;
+    anvilCast = null;
+    for (const ly of radarLayers.values()) ly.remove();
+    radarLayers.clear();
+    radarShown = null;
+    radarApprox = false;
+  }
+  radarSource = name;
+  radarHost = json.host;
+  // past frames only: RainViewer's free tier dropped forecast frames and
+  // LibreWXR's (60 min) would seam against ours — the nowcast is ANVIL
+  radarFrames = json.radar.past.slice().sort((a, b) => a.time - b.time);
+}
+
 async function fetchRadar() {
   if (!radarOn) { setRadarStatus("off"); return; }
-  const res = await fetch429(RV_META_URL);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const json = await res.json();
-  radarHost = json.host;
-  // the free tier no longer serves forecast ("nowcast") frames — ours is
-  // computed from these past frames instead
-  radarFrames = (json.radar?.past ?? []).slice().sort((a, b) => a.time - b.time);
-  if (!radarFrames.length) { setRadarStatus("no radar frames"); return; }
-  const valid = new Set(radarFrames.map((f) => f.path));
-  for (const p of radarGrids.keys()) if (!valid.has(p)) radarGrids.delete(p);
-  for (const [p, ly] of radarLayers) {
-    if (!valid.has(p)) {
-      ly.remove();
-      radarLayers.delete(p);
-      if (radarShown === p) radarShown = null;
+  const errors = [];
+  let reachable = null, decoded = false;
+  for (const src of RADAR_SOURCES) {
+    let json;
+    try {
+      const res = await fetch429(src.meta);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      json = await res.json();
+      if (!json.radar?.past?.length) throw new Error("no frames");
+    } catch (e) {
+      errors.push(`${src.name}: ${e.message}`);
+      continue;
+    }
+    reachable ??= { name: src.name, json };
+    useRadarSource(src.name, json);
+    try {
+      await loadRadarGrid(radarFrames[radarFrames.length - 1]);
+      decoded = true;
+      break;
+    } catch (e) {
+      errors.push(`${src.name} pixels: ${e.message}`);
+      radarGrids.clear();
     }
   }
-  if (radarMode === "pixels") {
-    const n = radarFrames.length;
-    // newest first (live view), then ~20 min back (motion), then the rest
-    const order = [n - 1, Math.max(0, n - 3), ...Array.from({ length: n }, (_, i) => n - 1 - i)]
-      .filter((i, k, a) => a.indexOf(i) === k).map((i) => radarFrames[i]);
-    let failed = 0;
-    for (const [k, f] of order.entries()) {
-      try {
-        await loadRadarGrid(f);
-      } catch (e) {
-        if (k === 0 && !radarGrids.size) {
-          // can't read pixels at all: fall back to plain tiles, loudly
-          radarMode = "tiles";
-          radarModeNote = `radar pixels unreadable (${e.message}) — coloured tiles, no nowcast`;
-          console.warn(`[sgtemp] ${radarModeNote}`);
-          break;
-        }
-        failed++;
-      }
-      if (k === 1) { updateMotion(); scheduleRender(); }
-      if (k === 0) scheduleRender();
-    }
-    if (failed) console.warn(`[sgtemp] ${failed} radar frame(s) failed to load`);
-    updateMotion();
-  }
-  scheduleRender();
-  if (radarMode === "tiles") {
-    // warm every frame in the background so scrubbing flips instantly
+  if (!reachable) throw new Error(errors.join("; "));
+  if (!decoded) {
+    // nothing decodable: plain coloured tiles from the first reachable
+    // source, no nowcast — and say so
+    useRadarSource(reachable.name, reachable.json);
+    radarMode = "tiles";
+    radarModeNote = `radar pixels unreadable (${errors.join("; ")}) — coloured tiles, no nowcast`;
+    console.warn(`[sgtemp] ${radarModeNote}`);
+    applyRadarFrame();
     setTimeout(() => {
       if (radarOn && radarHost) for (const f of radarFrames) layerFor(f.path);
     }, 2500);
+    return;
   }
+  radarMode = "pixels";
+  for (const ly of radarLayers.values()) ly.remove();
+  radarLayers.clear();
+  radarShown = null;
+  radarModeNote = errors.length ? `fallback (${errors.join("; ")})` : "";
+  if (errors.length) console.warn(`[sgtemp] radar ${radarModeNote}`);
+  const valid = new Set(radarFrames.map((f) => f.path));
+  for (const p of radarGrids.keys()) if (!valid.has(p)) radarGrids.delete(p);
+  scheduleRender();
+  // the three before the latest (ANVIL needs four), then the rest newest first
+  const n = radarFrames.length;
+  const order = [...Array.from({ length: n }, (_, i) => n - 1 - i)].map((i) => radarFrames[i]);
+  let failed = 0;
+  for (const [k, f] of order.entries()) {
+    try { await loadRadarGrid(f); } catch { failed++; }
+    if (k === 3) {
+      updateMotion();
+      await updateAnvil();
+    }
+  }
+  if (failed) console.warn(`[sgtemp] ${failed} radar frame(s) failed to load`);
+  updateMotion();
+  await updateAnvil();
+  scheduleRender();
 }
 
 function pollRadar() {

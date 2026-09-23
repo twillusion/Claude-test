@@ -77,11 +77,13 @@ static page, no backend, no hosting costs.
   for temperature — with 🌧️ glyphs at NEA's ~60 rain gauges underneath.
   Past and live, the cloud is RainViewer's radar (decoded from its
   dBZ-encoded tiles, ~0.6 km pixels) and the glyphs are real 5-minute gauge
-  readings. Into the future, the site runs its own nowcast: it measures how
-  the rain moved between radar frames ~20 minutes apart and carries the
-  latest radar forward along that motion (fading with lead time), blending
-  into the Open-Meteo model from +45 min to +2 h; beyond that it's the
-  model (ECMWF, ~8 km cells). Forecast glyphs appear at gauges the cloud
+  readings (radar from LibreWXR's MET Malaysia composite, RainViewer as
+  fallback). Into the future, the site runs its own nowcast: it measures
+  how the rain is moving, then applies ANVIL (Pulkkinen et al. 2020, as in
+  pySTEPS) — each spatial scale's recent growth or decay is extrapolated
+  with an autoregressive model, locally, so cells keep intensifying or
+  fading as they drift — blending into the Open-Meteo model from +45 min
+  to +2 h; beyond that it's the model (ECMWF, ~8 km cells). Forecast glyphs appear at gauges the cloud
   reaches at ≥1 mm/h, dimmer and dashed-ringed. The footer shows the
   source, lead time and rain motion; model rain hours are marked on the
   slider track. If the browser can't read radar pixels, RainViewer's own
