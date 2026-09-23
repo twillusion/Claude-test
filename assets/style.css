@@ -158,6 +158,36 @@ body { display: flex; flex-direction: column; }
 
 #sky-icon { font-size: 0.85rem; line-height: 1; }
 
+/* what's still loading: small, static, top-left beside the zoom buttons */
+.load-status {
+  position: absolute;
+  top: 12px;
+  left: 56px;
+  z-index: 800;
+  padding: 2px 8px 2px 6px;
+  font-size: 0.64rem;
+  color: var(--muted);
+  background: rgba(22, 29, 46, 0.88);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  max-width: calc(100% - 200px);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+.load-status::before {
+  content: "";
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin-right: 5px;
+  vertical-align: 1px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.load-status.hidden { display: none; }
+
 /* wind streaklines: above tiles and shading (z 200/400), below markers (600) */
 /* lives inside the windParticles map pane; Leaflet positions it via
    transforms, so only anchor the top-left (inset would zero its size) */
@@ -509,6 +539,8 @@ body { display: flex; flex-direction: column; }
   .slider-wrap { order: 2; flex: 1 0 100%; height: 30px; } /* full-width, taller hit area */
   #time-slider { height: 30px; }
   .slider-wrap { --thumb: 20px; }
+  /* under the zoom buttons: beside them it would run into the legend */
+  .load-status { top: 84px; left: 10px; max-width: 60%; }
   .slider-wrap.has-forecast::after { top: 5px; bottom: 5px; }
   .footer { font-size: 0.62rem; gap: 0.1rem 0.8rem; }
   /* sized so the "≈ Wed 06:05 pm" forecast label still fits row 1 — else

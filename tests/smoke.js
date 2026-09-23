@@ -151,6 +151,23 @@ const h = new Function(src + `
     windGridOk: () => { ensureWindField(); return !!windGridU; },
     rainOutlookText, fcRainStrength,
     gaugeCount: () => rainLocs.size,
+    loadingLeft: () => [...loadingItems.keys()].filter((k) => k !== "tiles"),
+    // newest radar frame newer than the viewed future moment (radar and
+    // temperature feeds update out of step): must render, not throw
+    negativeLeadTest: () => {
+      const now = Math.floor(Date.now() / 1000);
+      for (const f of radarFrames) f.time += 1800;
+      if (anvilCast) anvilCast.t0 += 1800;
+      displayedT = (now + 15 * 60) * 1000;
+      try {
+        const ctx = rainContext(displayedT);
+        const v = ctx.rate(rvLat(200), rvLon(330));
+        renderAll(true);
+        return { ok: Number.isFinite(v), future: isFutureView(), anvil: ctx.anvil };
+      } catch (e) {
+        return { ok: false, error: String(e) };
+      }
+    },
     // ANVIL: four frames 10 min apart, one cell intensifying, one fading,
     // both drifting east 1 px/min
     anvilTest: async () => {
@@ -292,7 +309,11 @@ const h = new Function(src + `
   console.assert(an.growFc > an.growNow * 1.15, "intensifying cell keeps growing:", an);
   console.assert(an.fadeFc < an.fadeNow * 0.85, "fading cell keeps decaying:", an);
   console.assert(an.growFc <= 1.5 * 36.5 + 5 + 0.01, "growth capped at 1.5x the observed peak:", an);
+  const nl = h.negativeLeadTest();
+  console.assert(nl.ok && nl.future && nl.anvil, "radar newer than the viewed moment renders:", nl);
   h.goLive();
+
+  console.assert(h.loadingLeft().length === 0, "nothing left marked as loading:", h.loadingLeft());
 
   // CARTO serves watermarked tiles (HTTP 200, no error) without a key
   const baseUrl = tileUrls.find((u) => u.includes("basemaps.cartocdn.com"));

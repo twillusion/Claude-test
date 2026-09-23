@@ -19,7 +19,7 @@ const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
 const HISTORY_HOURS = 24;
 // Shown in the footer; bump together with the ?v= stamps in index.html so a
 // glance settles "am I looking at the new build or a stale cache?"
-const APP_VERSION = "20260923h";
+const APP_VERSION = "20260923i";
 
 // CARTO basemap key. Since Aug 2026 basemaps.cartocdn.com answers keyless
 // requests with HTTP 200 tiles that have "API KEY REQUIRED" burned in, so
@@ -65,6 +65,40 @@ let renderQueued = false;
 let model = null; // {times: [ms], grids: [Float32Array(GRID_NLAT*GRID_NLON)]}
 let latestReadingT = null, statusPinned = false;
 let fieldCache = null, fadeCache = null; // last rasterized temperature field + edge fade
+
+// ---------- loading indicator ----------
+
+/* A small static note in the map corner listing what is still loading
+   ("loading radar 5/13 · wind history"); hidden when everything is in. No
+   spinner — nothing on this page pulses. An item only appears once it has
+   been loading for 0.4 s, so quick background refreshes never flicker it. */
+const loadingItems = new Map(); // key -> {label, since}
+
+function setLoading(key, label) {
+  if (label) loadingItems.set(key, { label, since: loadingItems.get(key)?.since ?? Date.now() });
+  else loadingItems.delete(key);
+  renderLoading();
+  if (label) setTimeout(renderLoading, 420);
+}
+
+function renderLoading() {
+  const el = typeof document !== "undefined" && document.getElementById("load-status");
+  if (!el) return;
+  const now = Date.now();
+  const shown = [...loadingItems.values()].filter((i) => now - i.since >= 400).map((i) => i.label);
+  el.textContent = shown.length ? `loading ${shown.join(" · ")}` : "";
+  if (el.classList) el.classList.toggle("hidden", !shown.length);
+}
+
+// Wrap a loader so it registers while it runs; label may be a function
+// (return null to stay quiet, e.g. for routine refreshes).
+function withLoading(key, label, fn) {
+  return async (...args) => {
+    const l = typeof label === "function" ? label() : label;
+    if (l) setLoading(key, l);
+    try { return await fn(...args); } finally { if (l) setLoading(key, null); }
+  };
+}
 
 // ---------- API ----------
 
@@ -1444,7 +1478,10 @@ async function buildAnvil(frames) {
 // Lagrangian ANVIL field at a fractional lead (minutes), linearly between
 // the 10-min steps (same coordinates, so no ghosting).
 function anvilAtLead(lead) {
-  const k = lead / ANVIL.stepMin;
+  // lead can be slightly negative: the newest radar frame may be a few
+  // minutes newer than the newest temperature reading that defines "now"
+  // (this once indexed leads[-1], threw mid-glide and froze the slider)
+  const k = Math.max(0, lead) / ANVIL.stepMin;
   const i = Math.floor(k), f = k - i;
   const a = i <= 0 ? anvilCast.latest : anvilCast.leads[Math.min(i, ANVIL.steps) - 1];
   const b = anvilCast.leads[Math.min(i + 1, ANVIL.steps) - 1];
@@ -1465,7 +1502,9 @@ async function updateAnvil() {
   const key = fr.map((f) => f.path).join(">") + `|${radarMotion?.key}`;
   if (anvilCast?.key === key) return;
   const t = performance.now?.() ?? Date.now();
-  const res = await buildAnvil(grids);
+  setLoading("nowcast", "nowcast");
+  let res;
+  try { res = await buildAnvil(grids); } finally { setLoading("nowcast", null); }
   anvilCast = { ...res, t0: fr[3].time, key };
   console.info(`[sgtemp] ANVIL nowcast built in ${Math.round((performance.now?.() ?? Date.now()) - t)} ms`);
   scheduleRender();
@@ -1475,6 +1514,7 @@ async function updateAnvil() {
 // the motion backwards, then read the ANVIL field there (growth/decay) —
 // or, before ANVIL has run, the latest frame itself, fading.
 function nowcastRate(grid, x, y, leadMin, t0) {
+  leadMin = Math.max(0, leadMin);
   const m = radarMotion ? motionAt(x, y) : { vx: 0, vy: 0 };
   const sx = x - m.vx * leadMin, sy = y - m.vy * leadMin;
   if (anvilCast && anvilCast.t0 === t0) {
@@ -1538,7 +1578,7 @@ function rainContext(t) {
     return { src: "radar", frame: f, rate: (lat, lon, x = rvX(lon), y = rvY(lat)) => sampleRate(grid, x, y) };
   }
   const latest = latestRadar();
-  const lead = latest ? (t - latest.f.time * 1000) / 60_000 : Infinity;
+  const lead = latest ? Math.max(0, (t - latest.f.time * 1000) / 60_000) : Infinity;
   const p = forecastRainGrid(t);
   const modelRate = p ? (lat, lon) => Math.max(0, gridSampleCubic(p, lat, lon)) : null;
   const useRadar = !!latest && lead <= NOWCAST.horizonMin;
@@ -1795,6 +1835,7 @@ async function fetchRadar() {
   const order = [...Array.from({ length: n }, (_, i) => n - 1 - i)].map((i) => radarFrames[i]);
   let failed = 0;
   for (const [k, f] of order.entries()) {
+    if (!radarGrids.has(f.path)) setLoading("radar", `radar ${k + 1}/${n}`);
     try { await loadRadarGrid(f); } catch { failed++; }
     if (k === 3) {
       updateMotion();
@@ -2749,15 +2790,19 @@ function scrubStep(now) {
   const cur = displayedT ?? liveTime();
   const tgt = scrubTarget ?? liveTime();
   const d = tgt - cur;
-  if (Math.abs(d) < 15_000) { // within 15 s: land exactly, full render
-    displayedT = scrubTarget;
-    scrubAnim = false;
-    renderAll();
-    return;
+  const landing = Math.abs(d) < 15_000; // within 15 s: land exactly, full render
+  displayedT = landing ? scrubTarget : cur + d * (1 - Math.exp(-dt / SCRUB_TAU_MS));
+  // A render error must never leave the glide half-running: scrubAnim
+  // stuck at true made scrubTo() ignore every later slider move. Say what
+  // broke on screen, and keep the glide alive.
+  try {
+    renderAll(!landing);
+  } catch (e) {
+    console.error("[sgtemp] render failed while scrubbing", e);
+    showError(`Display error while scrubbing: ${e.message} — please report (v${APP_VERSION})`);
   }
-  displayedT = cur + d * (1 - Math.exp(-dt / SCRUB_TAU_MS));
-  renderAll(true);
-  requestAnimationFrame(scrubStep);
+  if (landing) scrubAnim = false;
+  else requestAnimationFrame(scrubStep);
 }
 
 // light = mid-glide frame: skip the station list, detail panel and slider
@@ -3217,8 +3262,12 @@ function initMap() {
   // single dark basemap; daytime just brightens it slightly via a CSS
   // filter on the tile pane (no second tile set, no hue clash with the
   // temperature ramp)
-  L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png" +
+  const basemap = L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png" +
     (CARTO_KEY ? `?key=${encodeURIComponent(CARTO_KEY)}` : ""), tileOpts).addTo(map);
+  if (basemap.on) {
+    basemap.on("loading", () => setLoading("tiles", "map"));
+    basemap.on("load", () => setLoading("tiles", null));
+  }
   // the watermarked tiles load "fine", so say it out loud
   const baseEl = document.getElementById("basemap-status");
   if (baseEl) baseEl.textContent = CARTO_KEY ? "CARTO" : "CARTO — no API key, tiles watermarked";
@@ -3313,6 +3362,15 @@ document.getElementById("wind-btn").addEventListener("click", () => {
   if (v) v.textContent = APP_VERSION;
   console.info(`[sgtemp] app version ${APP_VERSION}`);
 }
+// loading indicator hooks (first loads and archives; routine polls stay quiet)
+loadHistory = withLoading("hist", "24h history", loadHistory);
+loadWindHistory = withLoading("windhist", () => (windDayLoaded ? null : "wind history"), loadWindHistory);
+loadRainHistory = withLoading("rainhist", () => (rainDayLoaded ? null : "rain history"), loadRainHistory);
+seedRainRecent = withLoading("rainseed", "recent rain", seedRainRecent);
+refresh = withLoading("temp", () => (latestReadingT == null ? "temperatures" : null), refresh);
+refreshModel = withLoading("model", () => (model ? null : "forecast"), refreshModel);
+fetchRadar = withLoading("radar", "radar", fetchRadar);
+
 initMap();
 startWind();
 refresh().then(() => {
