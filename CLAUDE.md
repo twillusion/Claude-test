@@ -101,6 +101,16 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
 
 ## How the page works (key mechanisms)
 
+- **Smooth scrubbing** (owner found it jerky): the slider sets a target
+  (`scrubTo`) and `displayedT` eases toward it each frame (`scrubStep`,
+  τ≈90 ms). Mid-glide frames call `renderAll(true)`: temperature shading
+  and clouds at half resolution, no station list/detail/slider-track. The
+  shading and clouds are canvases shown via `L.svgOverlay(canvas)` (no
+  PNG round-trip); the shading uses a colour LUT and precomputed
+  distances. Keep a glide frame under ~10 ms at 4× CPU throttle — measure
+  with Playwright + CDP `Emulation.setCPUThrottlingRate`. Past radar is
+  motion-interpolated between 10-min frames (`radarPairAt`). Never set
+  `slider.value` while `sliderDragging`.
 - **Time slider**: uniform 5-minute lattice −24h … +24h, LIVE at the centre
   (`sliderLiveIdx`, marked by a dotted green line on `.slider-wrap::after`).
   `displayedT === null` means live. `isFutureView()` switches pills to the
@@ -136,9 +146,12 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
   the code; DGMR/MetNet need GPUs + weights. The owner wants to *see rain
   roll over the island and grow/decay*: this is the feature.
 - **Rain glyphs**: 🌧️ at the real gauge positions, **no rain colour**
-  (owner's rule: colour means temperature). Past/live = observed gauges
-  (glyph + neutral grey ring). Future = gauges the cloud field reaches at
-  ≥1 mm/h (`forecastGaugeRain`), dimmer, dashed ring. Rejected along the
+  (owner's rule: colour means temperature), each with a **circle of
+  effect** (owner asked for it back): radius 0.8–5 km by intensity on one
+  mm/h scale (gauges report mm per 5 min, ×12), neutral white, dashed for
+  forecasts. Past/live = observed gauges; future = gauges the cloud field
+  reaches at ≥1 mm/h (`forecastGaugeRain`). Glyphs and circles fade in/out
+  (`rainFadeStep`, 0.35 s) — entries linger while fading, so count `show`. Rejected along the
   way: a marker per model node (lattice), pale-blue raster (read as
   "cool"), radar-palette raster (colour rule), sparse greedy glyphs
   ("didn't like it"). `rainOutlook()` marks model rain hours on the slider

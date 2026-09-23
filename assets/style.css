@@ -418,12 +418,6 @@ body { display: flex; flex-direction: column; }
   transform: translate(-50%, -50%);
   filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.7));
 }
-/* forecast glyph: dashed ring, the same "estimate" mark as .temp-pill.fc */
-.rain-icon.fc {
-  padding: 2px;
-  border: 1px dashed rgba(222, 229, 239, 0.5);
-  border-radius: 50%;
-}
 
 /* wind direction: a windsock wedge growing out from under the marker,
    extending downwind, tapering and fading at the tip — no arrowheads.
