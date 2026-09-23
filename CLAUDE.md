@@ -43,6 +43,10 @@ humans; this file is the working knowledge for continuing development.
    confirm the deploy (phones: fully close and reopen the tab).
 
 Visual checks: Playwright + the pre-installed Chromium work in the sandbox.
+For radar, generate scheme-0 PNG tiles in the harness (grey R=G=B =
+dBZ+32, moving cells) and serve them with `access-control-allow-origin`;
+note `route.fulfill` bypasses CORS, so simulate blocked pixels with
+`route.abort()`.
 Serve the repo locally and `page.route` every external host to mocks (the
 smoke test's fixtures are a good start); screenshot desktop and a 390px
 phone viewport, live and scrubbed into the forecast.
@@ -62,15 +66,23 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
   deferred, and processed series are cached in localStorage
   (`sgtemp-hist-v2`, 15-min freshness; wind seeds from it up to 12h old).
   data.gov.sg rate-limits bursts (HTTP 429) — use the `fetch429` wrapper.
-- **Open-Meteo** (hourly temperature, wind, precipitation on a 6×9 grid,
-  past 1 day + 2 forecast days). **Blocked from the owner's browser**, so the
+- **Open-Meteo** (hourly temperature, wind, precipitation on an 8×12 grid,
+  past 1 day + 2 forecast days). It serves ECMWF IFS here: native cells
+  ~0.07° (~8 km; the snapped lat/lon in each response show the grid), so
+  8×12 (~0.067°) hits every cell — the old 6×9 skipped rows. **Blocked from the owner's browser**, so the
   page reads the same-origin `data/model.json` first, then a localStorage
-  cache (`sgtemp-model-v2`), then a direct fetch. Grid constants in
-  `fetch-model.mjs` must match `OVERLAY`/`GRID_NLAT`/`GRID_NLON` in app.js.
-- **RainViewer** radar composite (smoothed NEXRAD palette, scheme 6). Free
-  tier: URL zoom capped at 7 (beyond → a literal "Zoom Level Not Supported"
-  tile); we use 512px tiles + `zoomOffset -1`. ~2h past frames + ~30min
-  nowcast. Its satellite product is retired ("no frames").
+  cache (`sgtemp-model-v3`), then a direct fetch. `fetch-model.mjs` writes
+  the grid dimensions into the file (`grid: {nlat, nlon}`) and the page
+  adopts them (`GRID_NLAT/NLON` are `let`); a file without `grid` is the
+  legacy 6×9. `OVERLAY` must match in both files.
+- **RainViewer** radar. Free tier since Jan 2026: ~2h of past frames only
+  (**no nowcast frames**), zoom ≤ 7, possibly a single colour scheme, PNG.
+  We fetch colour scheme 0 (dBZ in red: `(R & 127) − 32`) as two z7 512px
+  tiles per frame (x 100–101, y 63: lon 101.25–106.9, lat 0–2.8, ~0.6 km
+  px) and **decode the pixels** (`loadRadarGrid`). If the tiles come back
+  in another palette, intensity is flagged "approx." in the footer. If
+  pixels can't be read at all (CORS/network), `radarMode = "tiles"`: the
+  old coloured tile layers, no nowcast, footer says why.
 - **CARTO basemap** (`dark_all`): since Aug 2026 keyless requests get
   HTTP 200 tiles with "API KEY REQUIRED" burned in — no tileerror, so it
   fails silently. The owner's free key is in `CARTO_KEY` (app.js; public by
@@ -100,21 +112,25 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
   count scales with covered grid cells (so no "swarm" at low coverage).
 - **Hybrid markers**: NEA stations reporting both temp and wind get a
   temperature-coloured "windsock" wedge on the pill.
-- **Rain**: 🌧️ glyphs only, sized/faded by intensity — **no rain colour**
-  (owner's rule: colour means temperature). Observed gauges get a glyph +
-  neutral grey splash ring (24h series, scrubbable). Future = sparse model
-  glyphs with a dashed ring (`forecastRainIcons`): greedy wettest-first
-  pick among grid nodes in the current view, ≥14 km apart, max 10, fixed
-  per-node offset so uniform rain doesn't read as a grid; re-picked on
-  `moveend`. Never one glyph per node (widespread-rain hours wet 40-54 of
-  54 → lattice). Suppressed while a radar nowcast frame covers the time.
-  Tried and rejected: a pale-blue raster (read as "cool"), then a
-  radar-palette raster (owner: colours are for temperature only).
-  `rainOutlook()` marks forecast rain hours on the slider track in neutral
-  grey (`--rain-track`) and the footer ("model: showers ~12 pm–4 pm").
-  `?testrain` URL param injects synthetic gauges for visual testing.
-- **Radar**: one persistent preloaded Leaflet layer per frame; scrubbing only
-  flips opacity (anything that reloads tiles on scrub causes visible fading).
+- **Rain clouds** (`renderClouds`, pane `clouds`): one neutral grey-white
+  raster aligned to the radar pixels, from `rainContext(t)`:
+  past/live = the decoded radar frame; future = **our own nowcast** —
+  block-matching the latest frame against the one ~20 min earlier
+  (`blockMotion`/`motionField`, 4× downsampled) and advecting the latest
+  frame along it (`nowcastRate`, semi-Lagrangian, e-folding 100 min),
+  blended into the model from +45 min to +2h, then model only (bicubic,
+  `gridSampleCubic`). It can't create new storms — that's the model's job.
+  The owner wants to *see rain roll over the island*: this is the feature.
+- **Rain glyphs**: 🌧️ at the real gauge positions, **no rain colour**
+  (owner's rule: colour means temperature). Past/live = observed gauges
+  (glyph + neutral grey ring). Future = gauges the cloud field reaches at
+  ≥1 mm/h (`forecastGaugeRain`), dimmer, dashed ring. Rejected along the
+  way: a marker per model node (lattice), pale-blue raster (read as
+  "cool"), radar-palette raster (colour rule), sparse greedy glyphs
+  ("didn't like it"). `rainOutlook()` marks model rain hours on the slider
+  track (neutral grey) and in the footer. `?testrain` injects gauges.
+- **Radar tiles (fallback only)**: one persistent preloaded Leaflet layer per
+  frame; scrubbing only flips opacity (reloading tiles on scrub fades).
 - **Mobile**: `invalidateSize()` after layout settles (else the map stays
   blank); the timebar wraps so the slider gets its own full-width row.
 - **Day/night**: brightness filter on the dark tile pane via `--day-boost`.
@@ -125,9 +141,9 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
   gull, waves, travelling ripple, playback timelapse, cloud sprites).
 - Wants honest data: forecast/estimates visibly marked, gaps shown as gaps.
 - Dark map; subtle, low-opacity overlays; real-looking imagery.
-- **Colour on the map means temperature, strictly.** Rain is glyphs, wind
-  pins and list wind rows are neutral grey. (The RainViewer radar layer
-  is the one exception — its own palette, toggleable.)
+- **Colour on the map means temperature, strictly.** Rain is grey-white
+  cloud + glyphs, wind pins and list wind rows are neutral grey. (Only
+  the tile fallback shows RainViewer's own palette.)
 - Uses the site a lot on a phone — check the mobile layout for UI changes.
   The phone timebar's first row must fit the "≈ Wed 06:05 pm" forecast
   label, or the bar grows a row whenever you scrub into the future.

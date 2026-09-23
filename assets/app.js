@@ -19,7 +19,7 @@ const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
 const HISTORY_HOURS = 24;
 // Shown in the footer; bump together with the ?v= stamps in index.html so a
 // glance settles "am I looking at the new build or a stale cache?"
-const APP_VERSION = "20260923e";
+const APP_VERSION = "20260923f";
 
 // CARTO basemap key. Since Aug 2026 basemaps.cartocdn.com answers keyless
 // requests with HTTP 200 tiles that have "API KEY REQUIRED" burned in, so
@@ -33,10 +33,14 @@ const SLIDER_STEP_MIN = 5; // scrubber granularity; underlying data is per-minut
 // sample grid shares the same bounds so the raster never extrapolates, and
 // the map is hard-locked to this exact window.
 const OVERLAY = { latMin: 1.09, latMax: 1.56, lonMin: 103.48, lonMax: 104.22, w: 240, h: 152 };
-// ~10km sample spacing — matches the model's native resolution, so a denser
-// grid adds API weight without adding information
-const GRID_NLAT = 6;
-const GRID_NLON = 9;
+// Model sample grid. Open-Meteo serves ECMWF IFS here, whose octahedral
+// grid is ~0.07° (~8 km) — the snapped coordinates in its responses show
+// it. The old 6x9 grid (~0.094°) skipped whole native rows; 8x12 (~0.067°)
+// hits every native cell. The dimensions travel inside data/model.json
+// (`grid`), so the page follows whatever the file holds.
+const GRID_DEFAULT = { nlat: 8, nlon: 12 };
+let GRID_NLAT = GRID_DEFAULT.nlat;
+let GRID_NLON = GRID_DEFAULT.nlon;
 const KM_PER_DEG = 111.32;
 // Station residuals shrink toward zero away from stations; at ~12 km the
 // correction is halved, so the model field dominates where there's no sensor.
@@ -214,7 +218,10 @@ function pollCommunity() {
 // Hourly 2m-temperature, 10m wind, and precipitation for the whole sample
 // grid, yesterday through tomorrow — the scrubber's past window plus the
 // forecast horizon.
-function buildModelFromResults(results) {
+function buildModelFromResults(results, grid = GRID_DEFAULT) {
+  if (results.length !== grid.nlat * grid.nlon) {
+    throw new Error(`model grid mismatch (${results.length} points for ${grid.nlat}x${grid.nlon})`);
+  }
   const times = results[0].hourly.time.map((s) => s * 1000);
   const grids = [], uGrids = [], vGrids = [], pGrids = [];
   times.forEach((_, k) => {
@@ -238,6 +245,8 @@ function buildModelFromResults(results) {
     grids.push(g); uGrids.push(gu); vGrids.push(gv); pGrids.push(gp);
   });
   model = { times, grids, uGrids, vGrids, pGrids };
+  GRID_NLAT = grid.nlat;
+  GRID_NLON = grid.nlon;
 }
 
 // Primary source: data/model.json, committed by the scheduled GitHub Action
@@ -249,16 +258,18 @@ async function fetchModelLocal() {
   const j = await res.json();
   if (!j.results?.length) throw new Error("empty model file");
   if (Date.now() - (j.generated ?? 0) > 12 * 3600_000) throw new Error("stale model file");
-  buildModelFromResults(j.results);
+  // files written before the grid moved to 8x12 carry no `grid` field
+  buildModelFromResults(j.results, j.grid ?? { nlat: 6, nlon: 9 });
 }
 
 // Fallback: fetch Open-Meteo directly from the browser.
 async function fetchModel() {
   const lats = [], lons = [];
-  for (let iy = 0; iy < GRID_NLAT; iy++) {
-    for (let ix = 0; ix < GRID_NLON; ix++) {
-      lats.push((OVERLAY.latMin + (iy * (OVERLAY.latMax - OVERLAY.latMin)) / (GRID_NLAT - 1)).toFixed(4));
-      lons.push((OVERLAY.lonMin + (ix * (OVERLAY.lonMax - OVERLAY.lonMin)) / (GRID_NLON - 1)).toFixed(4));
+  const { nlat, nlon } = GRID_DEFAULT;
+  for (let iy = 0; iy < nlat; iy++) {
+    for (let ix = 0; ix < nlon; ix++) {
+      lats.push((OVERLAY.latMin + (iy * (OVERLAY.latMax - OVERLAY.latMin)) / (nlat - 1)).toFixed(4));
+      lons.push((OVERLAY.lonMin + (ix * (OVERLAY.lonMax - OVERLAY.lonMin)) / (nlon - 1)).toFixed(4));
     }
   }
   // chunked: long multi-location URLs / heavy requests are what get refused
@@ -277,19 +288,22 @@ async function fetchModel() {
   }
   const results = (await Promise.all(requests)).flat();
   if (results.length !== lats.length) throw new Error("open-meteo result count mismatch");
-  buildModelFromResults(results);
+  buildModelFromResults(results, GRID_DEFAULT);
 }
 
 // Cache the model in localStorage so page reloads within the refresh window
 // don't re-hit Open-Meteo — rapid reloads are how free-tier rate limits get
 // burned, which then takes the model (and wind) down for everyone-you.
-const MODEL_CACHE_KEY = "sgtemp-model-v2"; // v2: adds precipitation grids
+const MODEL_CACHE_KEY = "sgtemp-model-v3"; // v3: grid dimensions stored
 
 function loadModelCache() {
   try {
     const c = JSON.parse(localStorage.getItem(MODEL_CACHE_KEY));
     if (!c || Date.now() - c.at > MODEL_REFRESH_MS) return false;
     const revive = (arr) => arr.map((g) => Float32Array.from(g, (x) => (x == null ? NaN : x)));
+    if (!c.grid || c.grids[0]?.length !== c.grid.nlat * c.grid.nlon) return false;
+    GRID_NLAT = c.grid.nlat;
+    GRID_NLON = c.grid.nlon;
     model = {
       times: c.times, grids: revive(c.grids),
       uGrids: revive(c.uGrids), vGrids: revive(c.vGrids),
@@ -305,7 +319,7 @@ function saveModelCache() {
   try {
     const pack = (arr) => arr.map((g) => Array.from(g, (x) => (Number.isNaN(x) ? null : x)));
     localStorage.setItem(MODEL_CACHE_KEY, JSON.stringify({
-      at: Date.now(), times: model.times,
+      at: Date.now(), times: model.times, grid: { nlat: GRID_NLAT, nlon: GRID_NLON },
       grids: pack(model.grids), uGrids: pack(model.uGrids), vGrids: pack(model.vGrids),
       pGrids: pack(model.pGrids ?? []),
     }));
@@ -651,24 +665,26 @@ async function seedRainRecent() {
 
 const rainLayer = new Map(); // id -> {circle (gauges only), icon}
 
-/* Rain is drawn with 🌧️ rain-cloud glyphs, never with colour: on this map
-   colour means temperature and nothing else. Intensity is carried by the
-   glyph's size and opacity (plus a neutral splash ring around observed
-   gauges); forecast glyphs are dimmer and ringed with a dashed outline —
-   the same "estimate" mark as the dashed forecast pills. */
+/* Rain is drawn as neutral grey-white cloud (radar, nowcast, model — see
+   the radar section) with 🌧️ glyphs underneath, never with colour: on this
+   map colour means temperature and nothing else. Glyphs sit at the real
+   NEA gauge positions: observed readings in the past/live, and in the
+   future whatever rain the cloud layer brings to that gauge — so, as with
+   the real thing, glyphs appear under the cloud as it rolls over. Forecast
+   glyphs are dimmer and ringed with a dashed outline, the same "estimate"
+   mark as the dashed forecast pills. */
 const RAIN_RING = "rgb(222, 229, 239)"; // neutral, deliberately not a hue
 
 // 0..1 visibility of a forecast rain rate: ~0.35 at 0.3 mm/h, ~0.6 at
-// 1 mm/h, ~0.95 from 4 mm/h (a 10km model cell averages a local shower
-// down to 0.3-1 mm/h, so that range has to register clearly)
+// 1 mm/h, ~0.95 from 4 mm/h
 function fcRainStrength(mm) {
   return smooth01((mm - 0.08) / 0.35) * (0.55 + 0.45 * smooth01(mm / 5));
 }
 
-const FC_RAIN_MIN_MM = 0.3;     // model mm/h worth a forecast glyph
-const FC_ICON_SPACING_KM = 14;  // glyphs at least this far apart
-const FC_ICON_MAX = 10;         // per view
-let fcRainMax = 0, fcRainByRadar = false;
+// forecast mm/h worth a glyph: a real shower, not the drizzle haze the
+// model spreads everywhere (at 0.3, ~40 of 60 gauges lit up — clutter)
+const FC_RAIN_MIN_MM = 1;
+let fcRainMax = 0, fcRainSrc = "";
 
 // Open-Meteo's hourly precipitation is the total over the PRECEDING hour,
 // so the value stamped 08:00 is the 07:00-08:00 rate: sample half an hour
@@ -678,66 +694,46 @@ function forecastRainGrid(t) {
   return blendGrids(model.pGrids, t + 30 * 60_000);
 }
 
-/* Forecast glyphs at a sparse set of grid nodes — never one per wet node:
-   on widespread-rain hours 40-54 of the 54 nodes are wet and that tiled
-   the map with a lattice. Greedy pick among the nodes inside the current
-   view (the wettest nodes often sit on the grid's outer edge, which a
-   phone never shows): the wettest node, then the next wettest at least
-   FC_ICON_SPACING_KM from every earlier pick. Node ids are stable, so a
-   glyph stays put while its node stays picked; panning/zooming re-picks. */
-function forecastRainIcons(t) {
-  const p = forecastRainGrid(t);
+// Catmull-Rom sample of a model-shaped grid (clamped at the edges), so the
+// ~8km cells blend smoothly instead of showing bilinear diamonds.
+function gridSampleCubic(grid, lat, lon) {
+  const fy = ((lat - OVERLAY.latMin) / (OVERLAY.latMax - OVERLAY.latMin)) * (GRID_NLAT - 1);
+  const fx = ((lon - OVERLAY.lonMin) / (OVERLAY.lonMax - OVERLAY.lonMin)) * (GRID_NLON - 1);
+  const iy = Math.floor(fy), ix = Math.floor(fx);
+  const ty = fy - iy, tx = fx - ix;
+  const at = (y, x) => {
+    const v = grid[Math.min(GRID_NLAT - 1, Math.max(0, y)) * GRID_NLON +
+                   Math.min(GRID_NLON - 1, Math.max(0, x))];
+    return Number.isNaN(v) ? 0 : v;
+  };
+  const cr = (p0, p1, p2, p3, t) =>
+    p1 + 0.5 * t * (p2 - p0 + t * (2 * p0 - 5 * p1 + 4 * p2 - p3 + t * (3 * (p1 - p2) + p3 - p0)));
+  const row = (y) => cr(at(y, ix - 1), at(y, ix), at(y, ix + 1), at(y, ix + 2), tx);
+  return cr(row(iy - 1), row(iy), row(iy + 1), row(iy + 2), ty);
+}
+
+// Forecast glyphs: every gauge position the future rain field reaches.
+function forecastGaugeRain(ctx) {
   fcRainMax = 0;
-  if (!p) return [];
-  // visible area, inset a little so glyphs aren't clipped at the edge
-  let view = null;
-  if (map && map.getBounds) {
-    const b = map.getBounds(), dLat = (b.getNorth() - b.getSouth()) * 0.06,
-      dLon = (b.getEast() - b.getWest()) * 0.06;
-    view = { s: b.getSouth() + dLat, n: b.getNorth() - dLat, w: b.getWest() + dLon, e: b.getEast() - dLon };
+  fcRainSrc = ctx?.src ?? "";
+  if (!ctx?.rate) return [];
+  const out = [];
+  for (const [id, loc] of rainLocs) {
+    const mm = ctx.rate(loc.lat, loc.lon);
+    if (mm > fcRainMax) fcRainMax = mm;
+    if (mm >= FC_RAIN_MIN_MM) out.push({ id: `fc-${id}`, lat: loc.lat, lon: loc.lon, mm, fc: true });
   }
-  const nodes = [];
-  for (let iy = 0; iy < GRID_NLAT; iy++) {
-    for (let ix = 0; ix < GRID_NLON; ix++) {
-      const mm = p[iy * GRID_NLON + ix];
-      if (!(mm >= 0)) continue; // NaN
-      if (mm > fcRainMax) fcRainMax = mm;
-      if (mm < FC_RAIN_MIN_MM) continue;
-      // Each glyph stands for its ~10km model cell; a fixed per-node offset
-      // within the cell keeps uniform rain from reading as a regular grid
-      // (and never moves between scrub steps).
-      const dLat = (OVERLAY.latMax - OVERLAY.latMin) / (GRID_NLAT - 1);
-      const dLon = (OVERLAY.lonMax - OVERLAY.lonMin) / (GRID_NLON - 1);
-      const j1 = Math.sin((iy * 12.9898 + ix * 78.233) * 43.758) * 1e4 % 1;
-      const j2 = Math.sin((iy * 39.346 + ix * 11.135) * 23.421) * 1e4 % 1;
-      const lat = OVERLAY.latMin + iy * dLat + j1 * 0.35 * dLat;
-      const lon = OVERLAY.lonMin + ix * dLon + j2 * 0.35 * dLon;
-      if (view && (lat < view.s || lat > view.n || lon < view.w || lon > view.e)) continue;
-      nodes.push({ id: `fc-${iy}-${ix}`, mm, fc: true, lat, lon });
-    }
-  }
-  nodes.sort((a, b) => b.mm - a.mm);
-  const cosLat = Math.cos((1.35 * Math.PI) / 180);
-  const km = (a, b) => Math.hypot((a.lon - b.lon) * cosLat, a.lat - b.lat) * KM_PER_DEG;
-  const picked = [];
-  for (const n of nodes) {
-    if (picked.length >= FC_ICON_MAX) break;
-    if (picked.every((q) => km(q, n) >= FC_ICON_SPACING_KM)) picked.push(n);
-  }
-  return picked;
+  return out;
 }
 
 function renderRain() {
   if (typeof L === "undefined" || !map) return;
   // live shows "now"; scrubbing the past replays the day's gauges; the
-  // future shows the model's rain instead — unless a radar nowcast frame
-  // covers that moment, which beats the model outright
+  // future shows what the forecast rain field brings to each gauge
   const future = isFutureView();
-  fcRainByRadar = !!(future && radarOn && radarHost &&
-    radarFrameFor(displayedTime() ?? Date.now()));
   const t = displayedTime() ?? Date.now();
   const list = displayedT === null ? wetGauges
-    : future ? (fcRainByRadar ? [] : forecastRainIcons(t))
+    : future ? forecastGaugeRain(rainContext(t))
     : wetList(t);
   const seen = new Set();
   for (const g of list) {
@@ -746,7 +742,7 @@ function renderRain() {
     const active = fc || g.mm > 0.05; // raining now vs rained recently
     const intensity = fc ? g.mm : Math.max(g.mm, (g.recent ?? 0) / 3);
     const k = fc ? fcRainStrength(intensity) : Math.min(1, intensity / 8);
-    const size = Math.round(14 + 8 * k);
+    const size = Math.round(fc ? 12 + 6 * k : 14 + 8 * k);
     const opacity = fc ? 0.5 + 0.3 * k : active ? 1 : 0.55;
     let e = rainLayer.get(g.id);
     if (!e) {
@@ -898,10 +894,11 @@ function renderRainStatus() {
   const el = document.getElementById("rain-status");
   if (!el) return;
   if (isFutureView()) {
-    el.textContent = fcRainByRadar ? "radar nowcast"
-      : !model?.pGrids?.length ? "no model rain"
-      : fcRainMax >= 0.1 ? `model ≈ up to ${fcRainMax.toFixed(1)} mm/h`
-      : "model: dry";
+    const src = fcRainSrc === "nowcast" ? "nowcast" : fcRainSrc === "blend" ? "nowcast→model"
+      : fcRainSrc === "model" ? "model" : "";
+    el.textContent = !src ? "no forecast rain data"
+      : fcRainMax >= 0.1 ? `${src} ≈ up to ${fcRainMax.toFixed(1)} mm/h at gauges`
+      : `${src}: dry at gauges`;
     return;
   }
   const prefix = TEST_RAIN ? "TEST MODE — synthetic · " : "";
@@ -918,13 +915,27 @@ function renderRainStatus() {
   el.textContent = `${prefix}${wet.length} gauge${wet.length > 1 ? "s" : ""} wet · up to ${max.toFixed(1)} mm${suffix}`;
 }
 
-// ---------- precipitation radar (RainViewer) ----------
+// ---------- precipitation radar (RainViewer), nowcast, rain clouds ----------
 
-/* The organic green blobs on commercial weather maps are precipitation
-   radar, not satellite cloud photos: smoothed reflectivity composites
-   coloured by intensity. RainViewer's free API still serves the global
-   radar composite (only its satellite product was retired), so we draw the
-   latest frame with the classic NEXRAD palette, smoothed. */
+/* Radar is decoded, not just displayed. RainViewer's free tier (reduced in
+   Jan 2026) serves ~2h of past frames only: no forecast frames, zoom <= 7,
+   possibly a single colour scheme. We request scheme 0, which encodes
+   reflectivity in the red channel (dBZ = (R & 127) - 32), and decode two
+   z7 tiles per frame into a dBZ grid covering Singapore plus ~250 km in
+   every direction (~0.6 km pixels).
+
+   Those grids drive everything rain-cloud related:
+   - past/live: the frame itself, drawn as neutral grey-white cloud (colour
+     on this map means temperature);
+   - future: a nowcast. Block-matching the latest frame against the one
+     ~20 min earlier gives a motion field; the latest frame is advected
+     along it (semi-Lagrangian), fading with lead time, and blended into the
+     model from +45 min to +2h, after which it's the model alone.
+   Extrapolation only moves rain that already exists: storms that form in
+   place (common on Singapore afternoons) are the model's job.
+
+   If the pixels can't be read (CORS, decode failure) the old coloured tile
+   layers come back without the nowcast, and the footer says why. */
 const RV_META_URL = "https://api.rainviewer.com/public/weather-maps.json";
 let radarOn = true;
 try { radarOn = localStorage.getItem("sgtemp-radar") !== "off"; } catch { /* default on */ }
@@ -939,14 +950,357 @@ function setRadarStatus(text) {
   if (el) el.textContent = text;
 }
 
-let radarFrames = []; // [{time: sec, path}] \u2014 RainViewer keeps ~2h of past frames
+let radarFrames = []; // [{time: sec, path}], oldest first, ~2h of past frames
 let radarHost = "";
+let radarMode = "pixels"; // "pixels" | "tiles" (fallback: coloured tiles, no nowcast)
+let radarModeNote = "";
+let radarApprox = false;  // tiles weren't the dBZ-encoded scheme: intensity is a guess
+
+const RV_Z = 7, RV_TILE = 512;
+const RV_TX = [100, 101], RV_TY = 63; // lon 101.25-106.875, lat 0-2.81
+const RV_W = RV_TILE * RV_TX.length, RV_H = RV_TILE;
+const RV_KM_PER_PX = 40075 / (2 ** RV_Z * RV_TILE); // ~0.61 km at the equator
+const radarGrids = new Map(); // frame path -> Uint8Array(RV_W*RV_H): dBZ+32, 0 = no echo
+
+// Web Mercator pixel <-> lat/lon inside the decoded domain
+function rvX(lon) { return (((lon + 180) / 360) * 2 ** RV_Z - RV_TX[0]) * RV_TILE; }
+function rvY(lat) {
+  const r = (lat * Math.PI) / 180;
+  return (((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2) * 2 ** RV_Z - RV_TY) * RV_TILE;
+}
+function rvLon(x) { return ((x / RV_TILE + RV_TX[0]) / 2 ** RV_Z) * 360 - 180; }
+function rvLat(y) {
+  const n = Math.PI * (1 - (2 * (y / RV_TILE + RV_TY)) / 2 ** RV_Z);
+  return (Math.atan(Math.sinh(n)) * 180) / Math.PI;
+}
+
+// dBZ+32 byte -> mm/h (Marshall-Palmer Z = 200 R^1.6; under 10 dBZ is dry)
+const RATE_LUT = Float32Array.from({ length: 256 }, (_, b) => {
+  const dbz = (b & 127) - 32;
+  return dbz < 10 ? 0 : (10 ** (dbz / 10) / 200) ** (1 / 1.6);
+});
+
+async function decodeRadarTile(url, grid, ox) {
+  const res = await fetch(url); // a CORS block surfaces here as a TypeError
+  if (!res.ok) throw new Error(`tile HTTP ${res.status}`);
+  const bmp = await createImageBitmap(await res.blob());
+  const c = document.createElement("canvas");
+  c.width = RV_TILE; c.height = RV_TILE;
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(bmp, 0, 0, RV_TILE, RV_TILE);
+  const d = ctx.getImageData(0, 0, RV_TILE, RV_TILE).data;
+  let grey = 0, coloured = 0;
+  for (let y = 0; y < RV_TILE; y++) {
+    for (let x = 0; x < RV_TILE; x++) {
+      const o = (y * RV_TILE + x) * 4;
+      if (d[o + 3] < 8) continue;
+      const r = d[o], g = d[o + 1], b = d[o + 2];
+      let v;
+      if (Math.abs(r - g) <= 3 && Math.abs(g - b) <= 3) { grey++; v = r & 127; }
+      // some other palette came back: no dBZ in it, so call it a moderate
+      // echo (~45 dBZ) — shape and motion stay right, intensity doesn't
+      else { coloured++; v = 77; }
+      grid[y * RV_W + ox + x] = v;
+    }
+  }
+  return { grey, coloured };
+}
+
+async function loadRadarGrid(f) {
+  if (radarGrids.has(f.path)) return radarGrids.get(f.path);
+  const grid = new Uint8Array(RV_W * RV_H);
+  let grey = 0, coloured = 0;
+  for (let i = 0; i < RV_TX.length; i++) {
+    const url = `${radarHost}${f.path}/${RV_TILE}/${RV_Z}/${RV_TX[i]}/${RV_TY}/0/1_0.png`;
+    const r = await decodeRadarTile(url, grid, i * RV_TILE);
+    grey += r.grey; coloured += r.coloured;
+  }
+  if (coloured > 50 && coloured > grey * 0.25) radarApprox = true;
+  radarGrids.set(f.path, grid);
+  return grid;
+}
+
+// Bilinear rain rate (mm/h) at a fractional domain pixel; 0 outside.
+function sampleRate(grid, x, y) {
+  x -= 0.5; y -= 0.5;
+  const x0 = Math.floor(x), y0 = Math.floor(y);
+  if (x0 < 0 || y0 < 0 || x0 >= RV_W - 1 || y0 >= RV_H - 1) return 0;
+  const tx = x - x0, ty = y - y0, i = y0 * RV_W + x0;
+  const a = RATE_LUT[grid[i]], b = RATE_LUT[grid[i + 1]];
+  const c = RATE_LUT[grid[i + RV_W]], d = RATE_LUT[grid[i + RV_W + 1]];
+  return (a + (b - a) * tx) * (1 - ty) + (c + (d - c) * tx) * ty;
+}
+
+// ---- motion ----
+
+const NOWCAST = {
+  f: 4,             // motion is estimated on a 4x-downsampled grid (~2.4 km)
+  block: 12,        // matching block, coarse px (~29 km)
+  stride: 8,
+  maxKmh: 70,       // search radius
+  horizonMin: 120,  // radar extrapolation is used up to +2h...
+  blendFrom: 45,    // ...handing over to the model from +45 min
+  decayMin: 100,    // e-folding of extrapolated intensity (it can't grow)
+};
+let radarMotion = null; // {vx, vy (full px/min per cell), nx, ny, cw, ch, kmh, toward, key}
+
+function coarseLog(grid, f) {
+  const w = RV_W / f, h = RV_H / f, a = new Float32Array(w * h);
+  for (let y = 0; y < RV_H; y++) {
+    const row = ((y / f) | 0) * w;
+    for (let x = 0; x < RV_W; x++) a[row + ((x / f) | 0)] += Math.log1p(RATE_LUT[grid[y * RV_W + x]]);
+  }
+  for (let i = 0; i < a.length; i++) a[i] /= f * f;
+  return { a, w, h };
+}
+
+/* Block matching: for each wet block of the later frame B, the shift that
+   best matches the earlier frame A (sum of absolute differences), refined
+   to sub-pixel with a parabola through the minimum. Vectors are in coarse
+   px over the frame gap; flat or ambiguous blocks are dropped. */
+function blockMotion(A, B, w, h, block, stride, S) {
+  const out = [];
+  const n = 2 * S + 1;
+  const sad = new Float32Array(n * n);
+  for (let by = S; by + block <= h - S; by += stride) {
+    for (let bx = S; bx + block <= w - S; bx += stride) {
+      let wet = 0;
+      for (let y = by; y < by + block; y++) {
+        for (let x = bx; x < bx + block; x++) if (B[y * w + x] > 0.05) wet++;
+      }
+      if (wet < block * block * 0.1) continue;
+      let best = Infinity, bi = 0, sum = 0;
+      for (let dy = -S; dy <= S; dy++) {
+        for (let dx = -S; dx <= S; dx++) {
+          let s = 0;
+          for (let y = by; y < by + block; y++) {
+            const rb = y * w, ra = (y - dy) * w - dx;
+            for (let x = bx; x < bx + block; x++) s += Math.abs(B[rb + x] - A[ra + x]);
+          }
+          const k = (dy + S) * n + dx + S;
+          sad[k] = s; sum += s;
+          if (s < best) { best = s; bi = k; }
+        }
+      }
+      if (!(best < 0.6 * (sum / (n * n)))) continue;
+      const iy = Math.floor(bi / n), ix = bi % n;
+      const sub = (m, c, p) => { const d = m - 2 * c + p; return d > 0 ? (0.5 * (m - p)) / d : 0; };
+      const fx = ix > 0 && ix < n - 1 ? sub(sad[bi - 1], best, sad[bi + 1]) : 0;
+      const fy = iy > 0 && iy < n - 1 ? sub(sad[bi - n], best, sad[bi + n]) : 0;
+      out.push({ x: bx + block / 2, y: by + block / 2, dx: ix - S + fx, dy: iy - S + fy, wt: wet });
+    }
+  }
+  return out;
+}
+
+/* Smooth motion field on a coarse cell grid: inverse-distance blend of the
+   block vectors, pulled toward their median where vectors are sparse, with
+   outliers (far from the median) dropped first. */
+function motionField(vecs, w, h, f, dtMin) {
+  if (!vecs.length) return null;
+  const med = (k) => { const s = vecs.map((v) => v[k]).sort((a, b) => a - b); return s[s.length >> 1]; };
+  const gx = med("dx"), gy = med("dy");
+  const keep = vecs.filter((v) => Math.hypot(v.dx - gx, v.dy - gy) <= Math.max(1.5, 0.8 * Math.hypot(gx, gy)));
+  const nx = 16, ny = 8, cw = w / nx, ch = h / ny;
+  const vx = new Float32Array(nx * ny), vy = new Float32Array(nx * ny);
+  const total = keep.reduce((a, v) => a + v.wt, 0);
+  const W0 = total / (60 * 60); // the median, as if seen from ~60 coarse px away
+  const scale = f / dtMin;      // coarse px per gap -> full px per minute
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      const cx = (i + 0.5) * cw, cy = (j + 0.5) * ch;
+      let sw = W0, sx = W0 * gx, sy = W0 * gy;
+      for (const v of keep) {
+        const wt = v.wt / ((v.x - cx) ** 2 + (v.y - cy) ** 2 + 20 * 20);
+        sw += wt; sx += wt * v.dx; sy += wt * v.dy;
+      }
+      vx[j * nx + i] = (sx / sw) * scale;
+      vy[j * nx + i] = (sy / sw) * scale;
+    }
+  }
+  const kmh = Math.hypot(gx, gy) * f * RV_KM_PER_PX * (60 / dtMin);
+  const toward = (Math.atan2(gx, -gy) * 180 / Math.PI + 360) % 360; // y grows southward
+  return { vx, vy, nx, ny, cw: cw * f, ch: ch * f, kmh, toward, vectors: keep.length };
+}
+
+// Motion (full px/min) at a full-res domain pixel, bilinear over the cells.
+function motionAt(x, y) {
+  const m = radarMotion;
+  const fx = Math.min(m.nx - 1, Math.max(0, x / m.cw - 0.5));
+  const fy = Math.min(m.ny - 1, Math.max(0, y / m.ch - 0.5));
+  const i0 = Math.min(m.nx - 2, Math.floor(fx)), j0 = Math.min(m.ny - 2, Math.floor(fy));
+  const tx = fx - i0, ty = fy - j0;
+  const at = (arr, i, j) => arr[j * m.nx + i];
+  const bl = (arr) => (at(arr, i0, j0) * (1 - tx) + at(arr, i0 + 1, j0) * tx) * (1 - ty) +
+    (at(arr, i0, j0 + 1) * (1 - tx) + at(arr, i0 + 1, j0 + 1) * tx) * ty;
+  return { vx: bl(m.vx), vy: bl(m.vy) };
+}
+
+function updateMotion() {
+  const n = radarFrames.length;
+  if (n < 2) { radarMotion = null; return; }
+  const latest = radarFrames[n - 1];
+  let prev = radarFrames[n - 2];
+  for (let k = n - 2; k >= 0; k--) {
+    if (latest.time - radarFrames[k].time >= 20 * 60) { prev = radarFrames[k]; break; }
+  }
+  const key = `${prev.path}>${latest.path}`;
+  if (radarMotion?.key === key) return;
+  const A = radarGrids.get(prev.path), B = radarGrids.get(latest.path);
+  if (!A || !B) return;
+  const dtMin = (latest.time - prev.time) / 60;
+  const f = NOWCAST.f;
+  const a = coarseLog(A, f), b = coarseLog(B, f);
+  const S = Math.ceil((NOWCAST.maxKmh * dtMin) / 60 / (RV_KM_PER_PX * f));
+  const vecs = blockMotion(a.a, b.a, a.w, a.h, NOWCAST.block, NOWCAST.stride, S);
+  // no trackable rain anywhere: nothing moves (persistence, still fading)
+  radarMotion = motionField(vecs, a.w, a.h, f, dtMin) ??
+    { vx: new Float32Array(4), vy: new Float32Array(4), nx: 2, ny: 2, cw: RV_W / 2, ch: RV_H / 2, kmh: 0, toward: 0, vectors: 0 };
+  radarMotion.key = key;
+  console.info(`[sgtemp] nowcast motion: ${radarMotion.kmh.toFixed(0)} km/h toward ${radarMotion.toward.toFixed(0)}° from ${radarMotion.vectors} blocks`);
+}
+
+// Extrapolated rate at a domain pixel, leadMin after the latest frame:
+// follow the motion backwards and read the latest frame there.
+function nowcastRate(grid, x, y, leadMin) {
+  const m = radarMotion ? motionAt(x, y) : { vx: 0, vy: 0 };
+  return sampleRate(grid, x - m.vx * leadMin, y - m.vy * leadMin) * Math.exp(-leadMin / NOWCAST.decayMin);
+}
+
+function latestRadar() {
+  const f = radarFrames[radarFrames.length - 1];
+  const grid = f && radarMode === "pixels" ? radarGrids.get(f.path) : null;
+  return grid ? { f, grid } : null;
+}
+
+function radarFrameFor(tMs) {
+  let best = null, bestD = Infinity;
+  for (const f of radarFrames) {
+    const d = Math.abs(f.time * 1000 - tMs);
+    if (d < bestD) { bestD = d; best = f; }
+  }
+  return bestD <= 15 * 60_000 ? best : null;
+}
+
+/* What the rain looks like at displayed time t, as a rate(lat, lon) in
+   mm/h plus where it comes from:
+   - past/live: the matching radar frame ("radar"), if decoded;
+   - future: nowcast, then nowcast->model blend, then model. */
+function rainContext(t) {
+  if (!isFutureView()) {
+    const f = displayedT === null ? radarFrames[radarFrames.length - 1] : radarFrameFor(t);
+    const grid = f && radarMode === "pixels" ? radarGrids.get(f.path) : null;
+    if (!grid) return { src: radarMode === "tiles" && f ? "tiles" : f ? "pending" : "none", frame: f };
+    return { src: "radar", frame: f, rate: (lat, lon) => sampleRate(grid, rvX(lon), rvY(lat)) };
+  }
+  const latest = latestRadar();
+  const lead = latest ? (t - latest.f.time * 1000) / 60_000 : Infinity;
+  const p = forecastRainGrid(t);
+  const modelRate = p ? (lat, lon) => Math.max(0, gridSampleCubic(p, lat, lon)) : null;
+  const useRadar = !!latest && lead <= NOWCAST.horizonMin;
+  if (!useRadar && !modelRate) return { src: "none" };
+  const radarRate = useRadar ? (lat, lon) => nowcastRate(latest.grid, rvX(lon), rvY(lat), lead) : null;
+  const w = !useRadar ? 1 : !modelRate ? 0
+    : smooth01((lead - NOWCAST.blendFrom) / (NOWCAST.horizonMin - NOWCAST.blendFrom));
+  const src = w >= 1 ? "model" : w <= 0 ? "nowcast" : "blend";
+  return {
+    src, lead, frame: latest?.f,
+    rate: w >= 1 ? modelRate : w <= 0 ? radarRate
+      : (lat, lon) => (1 - w) * radarRate(lat, lon) + w * modelRate(lat, lon),
+  };
+}
+
+// ---- rain cloud layer ----
+
+// Raster aligned to the radar pixels over the map window (~0.6 km each).
+const CLOUD = (() => {
+  const x0 = Math.floor(rvX(OVERLAY.lonMin)), x1 = Math.ceil(rvX(OVERLAY.lonMax));
+  const y0 = Math.floor(rvY(OVERLAY.latMax)), y1 = Math.ceil(rvY(OVERLAY.latMin));
+  return { x0, y0, w: x1 - x0, h: y1 - y0 };
+})();
+let cloudLayer = null, cloudCanvas = null, cloudKey = "";
+
+// mm/h -> cloud opacity/brightness: faint grey drizzle, dense white downpour
+function cloudLook(mm) {
+  if (!(mm > 0.1)) return null;
+  const k = Math.min(1, Math.log1p(mm) / Math.log1p(20)) ** 0.7;
+  return { a: 0.65 * k, c: Math.round(178 + 72 * k) };
+}
+
+function hideClouds() {
+  if (cloudLayer) cloudLayer.setOpacity(0);
+  cloudKey = "";
+}
+
+function fmtClock(sec) {
+  return new Date(sec * 1000).toLocaleTimeString("en-SG",
+    { timeZone: "Asia/Singapore", hour: "2-digit", minute: "2-digit" });
+}
+
+function renderClouds() {
+  if (typeof L === "undefined" || !map) return;
+  if (!radarOn) { hideClouds(); setRadarStatus("off"); return; }
+  const t = displayedTime() ?? Date.now();
+  const ctx = rainContext(t);
+  const approx = radarApprox ? " · intensity approx. (unexpected palette)" : "";
+  const note = radarModeNote ? ` · ${radarModeNote}` : "";
+  const m = radarMotion;
+  const motion = m && m.kmh >= 3 ? ` · rain moving ${m.kmh.toFixed(0)} km/h → ${COMPASS[Math.round(m.toward / 22.5) % 16]}` : "";
+  if (ctx.src === "radar") setRadarStatus(`frame ${fmtClock(ctx.frame.time)}${approx}${note}`);
+  else if (ctx.src === "nowcast") setRadarStatus(`nowcast +${Math.round(ctx.lead)} min${motion}${approx}`);
+  else if (ctx.src === "blend") setRadarStatus(`nowcast→model +${Math.round(ctx.lead)} min${motion}`);
+  else if (ctx.src === "model") {
+    setRadarStatus(radarMode === "pixels" && latestRadar() ? "model rain (past the 2h nowcast)" : `model rain${note}`);
+  }
+  else if (ctx.src === "pending") setRadarStatus("loading radar…");
+  else if (ctx.src === "none") setRadarStatus(radarFrames.length ? "no radar at this time" : "no radar frames");
+  // "tiles": applyTileFrame owns the status
+  if (!ctx.rate) { hideClouds(); return; }
+
+  const key = `${t}|${ctx.src}|${ctx.frame?.path}|${radarMotion?.key}|${model?.times?.[0]}|${GRID_NLAT}`;
+  if (key === cloudKey) return;
+  if (!cloudCanvas) {
+    cloudCanvas = document.createElement("canvas");
+    cloudCanvas.width = CLOUD.w;
+    cloudCanvas.height = CLOUD.h;
+  }
+  if (typeof cloudCanvas.getContext !== "function") return;
+  const c2 = cloudCanvas.getContext("2d");
+  const img = c2.createImageData(CLOUD.w, CLOUD.h);
+  const future = isFutureView();
+  const lons = Array.from({ length: CLOUD.w }, (_, i) => rvLon(CLOUD.x0 + i + 0.5));
+  for (let j = 0; j < CLOUD.h; j++) {
+    const lat = rvLat(CLOUD.y0 + j + 0.5);
+    for (let i = 0; i < CLOUD.w; i++) {
+      const look = cloudLook(ctx.rate(lat, lons[i]));
+      if (!look) continue;
+      const o = (j * CLOUD.w + i) * 4;
+      img.data[o] = look.c; img.data[o + 1] = look.c; img.data[o + 2] = Math.min(255, look.c + 4);
+      img.data[o + 3] = Math.round(255 * look.a * (future ? 0.85 : 1));
+    }
+  }
+  c2.putImageData(img, 0, 0);
+  const url = cloudCanvas.toDataURL();
+  if (!cloudLayer) {
+    cloudLayer = L.imageOverlay(url,
+      [[rvLat(CLOUD.y0 + CLOUD.h), rvLon(CLOUD.x0)], [rvLat(CLOUD.y0), rvLon(CLOUD.x0 + CLOUD.w)]],
+      { pane: "clouds", opacity: 1, interactive: false, className: "rain-clouds",
+        attribution: 'Radar: <a href="https://www.rainviewer.com/">RainViewer</a>' }).addTo(map);
+  } else {
+    cloudLayer.setUrl(url);
+    cloudLayer.setOpacity(1);
+  }
+  cloudKey = key;
+}
+
+// ---- fallback: RainViewer's own coloured tiles (no pixel access) ----
+
 const radarLayers = new Map(); // frame path -> persistent preloaded layer
 let radarShown = null;         // frame path currently visible
 
 function radarUrl(path) {
-  // 512px tiles double the resolution at the same zoom cap;
-  // colour scheme 6 = NEXRAD green/yellow/red; options 1_1 = smoothed
+  // 512px tiles double the resolution at the same zoom cap; scheme 6 =
+  // NEXRAD (the free tier may serve its single scheme regardless)
   return `${radarHost}${path}/512/{z}/{x}/{y}/6/1_1.png`;
 }
 
@@ -978,45 +1332,33 @@ function layerFor(path) {
   return l;
 }
 
-function radarFrameFor(tMs) {
-  let best = null, bestD = Infinity;
-  for (const f of radarFrames) {
-    const d = Math.abs(f.time * 1000 - tMs);
-    if (d < bestD) { bestD = d; best = f; }
-  }
-  return bestD <= 15 * 60_000 ? best : null;
-}
-
-/* Show the frame matching the displayed time: latest when live, the nearest
-   archive frame when scrubbing the last ~2h, hidden (with an honest status)
-   beyond the archive. Every frame is a persistent preloaded layer, so a
-   scrub is just an opacity flip between layers that are already on the map
-   \u2014 no network, nothing to fade. A cold (not yet loaded) frame defers its
-   flip until loaded, keeping the previous frame visible meanwhile. */
-function applyRadarFrame() {
-  if (!radarOn || !radarHost || !radarFrames.length) return;
+/* Tile fallback: every frame is a persistent preloaded layer, so a scrub is
+   just an opacity flip (anything that reloads tiles on scrub fades). */
+function applyTileFrame() {
   const pane = map.getPane && map.getPane("radar");
   const f = displayedT === null
     ? radarFrames[radarFrames.length - 1]
-    : radarFrameFor(displayedTime() ?? Date.now());
+    : isFutureView() ? null : radarFrameFor(displayedTime() ?? Date.now());
   if (!f) {
     if (pane) pane.style.display = "none";
-    setRadarStatus("no archive at this time");
     return;
   }
   if (pane) pane.style.display = "";
   if (f.path === radarShown) return;
   radarShown = f.path;
-  const label = new Date(f.time * 1000).toLocaleTimeString("en-SG",
-    { timeZone: "Asia/Singapore", hour: "2-digit", minute: "2-digit" });
   const l = layerFor(f.path);
   const finalize = () => {
     if (radarShown !== f.path) return; // the scrub has moved on
     for (const [p, ly] of radarLayers) ly.setOpacity(p === f.path ? 0.7 : 0);
-    setRadarStatus(`frame ${label}`);
+    setRadarStatus(`tiles ${fmtClock(f.time)} · ${radarModeNote}`);
   };
   if (l._warm || !l.once) finalize();
   else l.once("load", finalize);
+}
+
+function applyRadarFrame() {
+  if (radarMode === "tiles" && radarOn && radarHost && radarFrames.length) applyTileFrame();
+  renderClouds();
 }
 
 async function fetchRadar() {
@@ -1025,11 +1367,12 @@ async function fetchRadar() {
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const json = await res.json();
   radarHost = json.host;
-  // past ~2h plus RainViewer's ~30-minute nowcast, so the slider's first
-  // forecast steps still show projected rain
-  radarFrames = [...(json.radar?.past ?? []), ...(json.radar?.nowcast ?? [])];
+  // the free tier no longer serves forecast ("nowcast") frames — ours is
+  // computed from these past frames instead
+  radarFrames = (json.radar?.past ?? []).slice().sort((a, b) => a.time - b.time);
   if (!radarFrames.length) { setRadarStatus("no radar frames"); return; }
   const valid = new Set(radarFrames.map((f) => f.path));
+  for (const p of radarGrids.keys()) if (!valid.has(p)) radarGrids.delete(p);
   for (const [p, ly] of radarLayers) {
     if (!valid.has(p)) {
       ly.remove();
@@ -1037,12 +1380,38 @@ async function fetchRadar() {
       if (radarShown === p) radarShown = null;
     }
   }
-  if (!radarLayers.size) setRadarStatus("loading radar\u2026");
-  applyRadarFrame();
-  // warm every frame in the background so scrubbing flips instantly
-  setTimeout(() => {
-    if (radarOn && radarHost) for (const f of radarFrames) layerFor(f.path);
-  }, 2500);
+  if (radarMode === "pixels") {
+    const n = radarFrames.length;
+    // newest first (live view), then ~20 min back (motion), then the rest
+    const order = [n - 1, Math.max(0, n - 3), ...Array.from({ length: n }, (_, i) => n - 1 - i)]
+      .filter((i, k, a) => a.indexOf(i) === k).map((i) => radarFrames[i]);
+    let failed = 0;
+    for (const [k, f] of order.entries()) {
+      try {
+        await loadRadarGrid(f);
+      } catch (e) {
+        if (k === 0 && !radarGrids.size) {
+          // can't read pixels at all: fall back to plain tiles, loudly
+          radarMode = "tiles";
+          radarModeNote = `radar pixels unreadable (${e.message}) — coloured tiles, no nowcast`;
+          console.warn(`[sgtemp] ${radarModeNote}`);
+          break;
+        }
+        failed++;
+      }
+      if (k === 1) { updateMotion(); scheduleRender(); }
+      if (k === 0) scheduleRender();
+    }
+    if (failed) console.warn(`[sgtemp] ${failed} radar frame(s) failed to load`);
+    updateMotion();
+  }
+  scheduleRender();
+  if (radarMode === "tiles") {
+    // warm every frame in the background so scrubbing flips instantly
+    setTimeout(() => {
+      if (radarOn && radarHost) for (const f of radarFrames) layerFor(f.path);
+    }, 2500);
+  }
 }
 
 function pollRadar() {
@@ -2341,14 +2710,15 @@ function initMap() {
     maxBoundsViscosity: 1.0, // hard wall when panning
     zoomSnap: 0, // fractional zoom, so min zoom can match the bounds exactly
   });
-  const radarPane = map.createPane("radar"); // RainViewer frames
+  const radarPane = map.createPane("radar"); // RainViewer tiles (fallback only)
   radarPane.style.zIndex = 430; // above the shading (400), below markers (600)
   radarPane.style.pointerEvents = "none";
+  const cloudPane = map.createPane("clouds"); // decoded radar / nowcast / model rain
+  cloudPane.style.zIndex = 432;
+  cloudPane.style.pointerEvents = "none";
   const rainPane = map.createPane("rain"); // gauge glyphs + splash circles
   rainPane.style.zIndex = 440;
   map.fitBounds(dataBounds);
-  // forecast rain glyphs are picked from the nodes in view
-  map.on("moveend", () => { if (isFutureView()) renderRain(); });
   // Fully zoomed out = screen completely filled by the data window
   // (inside=true), so the map can never show past the data edge. Recompute
   // when the container changes shape, or a resize would reopen the gap.
@@ -2413,13 +2783,13 @@ document.getElementById("radar-btn").addEventListener("click", () => {
   updateRadarBtn();
   if (!radarOn) {
     for (const ly of radarLayers.values()) ly.remove();
+    hideClouds();
     setRadarStatus("off");
-  } else if (radarLayers.size) {
+  } else {
     for (const ly of radarLayers.values()) ly.addTo(map);
     radarShown = null;
+    if (!radarFrames.length) pollRadar();
     applyRadarFrame();
-  } else {
-    pollRadar();
   }
 });
 updateRadarBtn();

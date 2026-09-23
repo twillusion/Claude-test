@@ -73,20 +73,20 @@ static page, no backend, no hosting costs.
   so the numbers tick like a real-time feed between the actual per-minute
   polls. Only the number displays refresh (no overlay re-rasterization),
   and it pauses when the tab is hidden.
-- Rain: 5-minute rainfall totals from NEA's ~60 gauges (polled every 5
-  minutes, kept as a 24h series) render as a 🌧️ glyph per wet gauge,
-  sized by intensity, with a faint neutral splash ring; a gauge stays
-  marked (faded) for 30 minutes after rain stops. Colour is reserved for
-  temperature. The time scrubber replays the day's rain; scrubbing into
-  the future switches to the Open-Meteo precipitation forecast, drawn as
-  a sparse set of dimmer glyphs with dashed rings where the model puts
-  rain (hidden while a RainViewer nowcast frame covers the time). Hours
-  with forecast rain are marked on the slider track, and the footer gives
-  an outlook ("model: showers ~12 pm–4 pm").
-- Radar: RainViewer's precipitation composite (smoothed NEXRAD palette,
-  512px tiles) as preloaded per-frame layers — the scrubber flips between
-  the ~2h archive and ~30min nowcast with no reload flicker; the RADAR
-  button toggles it.
+- Rain: drawn as neutral grey-white cloud — colour on the map is reserved
+  for temperature — with 🌧️ glyphs at NEA's ~60 rain gauges underneath.
+  Past and live, the cloud is RainViewer's radar (decoded from its
+  dBZ-encoded tiles, ~0.6 km pixels) and the glyphs are real 5-minute gauge
+  readings. Into the future, the site runs its own nowcast: it measures how
+  the rain moved between radar frames ~20 minutes apart and carries the
+  latest radar forward along that motion (fading with lead time), blending
+  into the Open-Meteo model from +45 min to +2 h; beyond that it's the
+  model (ECMWF, ~8 km cells). Forecast glyphs appear at gauges the cloud
+  reaches at ≥1 mm/h, dimmer and dashed-ringed. The footer shows the
+  source, lead time and rain motion; model rain hours are marked on the
+  slider track. If the browser can't read radar pixels, RainViewer's own
+  coloured tiles are shown instead (no nowcast) and the footer says so.
+  The RADAR button toggles the cloud layer.
 - The wind field is precomputed onto a 24×16 grid once per change, so
   particles and rain sample it with one bilinear lookup per tick instead
   of per-particle IDW.
