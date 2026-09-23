@@ -19,7 +19,7 @@ const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
 const HISTORY_HOURS = 24;
 // Shown in the footer; bump together with the ?v= stamps in index.html so a
 // glance settles "am I looking at the new build or a stale cache?"
-const APP_VERSION = "20260923c";
+const APP_VERSION = "20260923d";
 
 // CARTO basemap key. Since Aug 2026 basemaps.cartocdn.com answers keyless
 // requests with HTTP 200 tiles that have "API KEY REQUIRED" burned in, so
@@ -667,11 +667,39 @@ function rainColor(mm) {
    widespread-rain hour (40-54 of the 54 nodes wet is common) tiled the
    whole map with a lattice of circles. Now the grid is interpolated
    (bicubic, so no bilinear diamonds at the ~10km node spacing) onto a small
-   raster in the rain pane: a soft blue wash whose opacity follows the
-   intensity, striped by CSS so it reads as a forecast, not radar. */
+   raster in the rain pane, in the radar's green-yellow-red language (the
+   first version was pale blue — the same hue as the cool end of the
+   temperature ramp, so a forecast shower read as "slightly cooler"),
+   striped by CSS so it reads as a forecast, not radar.
+   A 10km model cell averages a local shower down to 0.3-1 mm/h, so the
+   opacity has to be clearly visible from ~0.3 mm/h, not ramp up at 5+. */
 const FC_RAIN = { w: 148, h: 94 };  // raster; stretched over OVERLAY bounds
 const FC_RAIN_MIN_MM = 0.1;         // mm/h below which the model is "dry"
-const FC_RAIN_MAX_ALPHA = 0.5;
+const FC_RAIN_MAX_ALPHA = 0.6;
+
+// mm/h -> radar-like colour (RainViewer's NEXRAD scheme runs green -> red)
+const FC_RAIN_STOPS = [
+  [0.1, [150, 230, 150]], [1, [72, 200, 88]], [3, [30, 150, 64]],
+  [6, [240, 210, 60]], [12, [240, 138, 36]], [25, [215, 50, 45]],
+];
+
+function fcRainRGB(mm) {
+  const S = FC_RAIN_STOPS;
+  if (mm <= S[0][0]) return S[0][1];
+  for (let i = 1; i < S.length; i++) {
+    if (mm <= S[i][0]) {
+      const t = (mm - S[i - 1][0]) / (S[i][0] - S[i - 1][0]);
+      return S[i - 1][1].map((c, k) => Math.round(c + (S[i][1][k] - c) * t));
+    }
+  }
+  return S[S.length - 1][1];
+}
+
+// 0..1 visibility of a forecast rain rate: ~0.35 at 0.3 mm/h, ~0.6 at
+// 1 mm/h, ~0.95 from 4 mm/h
+function fcRainStrength(mm) {
+  return smooth01((mm - 0.08) / 0.35) * (0.55 + 0.45 * smooth01(mm / 5));
+}
 let fcRainLayer = null, fcRainCanvas = null, fcRainMax = 0, fcRainByRadar = false;
 
 // Open-Meteo's hourly precipitation is the total over the PRECEDING hour,
@@ -722,10 +750,9 @@ function renderForecastRain(show) {
       const lon = OVERLAY.lonMin + ((px + 0.5) / FC_RAIN.w) * (OVERLAY.lonMax - OVERLAY.lonMin);
       const mm = gridSampleCubic(p, lat, lon);
       if (!(mm > FC_RAIN_MIN_MM)) continue;
-      // fades in over drizzle, full strength by ~6 mm/h; soft raster edges
-      const k = smooth01((mm - FC_RAIN_MIN_MM) / 1.2) * (0.45 + 0.55 * smooth01(mm / 6));
+      const k = fcRainStrength(mm);
       const edge = Math.min(1, Math.min(px, FC_RAIN.w - 1 - px, py, FC_RAIN.h - 1 - py) / edgePx);
-      const [r, g, b] = rainRGB(mm);
+      const [r, g, b] = fcRainRGB(mm);
       const o = (py * FC_RAIN.w + px) * 4;
       img.data[o] = r; img.data[o + 1] = g; img.data[o + 2] = b;
       img.data[o + 3] = Math.round(FC_RAIN_MAX_ALPHA * k * edge * 255);
@@ -841,6 +868,76 @@ function pollRain() {
   });
 }
 
+/* Island-wide model rain per forecast hour, for the slider track and the
+   footer outlook — so "showers this afternoon" is visible from the live
+   view without scrubbing. Each hour's figure is max(p75, p95/2) over the
+   grid: widespread rain and a strong local cell both register, a single
+   drizzly node doesn't. Open-Meteo stamps each hour's total at its END. */
+let rainOutlookCache = { key: "", hours: [] };
+
+function rainOutlook() {
+  if (!model?.pGrids?.length || sliderLiveIdx < 0) return [];
+  const now = sliderTicks[sliderLiveIdx], end = sliderTicks[sliderTicks.length - 1];
+  const key = `${model.times[0]}|${model.pGrids.length}|${now}|${end}|${model.pGrids[0][0]}`;
+  if (rainOutlookCache.key === key) return rainOutlookCache.hours;
+  const hours = [];
+  model.times.forEach((t, k) => {
+    if (t <= now || t - 3600_000 >= end) return;
+    const v = [...model.pGrids[k]].filter((x) => !Number.isNaN(x)).sort((a, b) => a - b);
+    if (!v.length) return;
+    const q = (f) => v[Math.min(v.length - 1, Math.floor(f * v.length))];
+    hours.push({ from: t - 3600_000, to: t, mm: Math.max(q(0.75), q(0.95) / 2) });
+  });
+  rainOutlookCache = { key, hours };
+  return hours;
+}
+
+const OUTLOOK_MM = 0.3; // island-wide mm/h that counts as "showers"
+
+function fmtHour(t) {
+  const opts = { timeZone: "Asia/Singapore", hour: "numeric" };
+  const sameDay = sgtDate(new Date(t)) === sgtDate(new Date());
+  if (!sameDay) opts.weekday = "short";
+  return new Date(t).toLocaleTimeString("en-SG", opts).replace(":00", "");
+}
+
+// "showers ~12 pm–4 pm", "showers now–2 pm", or "no rain next 20h"
+function rainOutlookText() {
+  const hours = rainOutlook();
+  if (!hours.length) return "";
+  const i = hours.findIndex((h) => h.mm >= OUTLOOK_MM);
+  if (i < 0) {
+    const span = Math.round((hours[hours.length - 1].to - Date.now()) / 3600_000);
+    return `model: no rain next ${span}h`;
+  }
+  let j = i;
+  while (j + 1 < hours.length && hours[j + 1].mm >= OUTLOOK_MM) j++;
+  const start = hours[i].from <= Date.now() ? "now" : `~${fmtHour(hours[i].from)}`;
+  return `model: showers ${start}–${fmtHour(hours[j].to)}`;
+}
+
+// Forecast rain hours painted onto the slider track (CSS --rain-track),
+// positioned the way the thumb travels (half a thumb in at each end).
+function renderRainTrack(wrap) {
+  if (!wrap?.style?.setProperty) return;
+  const t0 = sliderTicks[0], t1 = sliderTicks[sliderTicks.length - 1];
+  const stops = [];
+  const pos = (t) => {
+    const f = Math.min(1, Math.max(0, (t - t0) / (t1 - t0 || 1)));
+    return `calc(var(--thumb) / 2 + (100% - var(--thumb)) * ${f.toFixed(4)})`;
+  };
+  for (const h of rainOutlook()) {
+    const k = fcRainStrength(h.mm);
+    if (k < 0.15) continue;
+    const c = `rgba(${fcRainRGB(h.mm).join(",")},${(0.35 + 0.65 * k).toFixed(2)})`;
+    const a = pos(Math.max(h.from, sliderTicks[sliderLiveIdx])), b = pos(h.to);
+    stops.push(`transparent ${a}`, `${c} ${a}`, `${c} ${b}`, `transparent ${b}`);
+  }
+  wrap.style.setProperty("--rain-track", stops.length
+    ? `linear-gradient(90deg, transparent 0, ${stops.join(", ")}, transparent 100%)`
+    : "linear-gradient(transparent, transparent)");
+}
+
 // Describes what the map is showing for rain at the displayed time.
 function renderRainStatus() {
   const el = document.getElementById("rain-status");
@@ -853,15 +950,17 @@ function renderRainStatus() {
     return;
   }
   const prefix = TEST_RAIN ? "TEST MODE — synthetic · " : "";
-  if (!rainReadings.length && !rainSeries.size) { el.textContent = `${prefix}no gauges reporting`; return; }
+  const outlook = rainOutlookText();
+  const suffix = outlook ? ` · ${outlook}` : "";
+  if (!rainReadings.length && !rainSeries.size) { el.textContent = `${prefix}no gauges reporting${suffix}`; return; }
   const wet = displayedT === null ? wetGauges : wetList(displayedTime() ?? Date.now());
   if (!wet.length) {
     el.textContent = displayedT === null
-      ? `${prefix}dry 30 min (${rainReadings.length} gauges)` : `${prefix}dry at this time`;
+      ? `${prefix}dry 30 min (${rainReadings.length} gauges)${suffix}` : `${prefix}dry at this time${suffix}`;
     return;
   }
   const max = Math.max(...wet.map((g) => Math.max(g.mm, (g.recent ?? 0) / 3)));
-  el.textContent = `${prefix}${wet.length} gauge${wet.length > 1 ? "s" : ""} wet · up to ${max.toFixed(1)} mm`;
+  el.textContent = `${prefix}${wet.length} gauge${wet.length > 1 ? "s" : ""} wet · up to ${max.toFixed(1)} mm${suffix}`;
 }
 
 // ---------- precipitation radar (RainViewer) ----------
@@ -1849,6 +1948,7 @@ function renderTimebar(t) {
     if (wrap.style.setProperty) {
       wrap.style.setProperty("--live-frac", max > 0 ? (Math.max(0, sliderLiveIdx) / max).toFixed(4) : "1");
     }
+    renderRainTrack(wrap);
   }
   const f = dayFactor(t ?? Date.now());
   document.getElementById("sky-icon").textContent = f > 0.8 ? "☀️" : f < 0.2 ? "🌙" : "🌅";

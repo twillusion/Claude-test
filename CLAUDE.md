@@ -15,14 +15,15 @@ humans; this file is the working knowledge for continuing development.
 - `assets/vendor/leaflet/` — Leaflet 1.9.4, vendored on purpose (unpkg
   rate-limited the CSS once and broke the whole layout).
 - `scripts/fetch-model.mjs` + `.github/workflows/model.yml` — GitHub Action
-  (every 3h, also manually runnable) that fetches the Open-Meteo forecast
+  (hourly at :37 — GitHub skips many scheduled runs, a 3h cron really ran
+  every 5-7h; also manually runnable) that fetches the Open-Meteo forecast
   and commits `data/model.json`. Do not hand-edit `data/model.json`.
 - `tests/smoke.js` — runs app.js in Node with stubbed DOM/Leaflet/fetch.
 
 ## Every change: the release routine
 
 1. Develop on the designated `claude/...` branch. The model bot commits to
-   `main` every 3h, so **sync first**: `git fetch origin main && git merge
+   `main` hourly, so **sync first**: `git fetch origin main && git merge
    origin/main` (the cloud clone is shallow — if git says "unrelated
    histories", run `git fetch --unshallow origin` first).
 2. `node --check assets/app.js && node tests/smoke.js` — output must contain
@@ -101,8 +102,13 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
   temperature-coloured "windsock" wedge on the pill.
 - **Rain**: glyph + intensity-coloured circle per wet gauge (24h series,
   scrubbable); future = one bicubic-interpolated model-precipitation raster
-  (`renderForecastRain`, CSS-striped `.rain-forecast`), suppressed while a
-  radar nowcast frame covers the time. Never go back to a marker per grid
+  (`renderForecastRain`, CSS-striped `.rain-forecast`) in radar-like
+  green→yellow→red (`fcRainRGB`; the first pale-blue version was mistaken
+  for "cool" temperature shading), visible from ~0.3 mm/h (`fcRainStrength`
+  — a 10km cell averages showers down that low), suppressed while a radar
+  nowcast frame covers the time. `rainOutlook()` paints forecast rain hours
+  onto the slider track (`--rain-track`) and the footer ("model: showers
+  ~12 pm–4 pm"), so it's visible from the live view. Never go back to a marker per grid
   node: widespread-rain hours wet 40-54 of the 54 nodes and the map turns
   into a lattice of circles. `?testrain` URL param injects
   synthetic gauges for visual testing.
