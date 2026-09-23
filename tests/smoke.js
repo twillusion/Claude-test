@@ -43,6 +43,7 @@ global.L = {
   divIcon: (o) => o,
   marker: () => ({ on() {}, addTo() { return this; }, setIcon() {}, bindTooltip() {}, remove() {} }),
   imageOverlay: () => ({ addTo() { return this; }, setUrl() {}, opacity: 1, setOpacity(v) { this.opacity = v; } }),
+  svgOverlay: () => ({ addTo() { return this; }, opacity: 1, setOpacity(v) { this.opacity = v; } }),
 };
 const tileUrls = [];
 { const tl = global.L.tileLayer; global.L.tileLayer = (url, o) => { tileUrls.push(url); return tl(url, o); }; }
@@ -143,8 +144,9 @@ const h = new Function(src + `
     liveIdx: () => sliderLiveIdx,
     futureView: () => isFutureView(),
     windVecAt, fetchWind, fetchRain, fetchRadar, fetchCommunity, extremeness, dayFactor,
-    rainCount: () => rainLayer.size,
-    fcRain: () => ({ icons: [...rainLayer.keys()].filter((k) => k.startsWith("fc-")).length, max: fcRainMax }),
+    // entries fading out still exist for ~0.35 s; count what's shown
+    rainCount: () => [...rainLayer.values()].filter((e) => e.show).length,
+    fcRain: () => ({ icons: [...rainLayer].filter(([k, e]) => k.startsWith("fc-") && e.show).length, max: fcRainMax }),
     radarLayerCount: () => radarLayers.size,
     windGridOk: () => { ensureWindField(); return !!windGridU; },
     rainOutlookText, fcRainStrength,
@@ -205,7 +207,12 @@ const h = new Function(src + `
       displayedT = now * 1000 + 30 * 60_000;
       const ctx = rainContext(displayedT);
       const at = (x) => ctx.rate(rvLat(270), rvLon(x));
-      return { vx: m.vx, vy: m.vy, kmh: radarMotion.kmh, src: ctx.src, ahead: at(465), behind: at(405) };
+      // halfway between the first two past frames: the cell glides to ~405
+      displayedT = (now - 900) * 1000;
+      const mid = rainContext(displayedT);
+      const atm = (x) => mid.rate(rvLat(270), rvLon(x));
+      return { vx: m.vx, vy: m.vy, kmh: radarMotion.kmh, src: ctx.src, ahead: at(465), behind: at(405),
+        midPair: !!mid.pair, midCentre: atm(405), midWest: atm(372), midEast: atm(438) };
     },
   };`)();
 
@@ -274,6 +281,9 @@ const h = new Function(src + `
   console.assert(Math.abs(nc.vx - 1) < 0.15 && Math.abs(nc.vy) < 0.15, "nowcast motion ~1 px/min east:", nc);
   console.assert(Math.abs(nc.kmh - 36.7) < 5, "nowcast speed ~37 km/h:", nc.kmh);
   console.assert(nc.src === "nowcast" && nc.ahead > 3 && nc.behind === 0, "cell advected east at +30 min:", nc);
+  // between past frames rain moves (motion-compensated), no double image
+  console.assert(nc.midPair && nc.midCentre > 8 && nc.midWest === 0 && nc.midEast === 0,
+    "past frames interpolated along the motion:", nc);
   h.goLive();
 
   // ANVIL: growth and decay carry on along the motion

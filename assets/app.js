@@ -19,7 +19,7 @@ const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
 const HISTORY_HOURS = 24;
 // Shown in the footer; bump together with the ?v= stamps in index.html so a
 // glance settles "am I looking at the new build or a stale cache?"
-const APP_VERSION = "20260923g";
+const APP_VERSION = "20260923h";
 
 // CARTO basemap key. Since Aug 2026 basemaps.cartocdn.com answers keyless
 // requests with HTTP 200 tiles that have "API KEY REQUIRED" burned in, so
@@ -726,6 +726,49 @@ function forecastGaugeRain(ctx) {
   return out;
 }
 
+/* Glyphs and circles fade in and out (~0.35 s) instead of popping, and a
+   fading-out one comes straight back if the rain returns mid-fade. */
+const RAIN_FADE_MS = 350;
+let rainFadeOn = false, rainFadeLast = 0;
+
+function applyRainLook(e) {
+  const f = e.fade, L2 = e.look;
+  if (!L2) return;
+  e.circle.setRadius(L2.radius);
+  if (e.circle.setStyle) e.circle.setStyle({ opacity: L2.stroke * f, fillOpacity: L2.fill * f });
+  const el = e.icon.getElement && e.icon.getElement()?.querySelector(".rain-icon");
+  if (el && el.style) {
+    el.style.fontSize = `${L2.size}px`;
+    el.style.opacity = (L2.opacity * f).toFixed(2);
+  }
+}
+
+function startRainFade() {
+  if (rainFadeOn) return;
+  rainFadeOn = true;
+  rainFadeLast = typeof performance !== "undefined" ? performance.now() : Date.now();
+  requestAnimationFrame(rainFadeStep);
+}
+
+function rainFadeStep(now) {
+  const d = Math.min(100, Math.max(1, now - rainFadeLast)) / RAIN_FADE_MS;
+  rainFadeLast = now;
+  let busy = false;
+  for (const [id, e] of rainLayer) {
+    const target = e.show ? 1 : 0;
+    if (e.fade === target) continue;
+    e.fade = target > e.fade ? Math.min(1, e.fade + d) : Math.max(0, e.fade - d);
+    if (e.fade === 0 && !e.show) {
+      e.circle.remove(); e.icon.remove(); rainLayer.delete(id);
+      continue;
+    }
+    applyRainLook(e);
+    busy = true;
+  }
+  if (busy) requestAnimationFrame(rainFadeStep);
+  else rainFadeOn = false;
+}
+
 function renderRain() {
   if (typeof L === "undefined" || !map) return;
   // live shows "now"; scrubbing the past replays the day's gauges; the
@@ -741,51 +784,45 @@ function renderRain() {
     const fc = !!g.fc;
     const active = fc || g.mm > 0.05; // raining now vs rained recently
     const intensity = fc ? g.mm : Math.max(g.mm, (g.recent ?? 0) / 3);
+    // one scale for both: gauges report mm per 5 min, forecasts mm/h
+    const rate = fc ? intensity : intensity * 12;
     const k = fc ? fcRainStrength(intensity) : Math.min(1, intensity / 8);
-    const size = Math.round(fc ? 12 + 6 * k : 14 + 8 * k);
-    const opacity = fc ? 0.5 + 0.3 * k : active ? 1 : 0.55;
     let e = rainLayer.get(g.id);
     if (!e) {
       e = {
-        // gauges get a neutral splash ring; forecast glyphs mark a ~10km
-        // model cell, which a ring would overstate
-        circle: fc ? null : L.circle([g.lat, g.lon], {
-          pane: "rain", radius: 1200, color: RAIN_RING, weight: 1,
-          fillColor: RAIN_RING, interactive: false,
+        // circle of effect: how far the rain reaches, neutral (colour is
+        // for temperature), dashed for forecasts like the forecast pills
+        circle: L.circle([g.lat, g.lon], {
+          pane: "rain", radius: 800, color: RAIN_RING, weight: 1.2,
+          fillColor: RAIN_RING, interactive: false, opacity: 0, fillOpacity: 0,
+          dashArray: fc ? "4 5" : null,
         }).addTo(map),
         icon: L.marker([g.lat, g.lon], {
           pane: "rain", keyboard: false,
-          icon: L.divIcon({
-            className: "",
-            html: `<span class="rain-icon${fc ? " fc" : ""}">🌧️</span>`,
-            iconSize: [0, 0],
-          }),
+          icon: L.divIcon({ className: "", html: `<span class="rain-icon">🌧️</span>`, iconSize: [0, 0] }),
         }).addTo(map),
+        fade: 0,
       };
       e.icon.bindTooltip("");
       rainLayer.set(g.id, e);
     }
-    if (e.circle) {
-      e.circle.setRadius(1200 + Math.min(8, intensity) * 350);
-      if (e.circle.setStyle) {
-        e.circle.setStyle({ opacity: active ? 0.35 : 0.18, fillOpacity: active ? 0.07 : 0.03 });
-      }
-    }
-    // restyle in place: a fresh divIcon per scrub step blinks the glyph
-    const el = e.icon.getElement && e.icon.getElement()?.querySelector(".rain-icon");
-    if (el && el.style) {
-      el.style.fontSize = `${size}px`;
-      el.style.opacity = opacity.toFixed(2);
-    }
+    e.show = true;
+    e.look = {
+      radius: 800 + 4200 * Math.sqrt(Math.min(1, rate / 40)), // 0.8-5 km
+      stroke: fc ? 0.45 : active ? 0.55 : 0.28,
+      fill: fc ? 0.08 : active ? 0.12 : 0.05,
+      size: Math.round(fc ? 12 + 6 * k : 14 + 8 * k),
+      opacity: fc ? 0.5 + 0.3 * k : active ? 1 : 0.55,
+    };
+    applyRainLook(e);
     if (e.icon.setTooltipContent) {
       e.icon.setTooltipContent(fc
-        ? `forecast ≈ ${g.mm.toFixed(1)} mm/h (model)`
+        ? `forecast ≈ ${g.mm.toFixed(1)} mm/h`
         : `${g.mm.toFixed(1)} mm now · ${(g.recent ?? 0).toFixed(1)} mm last 30 min`);
     }
   }
-  for (const [id, e] of rainLayer) {
-    if (!seen.has(id)) { e.circle?.remove(); e.icon.remove(); rainLayer.delete(id); }
-  }
+  for (const [id, e] of rainLayer) e.show = seen.has(id); // the rest fade out
+  startRainFade();
   renderRainStatus();
 }
 
@@ -1447,6 +1484,31 @@ function nowcastRate(grid, x, y, leadMin, t0) {
   return sampleRate(grid, sx, sy) * Math.exp(-leadMin / NOWCAST.decayMin);
 }
 
+/* Between two decoded past frames (10 min apart), rain moves instead of
+   popping: the earlier frame is carried forward and the later one back
+   along the motion field to the displayed moment, then cross-faded
+   (motion-compensated interpolation). */
+function radarPairAt(t) {
+  let a = null, b = null;
+  for (const f of radarFrames) {
+    if (f.time * 1000 <= t) a = f;
+    else { b = f; break; }
+  }
+  if (!a || !b || b.time - a.time > 15 * 60) return null;
+  const ga = radarGrids.get(a.path), gb = radarGrids.get(b.path);
+  if (!ga || !gb) return null;
+  const ta = (t - a.time * 1000) / 60_000, tb = (b.time * 1000 - t) / 60_000;
+  const w = ta / (ta + tb);
+  return {
+    a, b, w,
+    rate: (lat, lon, x = rvX(lon), y = rvY(lat)) => {
+      const m = radarMotion ? motionAt(x, y) : { vx: 0, vy: 0 };
+      return (1 - w) * sampleRate(ga, x - m.vx * ta, y - m.vy * ta) +
+        w * sampleRate(gb, x + m.vx * tb, y + m.vy * tb);
+    },
+  };
+}
+
 function latestRadar() {
   const f = radarFrames[radarFrames.length - 1];
   const grid = f && radarMode === "pixels" ? radarGrids.get(f.path) : null;
@@ -1471,7 +1533,9 @@ function rainContext(t) {
     const f = displayedT === null ? radarFrames[radarFrames.length - 1] : radarFrameFor(t);
     const grid = f && radarMode === "pixels" ? radarGrids.get(f.path) : null;
     if (!grid) return { src: radarMode === "tiles" && f ? "tiles" : f ? "pending" : "none", frame: f };
-    return { src: "radar", frame: f, rate: (lat, lon) => sampleRate(grid, rvX(lon), rvY(lat)) };
+    const pair = displayedT === null ? null : radarPairAt(t);
+    if (pair) return { src: "radar", frame: f, pair, rate: pair.rate };
+    return { src: "radar", frame: f, rate: (lat, lon, x = rvX(lon), y = rvY(lat)) => sampleRate(grid, x, y) };
   }
   const latest = latestRadar();
   const lead = latest ? (t - latest.f.time * 1000) / 60_000 : Infinity;
@@ -1479,14 +1543,15 @@ function rainContext(t) {
   const modelRate = p ? (lat, lon) => Math.max(0, gridSampleCubic(p, lat, lon)) : null;
   const useRadar = !!latest && lead <= NOWCAST.horizonMin;
   if (!useRadar && !modelRate) return { src: "none" };
-  const radarRate = useRadar ? (lat, lon) => nowcastRate(latest.grid, rvX(lon), rvY(lat), lead, latest.f.time) : null;
+  const radarRate = useRadar
+    ? (lat, lon, x = rvX(lon), y = rvY(lat)) => nowcastRate(latest.grid, x, y, lead, latest.f.time) : null;
   const w = !useRadar ? 1 : !modelRate ? 0
     : smooth01((lead - NOWCAST.blendFrom) / (NOWCAST.horizonMin - NOWCAST.blendFrom));
   const src = w >= 1 ? "model" : w <= 0 ? "nowcast" : "blend";
   return {
     src, lead, frame: latest?.f, anvil: !!anvilCast && anvilCast.t0 === latest?.f.time,
     rate: w >= 1 ? modelRate : w <= 0 ? radarRate
-      : (lat, lon) => (1 - w) * radarRate(lat, lon) + w * modelRate(lat, lon),
+      : (lat, lon, x, y) => (1 - w) * radarRate(lat, lon, x, y) + w * modelRate(lat, lon),
   };
 }
 
@@ -1517,7 +1582,7 @@ function fmtClock(sec) {
     { timeZone: "Asia/Singapore", hour: "2-digit", minute: "2-digit" });
 }
 
-function renderClouds() {
+function renderClouds(light = false) {
   if (typeof L === "undefined" || !map) return;
   if (!radarOn) { hideClouds(); setRadarStatus("off"); return; }
   const t = displayedTime() ?? Date.now();
@@ -1527,7 +1592,11 @@ function renderClouds() {
   const m = radarMotion;
   const motion = m && m.kmh >= 3 ? ` · rain moving ${m.kmh.toFixed(0)} km/h → ${COMPASS[Math.round(m.toward / 22.5) % 16]}` : "";
   const method = ctx.anvil ? "ANVIL" : "advection";
-  if (ctx.src === "radar") setRadarStatus(`${radarSource} frame ${fmtClock(ctx.frame.time)}${approx}${note}`);
+  if (ctx.src === "radar") {
+    setRadarStatus(ctx.pair
+      ? `${radarSource} frames ${fmtClock(ctx.pair.a.time)}→${fmtClock(ctx.pair.b.time)} (interpolated)${approx}${note}`
+      : `${radarSource} frame ${fmtClock(ctx.frame.time)}${approx}${note}`);
+  }
   else if (ctx.src === "nowcast") setRadarStatus(`nowcast (${method}) +${Math.round(ctx.lead)} min${motion}${approx}`);
   else if (ctx.src === "blend") setRadarStatus(`nowcast (${method})→model +${Math.round(ctx.lead)} min${motion}`);
   else if (ctx.src === "model") {
@@ -1538,37 +1607,39 @@ function renderClouds() {
   // "tiles": applyTileFrame owns the status
   if (!ctx.rate) { hideClouds(); return; }
 
-  const key = `${t}|${ctx.src}|${ctx.frame?.path}|${radarMotion?.key}|${anvilCast?.key}|${model?.times?.[0]}|${GRID_NLAT}`;
+  const key = `${t}|${light}|${ctx.src}|${ctx.frame?.path}|${radarMotion?.key}|${anvilCast?.key}|${model?.times?.[0]}|${GRID_NLAT}`;
   if (key === cloudKey) return;
-  if (!cloudCanvas) {
-    cloudCanvas = document.createElement("canvas");
-    cloudCanvas.width = CLOUD.w;
-    cloudCanvas.height = CLOUD.h;
-  }
+  // mid-glide frames at half resolution; the landing frame is full
+  const f = light ? 2 : 1, CW = Math.ceil(CLOUD.w / f), CH = Math.ceil(CLOUD.h / f);
+  cloudCanvas ??= document.createElement("canvas");
   if (typeof cloudCanvas.getContext !== "function") return;
+  if (cloudCanvas.width !== CW || cloudCanvas.height !== CH) {
+    cloudCanvas.width = CW;
+    cloudCanvas.height = CH;
+  }
   const c2 = cloudCanvas.getContext("2d");
-  const img = c2.createImageData(CLOUD.w, CLOUD.h);
+  const img = c2.createImageData(CW, CH);
   const future = isFutureView();
-  const lons = Array.from({ length: CLOUD.w }, (_, i) => rvLon(CLOUD.x0 + i + 0.5));
-  for (let j = 0; j < CLOUD.h; j++) {
-    const lat = rvLat(CLOUD.y0 + j + 0.5);
-    for (let i = 0; i < CLOUD.w; i++) {
-      const look = cloudLook(ctx.rate(lat, lons[i]));
+  const xs = Array.from({ length: CW }, (_, i) => CLOUD.x0 + (i + 0.5) * f);
+  const lons = xs.map(rvLon);
+  for (let j = 0; j < CH; j++) {
+    const y = CLOUD.y0 + (j + 0.5) * f, lat = rvLat(y);
+    for (let i = 0; i < CW; i++) {
+      const look = cloudLook(ctx.rate(lat, lons[i], xs[i], y));
       if (!look) continue;
-      const o = (j * CLOUD.w + i) * 4;
+      const o = (j * CW + i) * 4;
       img.data[o] = look.c; img.data[o + 1] = look.c; img.data[o + 2] = Math.min(255, look.c + 4);
       img.data[o + 3] = Math.round(255 * look.a * (future ? 0.85 : 1));
     }
   }
   c2.putImageData(img, 0, 0);
-  const url = cloudCanvas.toDataURL();
   if (!cloudLayer) {
-    cloudLayer = L.imageOverlay(url,
+    cloudLayer = L.svgOverlay(cloudCanvas,
       [[rvLat(CLOUD.y0 + CLOUD.h), rvLon(CLOUD.x0)], [rvLat(CLOUD.y0), rvLon(CLOUD.x0 + CLOUD.w)]],
-      { pane: "clouds", opacity: 1, interactive: false, className: "rain-clouds",
-        attribution: 'Radar: <a href="https://librewxr.net/">LibreWXR</a> (MET Malaysia) / <a href="https://www.rainviewer.com/">RainViewer</a>' }).addTo(map);
+      { pane: "clouds", opacity: 1, interactive: false, className: "canvas-layer rain-clouds",
+        // short: a two-line credit overlaps the phone timebar
+        attribution: 'Radar <a href="https://librewxr.net/">LibreWXR</a>·<a href="https://www.rainviewer.com/">RainViewer</a>' }).addTo(map);
   } else {
-    cloudLayer.setUrl(url);
     cloudLayer.setOpacity(1);
   }
   cloudKey = key;
@@ -1637,9 +1708,9 @@ function applyTileFrame() {
   else l.once("load", finalize);
 }
 
-function applyRadarFrame() {
+function applyRadarFrame(light = false) {
   if (radarMode === "tiles" && radarOn && radarHost && radarFrames.length) applyTileFrame();
-  renderClouds();
+  renderClouds(light);
 }
 
 // Radar sources, best first; both speak the RainViewer API. LibreWXR is an
@@ -1983,10 +2054,11 @@ function gridSample(grid, lat, lon) {
   const cy = Math.min(GRID_NLAT - 2, Math.max(0, Math.floor(fy)));
   const cx = Math.min(GRID_NLON - 2, Math.max(0, Math.floor(fx)));
   const ty = Math.min(1, Math.max(0, fy - cy)), tx = Math.min(1, Math.max(0, fx - cx));
-  // grid index iy counts from latMin upward; fy counts from latMax downward
-  const at = (iy, ix) => grid[(GRID_NLAT - 1 - iy) * GRID_NLON + ix];
-  const v00 = at(cy, cx), v01 = at(cy, cx + 1), v10 = at(cy + 1, cx), v11 = at(cy + 1, cx + 1);
-  if ([v00, v01, v10, v11].some(Number.isNaN)) return null;
+  // grid rows count from latMin upward; fy counts from latMax downward.
+  // (Hot path while scrubbing: no closures or arrays per call.)
+  const r0 = (GRID_NLAT - 1 - cy) * GRID_NLON + cx, r1 = r0 - GRID_NLON;
+  const v00 = grid[r0], v01 = grid[r0 + 1], v10 = grid[r1], v11 = grid[r1 + 1];
+  if (v00 !== v00 || v01 !== v01 || v10 !== v10 || v11 !== v11) return null; // NaN
   const top = v00 + (v01 - v00) * tx;
   const bot = v10 + (v11 - v10) * tx;
   return top + (bot - top) * ty;
@@ -2481,7 +2553,10 @@ function extremeness(val) {
   const f = Math.min(1, Math.max(0, (val - scaleLo) / (scaleHi - scaleLo || 1)));
   return smooth01(Math.abs(f - 0.5) * 4);
 }
-function renderOverlay(values, grid) {
+// light = mid-glide frame: half resolution (4x fewer pixels); the landing
+// frame redraws at full resolution
+function renderOverlay(values, grid, light = false) {
+  const OW = light ? OVERLAY.w >> 1 : OVERLAY.w, OH = light ? OVERLAY.h >> 1 : OVERLAY.h;
   const pts = [...stations.values()]
     .filter((s) => values.has(s.id) && Number.isFinite(s.lat) && Number.isFinite(s.lon))
     .map((s) => ({
@@ -2491,31 +2566,69 @@ function renderOverlay(values, grid) {
   if (!grid && pts.length < 3) return;
   const residuals = grid ? computeResiduals(pts, grid) : [];
 
-  if (!overlayCanvas) {
-    overlayCanvas = document.createElement("canvas");
-    overlayCanvas.width = OVERLAY.w;
-    overlayCanvas.height = OVERLAY.h;
-  }
+  overlayCanvas ??= document.createElement("canvas");
   if (typeof overlayCanvas.getContext !== "function") return;
-  const n = OVERLAY.w * OVERLAY.h;
-  if (!fieldCache) {
+  const n = OW * OH;
+  if (overlayCanvas.width !== OW || overlayCanvas.height !== OH) {
+    overlayCanvas.width = OW; // the layer keeps its on-map size; the canvas scales
+    overlayCanvas.height = OH;
+  }
+  if (!fieldCache || fieldCache.length !== n) {
     fieldCache = new Float32Array(n);
     fadeCache = new Float32Array(n);
+    overlayImg = null;
   }
   const cosLat = Math.cos((1.35 * Math.PI) / 180);
-  const edgePx = Math.round(OVERLAY.w * 0.05);
+  const edgePx = Math.round(OW * 0.05);
+  // This loop runs every frame while scrubbing, so the per-pixel work is
+  // precomputed: squared station distances split into a column part and a
+  // row part (dx^2 + dy^2), and the model grid's bilinear weights per row
+  // and column. Same field as fieldAt(), several times faster.
+  const R = residuals.length;
+  const dx2 = new Float32Array(R * OW), dy2 = new Float32Array(R * OH);
+  const rw = new Float32Array(R), rr = new Float32Array(R);
+  residuals.forEach((p, k) => { rw[k] = p.wt ?? 1; rr[k] = p.r; });
+  for (let px = 0; px < OW; px++) {
+    const lon = OVERLAY.lonMin + ((px + 0.5) / OW) * (OVERLAY.lonMax - OVERLAY.lonMin);
+    for (let k = 0; k < R; k++) dx2[k * OW + px] = ((lon - residuals[k].lon) * cosLat * KM_PER_DEG) ** 2;
+  }
+  for (let py = 0; py < OH; py++) {
+    const lat = OVERLAY.latMax - ((py + 0.5) / OH) * (OVERLAY.latMax - OVERLAY.latMin);
+    for (let k = 0; k < R; k++) dy2[k * OH + py] = ((lat - residuals[k].lat) * KM_PER_DEG) ** 2;
+  }
 
-  for (let py = 0; py < OVERLAY.h; py++) {
-    const lat = OVERLAY.latMax - ((py + 0.5) / OVERLAY.h) * (OVERLAY.latMax - OVERLAY.latMin);
-    for (let px = 0; px < OVERLAY.w; px++) {
-      const lon = OVERLAY.lonMin + ((px + 0.5) / OVERLAY.w) * (OVERLAY.lonMax - OVERLAY.lonMin);
-      const i = py * OVERLAY.w + px;
+  // model base, bilinear: blend the two grid rows once per raster row,
+  // then only interpolate along x per pixel
+  const rowVals = new Float32Array(GRID_NLON);
+  const colIdx = new Int32Array(OW), colT = new Float32Array(OW);
+  for (let px = 0; px < OW; px++) {
+    const fx = ((px + 0.5) / OW) * (GRID_NLON - 1);
+    colIdx[px] = Math.min(GRID_NLON - 2, Math.floor(fx));
+    colT[px] = fx - colIdx[px];
+  }
+  for (let py = 0; py < OH; py++) {
+    const lat = OVERLAY.latMax - ((py + 0.5) / OH) * (OVERLAY.latMax - OVERLAY.latMin);
+    if (grid) {
+      const fy = ((py + 0.5) / OH) * (GRID_NLAT - 1);
+      const cy = Math.min(GRID_NLAT - 2, Math.floor(fy)), ty = fy - cy;
+      const r0 = (GRID_NLAT - 1 - cy) * GRID_NLON, r1 = r0 - GRID_NLON;
+      for (let ix = 0; ix < GRID_NLON; ix++) rowVals[ix] = grid[r0 + ix] + (grid[r1 + ix] - grid[r0 + ix]) * ty;
+    }
+    for (let px = 0; px < OW; px++) {
+      const lon = OVERLAY.lonMin + ((px + 0.5) / OW) * (OVERLAY.lonMax - OVERLAY.lonMin);
+      const i = py * OW + px;
       if (grid) {
-        const val = fieldAt(lat, lon, grid, residuals);
-        if (val == null) { fieldCache[i] = NaN; continue; }
-        fieldCache[i] = val;
+        const c = colIdx[px], a = rowVals[c], b = rowVals[c + 1];
+        const base = a + (b - a) * colT[px];
+        if (base !== base) { fieldCache[i] = NaN; continue; } // NaN
+        let wSum = 0, rSum = 0;
+        for (let k = 0; k < R; k++) {
+          const w = rw[k] / (dx2[k * OW + px] + dy2[k * OH + py] + 0.05);
+          wSum += w; rSum += w * rr[k];
+        }
+        fieldCache[i] = base + rSum / (wSum + RESIDUAL_LAMBDA);
         // soft fade only at the raster's outer edges
-        const edge = Math.min(px, OVERLAY.w - 1 - px, py, OVERLAY.h - 1 - py) / edgePx;
+        const edge = Math.min(px, OW - 1 - px, py, OH - 1 - py) / edgePx;
         fadeCache[i] = Math.min(1, edge);
       } else {
         let wSum = 0, vSum = 0, nearest = Infinity;
@@ -2537,41 +2650,50 @@ function renderOverlay(values, grid) {
   paintOverlay();
 }
 
-/* Colour pass over the cached field. */
+/* Colour pass over the cached field, through a 256-step lookup table over
+   the current scale (colour + extremeness alpha) and a reused buffer —
+   per-pixel colour arrays made this the slowest part of a scrub frame. */
+let overlayImg = null;
+const OV_LUT_N = 256;
+const ovLut = new Uint8ClampedArray(OV_LUT_N * 4);
+
 function paintOverlay() {
   if (!fieldCache || !overlayCanvas || typeof overlayCanvas.getContext !== "function") return;
   const ctx = overlayCanvas.getContext("2d");
-  const img = ctx.createImageData(OVERLAY.w, OVERLAY.h);
-  for (let py = 0; py < OVERLAY.h; py++) {
-    for (let px = 0; px < OVERLAY.w; px++) {
-      const i = py * OVERLAY.w + px;
-      const v = fieldCache[i];
-      if (Number.isNaN(v)) continue;
-      const alpha = OVERLAY_MAX_ALPHA * extremeness(v) * fadeCache[i];
-      if (alpha <= 0.004) continue;
-      const [r, g, b] = tempRGB(v);
-      const o = i * 4;
-      img.data[o] = r; img.data[o + 1] = g; img.data[o + 2] = b;
-      img.data[o + 3] = Math.round(alpha * 255);
-    }
+  const OW = overlayCanvas.width, OH = overlayCanvas.height;
+  overlayImg ??= ctx.createImageData(OW, OH);
+  const data = overlayImg.data;
+  const span = scaleHi - scaleLo || 1;
+  for (let k = 0; k < OV_LUT_N; k++) {
+    const v = scaleLo + (k / (OV_LUT_N - 1)) * span;
+    const [r, g, b] = tempRGB(v);
+    ovLut[k * 4] = r; ovLut[k * 4 + 1] = g; ovLut[k * 4 + 2] = b;
+    ovLut[k * 4 + 3] = Math.round(255 * OVERLAY_MAX_ALPHA * extremeness(v));
   }
-  ctx.putImageData(img, 0, 0);
-  const url = overlayCanvas.toDataURL();
-  if (!overlayLayer) {
-    overlayLayer = L.imageOverlay(url,
-      [[OVERLAY.latMin, OVERLAY.lonMin], [OVERLAY.latMax, OVERLAY.lonMax]],
-      { opacity: 1, interactive: false }).addTo(map);
-  } else {
-    overlayLayer.setUrl(url);
+  const n = OW * OH, scale = (OV_LUT_N - 1) / span;
+  for (let i = 0; i < n; i++) {
+    const v = fieldCache[i], o = i * 4;
+    if (v !== v) { data[o + 3] = 0; continue; } // NaN
+    const k = Math.min(OV_LUT_N - 1, Math.max(0, Math.round((v - scaleLo) * scale))) * 4;
+    data[o] = ovLut[k]; data[o + 1] = ovLut[k + 1]; data[o + 2] = ovLut[k + 2];
+    data[o + 3] = ovLut[k + 3] * fadeCache[i];
   }
+  ctx.putImageData(overlayImg, 0, 0);
+  // the canvas itself is the map layer (svgOverlay takes any element): no
+  // PNG encode/decode per frame, which made scrubbing stutter
+  overlayLayer ??= L.svgOverlay(overlayCanvas,
+    [[OVERLAY.latMin, OVERLAY.lonMin], [OVERLAY.latMax, OVERLAY.lonMax]],
+    { opacity: 1, interactive: false, className: "canvas-layer" }).addTo(map);
 }
 
-function renderTimebar(t) {
+function renderTimebar(t, light = false) {
   const slider = document.getElementById("time-slider");
   const label = document.getElementById("time-label");
   const liveBtn = document.getElementById("live-btn");
   slider.max = Math.max(0, sliderTicks.length - 1);
-  if (displayedT === null) {
+  if (sliderDragging) {
+    // the thumb is under the finger: never move it from here
+  } else if (displayedT === null) {
     slider.value = Math.max(0, sliderLiveIdx);
   } else {
     let lo = 0, hi = sliderTicks.length - 1, idx = 0;
@@ -2594,14 +2716,53 @@ function renderTimebar(t) {
     if (wrap.style.setProperty) {
       wrap.style.setProperty("--live-frac", max > 0 ? (Math.max(0, sliderLiveIdx) / max).toFixed(4) : "1");
     }
-    renderRainTrack(wrap);
+    if (!light) renderRainTrack(wrap);
   }
   const f = dayFactor(t ?? Date.now());
   document.getElementById("sky-icon").textContent = f > 0.8 ? "☀️" : f < 0.2 ? "🌙" : "🌅";
-  liveBtn.classList.toggle("active", displayedT === null);
+  liveBtn.classList.toggle("active", displayedT === null && scrubTarget === null);
 }
 
-function renderAll() {
+/* Scrubbing glide: the slider (or LIVE) sets a target time, and the shown
+   time eases toward it every animation frame (exponential, ~90 ms time
+   constant). A drag that jumps several 5-minute ticks per input event
+   plays as continuous motion instead of snapping from state to state. */
+let scrubTarget = null;   // null = live
+let scrubAnim = false, scrubLast = 0, sliderDragging = false;
+const SCRUB_TAU_MS = 90;
+
+function liveTime() {
+  return timeline.length ? timeline[timeline.length - 1] : Date.now();
+}
+
+function scrubTo(target) {
+  scrubTarget = target;
+  if (scrubAnim) return;
+  scrubAnim = true;
+  scrubLast = typeof performance !== "undefined" ? performance.now() : Date.now();
+  requestAnimationFrame(scrubStep);
+}
+
+function scrubStep(now) {
+  const dt = Math.min(64, Math.max(1, now - scrubLast));
+  scrubLast = now;
+  const cur = displayedT ?? liveTime();
+  const tgt = scrubTarget ?? liveTime();
+  const d = tgt - cur;
+  if (Math.abs(d) < 15_000) { // within 15 s: land exactly, full render
+    displayedT = scrubTarget;
+    scrubAnim = false;
+    renderAll();
+    return;
+  }
+  displayedT = cur + d * (1 - Math.exp(-dt / SCRUB_TAU_MS));
+  renderAll(true);
+  requestAnimationFrame(scrubStep);
+}
+
+// light = mid-glide frame: skip the station list, detail panel and slider
+// track (heavy DOM work that nobody reads while the map is moving)
+function renderAll(light = false) {
   const t = displayedTime();
   const values = displayedValues(t);
   const grid = buildBlendedGrid(t ?? Date.now());
@@ -2613,15 +2774,17 @@ function renderAll() {
     map.getContainer().style.setProperty("--day-boost", boost.toFixed(3));
   }
   for (const s of stations.values()) renderMarker(s, values.get(s.id));
-  renderList(values);
+  if (!light) {
+    renderList(values);
+    renderDetail(values, t);
+  }
   renderSummary(values);
-  renderDetail(values, t);
-  renderOverlay(values, grid);
-  renderTimebar(t);
+  renderOverlay(values, grid, light);
+  renderTimebar(t, light);
   renderWindStatus();
   renderWindPins();
   renderRain(); // rain follows the scrubber (24h series)
-  applyRadarFrame(); // radar follows it too, within RainViewer's ~2h archive
+  applyRadarFrame(light); // radar, nowcast and model rain follow it too
 }
 
 // Coalesce slider-drag renders to animation frames.
@@ -3077,16 +3240,19 @@ function initMap() {
 
 document.getElementById("detail-close").addEventListener("click", () => selectStation(selectedId));
 
-document.getElementById("time-slider").addEventListener("input", (e) => {
-  const idx = Number(e.target.value);
-  displayedT = idx === sliderLiveIdx ? null : sliderTicks[idx];
-  scheduleRender();
-});
+{
+  const slider = document.getElementById("time-slider");
+  slider.addEventListener("input", (e) => {
+    const idx = Number(e.target.value);
+    scrubTo(idx === sliderLiveIdx ? null : sliderTicks[idx]);
+  });
+  const down = () => { sliderDragging = true; };
+  const up = () => { sliderDragging = false; };
+  for (const ev of ["pointerdown", "touchstart", "mousedown"]) slider.addEventListener(ev, down);
+  for (const ev of ["pointerup", "pointercancel", "touchend", "touchcancel", "mouseup", "change"]) slider.addEventListener(ev, up);
+}
 
-document.getElementById("live-btn").addEventListener("click", () => {
-  displayedT = null;
-  renderAll();
-});
+document.getElementById("live-btn").addEventListener("click", () => scrubTo(null));
 
 const filterSel = document.getElementById("list-filter");
 try {
