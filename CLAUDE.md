@@ -110,7 +110,16 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
   distances. Keep a glide frame under ~10 ms at 4× CPU throttle — measure
   with Playwright + CDP `Emulation.setCPUThrottlingRate`. Past radar is
   motion-interpolated between 10-min frames (`radarPairAt`). Never set
-  `slider.value` while `sliderDragging`.
+  `slider.value` while `sliderDragging`. `scrubStep` wraps `renderAll` in
+  try/catch and always lands or re-arms: a render exception once left
+  `scrubAnim` stuck true and the slider dead (cause: newest radar frame
+  newer than the viewed moment → negative nowcast lead → `leads[-1]`;
+  leads are clamped ≥ 0 now; smoke test `negativeLeadTest`).
+- **Loading indicator** (`#load-status`, `setLoading`/`withLoading`): small
+  static note top-left of the map ("loading radar 5/13 · wind history");
+  items show only after 0.4 s so routine polls don't flicker; routine
+  refreshes pass a label function returning null. Nothing may stay
+  registered after loads finish (smoke test checks).
 - **Time slider**: uniform 5-minute lattice −24h … +24h, LIVE at the centre
   (`sliderLiveIdx`, marked by a dotted green line on `.slider-wrap::after`).
   `displayedT === null` means live. `isFutureView()` switches pills to the
