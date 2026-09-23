@@ -420,8 +420,8 @@ body { display: flex; flex-direction: column; }
 }
 /* forecast glyph: dashed ring, the same "estimate" mark as .temp-pill.fc */
 .rain-icon.fc {
-  padding: 3px;
-  border: 1.5px dashed rgba(222, 229, 239, 0.7);
+  padding: 2px;
+  border: 1px dashed rgba(222, 229, 239, 0.5);
   border-radius: 50%;
 }
 

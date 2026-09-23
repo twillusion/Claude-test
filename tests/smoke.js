@@ -148,6 +148,30 @@ const h = new Function(src + `
     radarLayerCount: () => radarLayers.size,
     windGridOk: () => { ensureWindField(); return !!windGridU; },
     rainOutlookText, fcRainStrength,
+    gaugeCount: () => rainLocs.size,
+    // three synthetic radar frames: a round cell moving 1 px/min east
+    nowcastTest: () => {
+      radarMode = "pixels";
+      radarHost = "synthetic";
+      const mk = (cx, cy) => {
+        const g = new Uint8Array(RV_W * RV_H);
+        for (let y = cy - 40; y <= cy + 40; y++) {
+          for (let x = cx - 40; x <= cx + 40; x++) if ((x - cx) ** 2 + (y - cy) ** 2 < 30 * 30) g[y * RV_W + x] = 32 + 40;
+        }
+        return g;
+      };
+      const now = Math.floor(Date.now() / 1000);
+      radarFrames = [{ time: now - 1200, path: "p0" }, { time: now - 600, path: "p1" }, { time: now, path: "p2" }];
+      radarGrids.clear();
+      radarGrids.set("p0", mk(400, 270)); radarGrids.set("p1", mk(410, 270)); radarGrids.set("p2", mk(420, 270));
+      radarMotion = null;
+      updateMotion();
+      const m = motionAt(420, 270);
+      displayedT = now * 1000 + 30 * 60_000;
+      const ctx = rainContext(displayedT);
+      const at = (x) => ctx.rate(rvLat(270), rvLon(x));
+      return { vx: m.vx, vy: m.vy, kmh: radarMotion.kmh, src: ctx.src, ahead: at(465), behind: at(405) };
+    },
   };`)();
 
 (async () => {
@@ -195,15 +219,12 @@ const h = new Function(src + `
   // particles need a grid far into the future too (it used to go empty past
   // +90 min, freezing the animation on its last frame)
   console.assert(h.windGridOk(), "forecast wind grid exists at +24h");
-  // model rain: a sparse set of glyphs even when every node is wet (one
-  // per node tiled the map with a lattice on widespread-rain hours)
+  // forecast glyphs sit at the gauge positions the rain field reaches
+  // (Node can't decode radar tiles, so this is the tile fallback: model
+  // rain from the first future tick, 2 mm/h everywhere)
   const fr = h.fcRain();
-  console.assert(fr.icons >= 3 && fr.icons <= 10 && Math.abs(fr.max - 2) < 0.01, "forecast rain glyphs:", fr);
-  console.assert(h.rainCount() === fr.icons, "no gauge glyphs in the future:", h.rainCount());
-  // +15 min: past the fixture's last reading (day files run to now+10min),
-  // still within 15 min of the newest radar frame
-  h.scrubTo(h.liveIdx() + 3);
-  console.assert(h.futureView() && h.fcRain().icons === 0, "radar beats model rain near now");
+  console.assert(fr.icons === h.gaugeCount() && Math.abs(fr.max - 2) < 0.01, "forecast gauge glyphs:", fr, h.gaugeCount());
+  console.assert(h.rainCount() === fr.icons, "only forecast glyphs in the future:", h.rainCount());
   h.goLive();
   console.assert(h.rainCount() === 1, "back to observed rain at live:", h.rainCount());
   console.assert(h.fcRain().icons === 0, "forecast rain hidden at live");
@@ -212,6 +233,13 @@ const h = new Function(src + `
   // cell averages a shower down to ~0.3-1 mm/h), and show in the outlook
   console.assert(h.fcRainStrength(0.3) > 0.3 && h.fcRainStrength(1) > 0.55, "model rain visibility");
   console.assert(/^model: showers now–/.test(h.rainOutlookText()), "rain outlook:", h.rainOutlookText());
+
+  // nowcast: motion from block matching, then the cell carried downstream
+  const nc = h.nowcastTest();
+  console.assert(Math.abs(nc.vx - 1) < 0.15 && Math.abs(nc.vy) < 0.15, "nowcast motion ~1 px/min east:", nc);
+  console.assert(Math.abs(nc.kmh - 36.7) < 5, "nowcast speed ~37 km/h:", nc.kmh);
+  console.assert(nc.src === "nowcast" && nc.ahead > 3 && nc.behind === 0, "cell advected east at +30 min:", nc);
+  h.goLive();
 
   // CARTO serves watermarked tiles (HTTP 200, no error) without a key
   const baseUrl = tileUrls.find((u) => u.includes("basemaps.cartocdn.com"));
