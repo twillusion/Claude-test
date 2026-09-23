@@ -19,7 +19,7 @@ const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
 const HISTORY_HOURS = 24;
 // Shown in the footer; bump together with the ?v= stamps in index.html so a
 // glance settles "am I looking at the new build or a stale cache?"
-const APP_VERSION = "20260923i";
+const APP_VERSION = "20260923j";
 
 // CARTO basemap key. Since Aug 2026 basemaps.cartocdn.com answers keyless
 // requests with HTTP 200 tiles that have "API KEY REQUIRED" burned in, so
@@ -731,19 +731,26 @@ function forecastRainGrid(t) {
 // Catmull-Rom sample of a model-shaped grid (clamped at the edges), so the
 // ~8km cells blend smoothly instead of showing bilinear diamonds.
 function gridSampleCubic(grid, lat, lon) {
+  // hot path (every cloud pixel): no closures or arrays per call
   const fy = ((lat - OVERLAY.latMin) / (OVERLAY.latMax - OVERLAY.latMin)) * (GRID_NLAT - 1);
   const fx = ((lon - OVERLAY.lonMin) / (OVERLAY.lonMax - OVERLAY.lonMin)) * (GRID_NLON - 1);
-  const iy = Math.floor(fy), ix = Math.floor(fx);
-  const ty = fy - iy, tx = fx - ix;
-  const at = (y, x) => {
-    const v = grid[Math.min(GRID_NLAT - 1, Math.max(0, y)) * GRID_NLON +
-                   Math.min(GRID_NLON - 1, Math.max(0, x))];
-    return Number.isNaN(v) ? 0 : v;
-  };
-  const cr = (p0, p1, p2, p3, t) =>
-    p1 + 0.5 * t * (p2 - p0 + t * (2 * p0 - 5 * p1 + 4 * p2 - p3 + t * (3 * (p1 - p2) + p3 - p0)));
-  const row = (y) => cr(at(y, ix - 1), at(y, ix), at(y, ix + 1), at(y, ix + 2), tx);
-  return cr(row(iy - 1), row(iy), row(iy + 1), row(iy + 2), ty);
+  const iy = Math.floor(fy), ix = Math.floor(fx), ty = fy - iy, tx = fx - ix;
+  const cx0 = Math.min(GRID_NLON - 1, Math.max(0, ix - 1)), cx1 = Math.min(GRID_NLON - 1, Math.max(0, ix));
+  const cx2 = Math.min(GRID_NLON - 1, Math.max(0, ix + 1)), cx3 = Math.min(GRID_NLON - 1, Math.max(0, ix + 2));
+  let out = 0;
+  for (let k = 0; k < 4; k++) {
+    const r = Math.min(GRID_NLAT - 1, Math.max(0, iy - 1 + k)) * GRID_NLON;
+    let p0 = grid[r + cx0], p1 = grid[r + cx1], p2 = grid[r + cx2], p3 = grid[r + cx3];
+    if (p0 !== p0) p0 = 0; if (p1 !== p1) p1 = 0; if (p2 !== p2) p2 = 0; if (p3 !== p3) p3 = 0; // NaN
+    const v = p1 + 0.5 * tx * (p2 - p0 + tx * (2 * p0 - 5 * p1 + 4 * p2 - p3 + tx * (3 * (p1 - p2) + p3 - p0)));
+    // Catmull-Rom weights along y, accumulated row by row
+    const w = k === 0 ? 0.5 * (-ty + 2 * ty * ty - ty * ty * ty)
+      : k === 1 ? 0.5 * (2 - 5 * ty * ty + 3 * ty * ty * ty)
+      : k === 2 ? 0.5 * (ty + 4 * ty * ty - 3 * ty * ty * ty)
+      : 0.5 * (-ty * ty + ty * ty * ty);
+    out += w * v;
+  }
+  return out;
 }
 
 // Forecast glyphs: every gauge position the future rain field reaches.
@@ -1564,12 +1571,99 @@ function radarFrameFor(tMs) {
   return bestD <= 15 * 60_000 ? best : null;
 }
 
+/* Rain analysis for the hours before the radar archive: the model's own
+   rain for that past moment, corrected toward what the NEA gauges actually
+   measured — the same residual scheme as the temperature shading. Each
+   gauge's residual (measured − model) is spread by inverse distance and
+   shrinks away from gauges (halved ~8 km out); far from any gauge (sea,
+   Johor) it's the model alone at half strength. Gauge rates are 5-minute
+   totals averaged over ±10 min (triangular), so scrubbing stays smooth. */
+const ANALYSIS = {
+  halfWindowMs: 10 * 60_000,
+  lambda: 1 / (8 * 8),     // residual weight floor: halved ~8 km from a gauge
+  d0: 2,                   // km, softens the peak right at a gauge
+  handoverMs: 30 * 60_000, // cross-fade into the oldest radar frame
+  gw: 72, gh: 48,          // correction grid over the map window (~1.1 km)
+};
+
+function gaugeRateAt(arr, t) {
+  let s = 0;
+  for (const p of arr) {
+    const d = Math.abs(p.t - t);
+    if (d < ANALYSIS.halfWindowMs) s += p.mm * (1 - d / ANALYSIS.halfWindowMs);
+  }
+  // slots every 5 min: triangular weights over ±10 min sum to 2
+  return (12 * s) / 2; // mm per 5 min -> mm/h
+}
+
+function rainAnalysis(t) {
+  const p = forecastRainGrid(t);
+  const model = p ? (lat, lon) => Math.max(0, gridSampleCubic(p, lat, lon)) : () => 0;
+  const gauges = [];
+  for (const [id, loc] of rainLocs) {
+    const rate = gaugeRateAt(rainSeries.get(id) ?? [], t);
+    gauges.push({ lat: loc.lat, lon: loc.lon, r: rate - model(loc.lat, loc.lon) });
+  }
+  if (!gauges.length && !p) return null;
+  // The correction is smooth (8 km scale), so it's computed once per frame
+  // on a coarse grid (~1.1 km) and interpolated, not per pixel per gauge —
+  // that kept a scrub frame inside its time budget.
+  const { gw, gh } = ANALYSIS, cosLat = Math.cos((1.35 * Math.PI) / 180), d02 = ANALYSIS.d0 ** 2;
+  const corr = new Float32Array(gw * gh), cover = new Float32Array(gw * gh);
+  for (let j = 0; j < gh; j++) {
+    const lat = OVERLAY.latMin + (j / (gh - 1)) * (OVERLAY.latMax - OVERLAY.latMin);
+    for (let i = 0; i < gw; i++) {
+      const lon = OVERLAY.lonMin + (i / (gw - 1)) * (OVERLAY.lonMax - OVERLAY.lonMin);
+      let wSum = 0, rSum = 0, near = Infinity;
+      for (const g of gauges) {
+        const dx = (lon - g.lon) * cosLat * KM_PER_DEG, dy = (lat - g.lat) * KM_PER_DEG;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < near) near = d2;
+        const w = 1 / (d2 + d02);
+        wSum += w; rSum += w * g.r;
+      }
+      corr[j * gw + i] = gauges.length ? rSum / (wSum + ANALYSIS.lambda) : 0;
+      // model-only areas count half: full within 6 km of a gauge, half past 20
+      cover[j * gw + i] = 0.5 + 0.5 * (1 - smooth01((Math.sqrt(near) - 6) / 14));
+    }
+  }
+  const bl = (arr, fx, fy) => {
+    const i0 = Math.min(gw - 2, Math.floor(fx)), j0 = Math.min(gh - 2, Math.floor(fy));
+    const tx = fx - i0, ty = fy - j0, k = j0 * gw + i0;
+    return (arr[k] + (arr[k + 1] - arr[k]) * tx) * (1 - ty) + (arr[k + gw] + (arr[k + gw + 1] - arr[k + gw]) * tx) * ty;
+  };
+  return {
+    gauges: gauges.length,
+    rate: (lat, lon) => {
+      const fx = Math.min(gw - 1, Math.max(0, ((lon - OVERLAY.lonMin) / (OVERLAY.lonMax - OVERLAY.lonMin)) * (gw - 1)));
+      const fy = Math.min(gh - 1, Math.max(0, ((lat - OVERLAY.latMin) / (OVERLAY.latMax - OVERLAY.latMin)) * (gh - 1)));
+      return Math.max(0, model(lat, lon) + bl(corr, fx, fy)) * bl(cover, fx, fy);
+    },
+  };
+}
+
 /* What the rain looks like at displayed time t, as a rate(lat, lon) in
    mm/h plus where it comes from:
    - past/live: the matching radar frame ("radar"), if decoded;
    - future: nowcast, then nowcast->model blend, then model. */
 function rainContext(t) {
   if (!isFutureView()) {
+    const first = radarFrames[0];
+    const tFirst = first ? first.time * 1000 : Infinity;
+    // before the radar archive (~2h): estimate from gauges + model, fading
+    // into the oldest real frame over the half hour before it
+    if (displayedT !== null && t < tFirst) {
+      const ana = rainAnalysis(t);
+      const firstGrid = first && radarMode === "pixels" ? radarGrids.get(first.path) : null;
+      const w = firstGrid ? smooth01((t - (tFirst - ANALYSIS.handoverMs)) / ANALYSIS.handoverMs) : 0;
+      if (ana && w <= 0) return { src: "analysis", rate: ana.rate, gauges: ana.gauges };
+      if (ana && firstGrid) {
+        return {
+          src: "analysis", frame: first, gauges: ana.gauges, handover: w,
+          rate: (lat, lon, x = rvX(lon), y = rvY(lat)) => (1 - w) * ana.rate(lat, lon) + w * sampleRate(firstGrid, x, y),
+        };
+      }
+    }
     const f = displayedT === null ? radarFrames[radarFrames.length - 1] : radarFrameFor(t);
     const grid = f && radarMode === "pixels" ? radarGrids.get(f.path) : null;
     if (!grid) return { src: radarMode === "tiles" && f ? "tiles" : f ? "pending" : "none", frame: f };
@@ -1642,12 +1736,17 @@ function renderClouds(light = false) {
   else if (ctx.src === "model") {
     setRadarStatus(radarMode === "pixels" && latestRadar() ? "model rain (past the 2h nowcast)" : `model rain${note}`);
   }
+  else if (ctx.src === "analysis") {
+    setRadarStatus(ctx.handover
+      ? `estimated → ${radarSource} radar (archive starts ${fmtClock(ctx.frame.time)})`
+      : `estimated from ${ctx.gauges} gauges + model (before the radar archive)`);
+  }
   else if (ctx.src === "pending") setRadarStatus("loading radar…");
   else if (ctx.src === "none") setRadarStatus(radarFrames.length ? "no radar at this time" : "no radar frames");
   // "tiles": applyTileFrame owns the status
   if (!ctx.rate) { hideClouds(); return; }
 
-  const key = `${t}|${light}|${ctx.src}|${ctx.frame?.path}|${radarMotion?.key}|${anvilCast?.key}|${model?.times?.[0]}|${GRID_NLAT}`;
+  const key = `${t}|${light}|${ctx.src}|${ctx.frame?.path}|${radarMotion?.key}|${anvilCast?.key}|${model?.times?.[0]}|${GRID_NLAT}|${rainSeries.size}|${rainDayLoaded}`;
   if (key === cloudKey) return;
   // mid-glide frames at half resolution; the landing frame is full
   const f = light ? 2 : 1, CW = Math.ceil(CLOUD.w / f), CH = Math.ceil(CLOUD.h / f);
@@ -1660,6 +1759,8 @@ function renderClouds(light = false) {
   const c2 = cloudCanvas.getContext("2d");
   const img = c2.createImageData(CW, CH);
   const future = isFutureView();
+  // estimates at 80%, rising to 100% as they hand over to real radar
+  const alphaK = future ? 0.85 : ctx.src === "analysis" ? 0.8 + 0.2 * (ctx.handover ?? 0) : 1;
   const xs = Array.from({ length: CW }, (_, i) => CLOUD.x0 + (i + 0.5) * f);
   const lons = xs.map(rvLon);
   for (let j = 0; j < CH; j++) {
@@ -1669,7 +1770,8 @@ function renderClouds(light = false) {
       if (!look) continue;
       const o = (j * CW + i) * 4;
       img.data[o] = look.c; img.data[o + 1] = look.c; img.data[o + 2] = Math.min(255, look.c + 4);
-      img.data[o + 3] = Math.round(255 * look.a * (future ? 0.85 : 1));
+      // forecasts and estimates a little lighter than observed radar
+      img.data[o + 3] = Math.round(255 * look.a * alphaK);
     }
   }
   c2.putImageData(img, 0, 0);
