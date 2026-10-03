@@ -19,7 +19,7 @@ const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
 const HISTORY_HOURS = 24;
 // Shown in the footer; bump together with the ?v= stamps in index.html so a
 // glance settles "am I looking at the new build or a stale cache?"
-const APP_VERSION = "20260923j";
+const APP_VERSION = "20261003a";
 
 // CARTO basemap key. Since Aug 2026 basemaps.cartocdn.com answers keyless
 // requests with HTTP 200 tiles that have "API KEY REQUIRED" burned in, so
@@ -1954,6 +1954,443 @@ function pollRadar() {
   fetchRadar().catch((e) => setRadarStatus(`unreachable (${e.message})`));
 }
 
+// ---------- haze (PM2.5) ----------
+
+/* Haze is handled like rain: a measured network plus a model, blended.
+   - NEA publishes 1-hour PM2.5 for five regions (north/south/east/west/
+     central, hourly) and the 24-hour PSI; day files give the past 24h.
+   - CAMS (Copernicus) forecasts PM2.5 at ~0.4° (~45 km), fetched by the
+     GitHub Action into data/air.json (Open-Meteo is blocked from the
+     owner's browser).
+   The haze field is the CAMS field scaled toward the NEA readings: each
+   region's log ratio (NEA / model) is spread by inverse distance around
+   the island mean ratio, so a haze episode the model underplays still
+   shows its real strength. Into the future the current ratio carries
+   forward, fading to half after 12 h. Drawn as a neutral grey veil (colour
+   on this map means temperature) that thickens with PM2.5, plus the five
+   region readings as small tags when the air is hazy. */
+const PM25_URLS = ["https://api-open.data.gov.sg/v2/real-time/api/pm25", "https://api.data.gov.sg/v1/environment/pm25"];
+const PSI_URLS = ["https://api-open.data.gov.sg/v2/real-time/api/psi", "https://api.data.gov.sg/v1/environment/psi"];
+const HAZE_POLL_MS = 10 * 60_000; // NEA updates hourly; catch it within 10 min
+const HAZE = {
+  w: 48, h: 31,           // veil raster (~1.7 km px; smooth field, browser-smoothed)
+  sigmaDeg: 0.22,         // CAMS cell interpolation (cells ~0.4° apart)
+  lambda: 1 / (10 * 10),  // region residuals halve ~10 km out
+  d0: 3,                  // km
+  fadeHalfH: 12,          // future: NEA/model ratio halves every 12 h
+  tagMin: 25,             // µg/m³ at any region before the tags appear
+};
+let hazeOn = true;
+try { hazeOn = localStorage.getItem("sgtemp-haze") !== "off"; } catch { /* default on */ }
+const hazeRegions = new Map(); // name -> {name, lat, lon}
+const hazeSeries = new Map();  // name -> [{t: centre of the hour, v}] sorted
+let hazePsi = null;            // {t, byRegion: {name: psi24}}
+let hazeErr = "", hazeDayLoaded = false;
+let airModel = null, airErr = "loading"; // CAMS: {times: [ms], cells: [{lat, lon, v}], generated}
+let airW = null;               // Gaussian weights pixel x cell, row-major
+
+function updateHazeBtn() {
+  const b = document.getElementById("haze-btn");
+  if (b && b.classList) b.classList.toggle("active", hazeOn);
+}
+
+// v2 and v1 shapes differ only in naming
+function normalizeAir(json) {
+  const d = json?.data ?? json ?? {};
+  const regions = (d.regionMetadata ?? d.region_metadata ?? []).map((r) => {
+    const loc = r.labelLocation ?? r.label_location ?? {};
+    return { name: r.name, lat: loc.latitude, lon: loc.longitude };
+  }).filter((r) => r.name !== "national" && Number.isFinite(r.lat) && Number.isFinite(r.lon));
+  const items = (d.items ?? []).map((it) => ({ t: new Date(it.timestamp).getTime(), readings: it.readings ?? {} }))
+    .filter((it) => Number.isFinite(it.t));
+  return { regions, items, token: d.paginationToken };
+}
+
+async function fetchNeaAir(urls, query = "") {
+  const errs = [];
+  for (const base of urls) {
+    try {
+      const out = { regions: [], items: [] };
+      let token = null, pages = 0;
+      do {
+        const url = base + query + (token ? `${query ? "&" : "?"}paginationToken=${encodeURIComponent(token)}` : "");
+        const res = await fetch429(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const n = normalizeAir(await res.json());
+        if (n.regions.length) out.regions = n.regions;
+        out.items.push(...n.items);
+        token = n.token;
+      } while (token && ++pages < 10);
+      if (!out.items.length) throw new Error("no readings in response");
+      return out;
+    } catch (e) {
+      errs.push(`${base.includes("/v2/") ? "v2" : "v1"} ${e.message}`);
+    }
+  }
+  throw new Error(errs.join("; "));
+}
+
+// NEA stamps the 1-hour reading at the END of its hour: centre it.
+function ingestPm25(data) {
+  for (const r of data.regions) hazeRegions.set(r.name, r);
+  let n = 0;
+  for (const it of data.items) {
+    const map1h = it.readings.pm25_one_hourly ?? {};
+    for (const [name, v] of Object.entries(map1h)) {
+      if (name === "national" || !Number.isFinite(v) || v < 0) continue;
+      const tc = it.t - 30 * 60_000;
+      const arr = hazeSeries.get(name) ?? [];
+      if (!arr.some((p) => p.t === tc)) { arr.push({ t: tc, v }); n++; }
+      arr.sort((a, b) => a.t - b.t);
+      const cutoff = Date.now() - (HISTORY_HOURS + 2) * 3600_000;
+      while (arr.length && arr[0].t < cutoff) arr.shift();
+      hazeSeries.set(name, arr);
+    }
+  }
+  if (!n && !hazeSeries.size) throw new Error("response had no pm25_one_hourly values");
+}
+
+async function fetchHaze() {
+  try {
+    ingestPm25(await fetchNeaAir(PM25_URLS));
+    hazeErr = "";
+  } catch (e) {
+    hazeErr = `NEA PM2.5 ${e.message}`;
+    console.warn("[sgtemp] haze:", hazeErr);
+  }
+  try {
+    const psi = await fetchNeaAir(PSI_URLS);
+    const it = psi.items[psi.items.length - 1];
+    const by = it.readings.psi_twenty_four_hourly;
+    if (by) hazePsi = { t: it.t, byRegion: by };
+  } catch (e) {
+    console.warn("[sgtemp] PSI unavailable:", e.message); // PM2.5 carries the layer
+  }
+  scheduleRender();
+}
+
+async function loadHazeHistory() {
+  if (hazeDayLoaded) return;
+  hazeDayLoaded = true;
+  for (const day of [sgtDate(new Date(Date.now() - 86_400_000)), sgtDate(new Date())]) {
+    try {
+      ingestPm25(await fetchNeaAir(PM25_URLS, `?date=${day}`));
+    } catch (e) {
+      console.warn(`[sgtemp] haze history ${day}:`, e.message);
+    }
+  }
+  scheduleRender();
+}
+
+function pollHaze() {
+  fetchHaze().catch((e) => console.warn("[sgtemp] haze poll failed:", e));
+}
+
+// Same-origin data/air.json only: there is no browser fallback, since the
+// owner's browser can't reach Open-Meteo — the footer says when it's missing.
+async function refreshAir() {
+  try {
+    const res = await fetch(`data/air.json?t=${Math.floor(Date.now() / 600_000)}`);
+    if (!res.ok) throw new Error(`data/air.json HTTP ${res.status}`);
+    const j = await res.json();
+    if (!j.cells?.length || !j.times?.length) throw new Error("data/air.json is empty");
+    const age = Date.now() - (j.generated ?? 0);
+    if (age > 30 * 3600_000) throw new Error(`data/air.json is ${Math.round(age / 3600_000)}h old`);
+    airModel = {
+      times: j.times.map((s) => s * 1000), generated: j.generated,
+      cells: j.cells.map((c) => ({ lat: c.lat, lon: c.lon, v: Float32Array.from(c.pm2_5, (x) => (x == null ? NaN : x)) })),
+    };
+    airW = null;
+    airErr = "";
+  } catch (e) {
+    airErr = e.message;
+    console.warn("[sgtemp] haze model unavailable:", e.message);
+  }
+  scheduleRender();
+}
+
+function hazePixLatLon(i, j) {
+  return [
+    OVERLAY.latMax - ((j + 0.5) / HAZE.h) * (OVERLAY.latMax - OVERLAY.latMin),
+    OVERLAY.lonMin + ((i + 0.5) / HAZE.w) * (OVERLAY.lonMax - OVERLAY.lonMin),
+  ];
+}
+
+function airWeightsAt(lat, lon, out, off) {
+  const s2 = 2 * HAZE.sigmaDeg ** 2;
+  airModel.cells.forEach((c, k) => {
+    out[off + k] = Math.exp(-((c.lat - lat) ** 2 + (c.lon - lon) ** 2) / s2);
+  });
+}
+
+// CAMS cell values at time t (linear between hours); null outside the run
+function airCellsAt(t) {
+  if (!airModel) return null;
+  const { times, cells } = airModel;
+  if (t < times[0] || t > times[times.length - 1]) return null;
+  let k = 0;
+  while (k < times.length - 2 && times[k + 1] <= t) k++;
+  const f = Math.min(1, Math.max(0, (t - times[k]) / (times[k + 1] - times[k] || 1)));
+  const out = new Float32Array(cells.length);
+  cells.forEach((c, i) => {
+    const a = c.v[k], b = c.v[k + 1];
+    out[i] = Number.isNaN(a) ? b : Number.isNaN(b) ? a : a + (b - a) * f;
+  });
+  return out;
+}
+
+function airMix(vals, w, off) {
+  let s = 0, ws = 0;
+  for (let k = 0; k < vals.length; k++) {
+    const v = vals[k];
+    if (v !== v) continue; // NaN
+    s += w[off + k] * v; ws += w[off + k];
+  }
+  return ws > 0 ? s / ws : NaN;
+}
+
+function airAt(vals, lat, lon) {
+  if (!vals) return NaN;
+  const w = new Float32Array(vals.length);
+  airWeightsAt(lat, lon, w, 0);
+  return airMix(vals, w, 0);
+}
+
+// NEA reading for a region at t: linear between hourly points, held up to
+// 2 h past the last one; a longer gap is a gap (null).
+function hazeObsAt(name, t) {
+  const arr = hazeSeries.get(name);
+  if (!arr?.length) return null;
+  let i = arr.findIndex((p) => p.t > t);
+  if (i === 0) return t > arr[0].t - 45 * 60_000 ? arr[0].v : null;
+  if (i < 0) return t - arr[arr.length - 1].t <= 2 * 3600_000 ? arr[arr.length - 1].v : null;
+  const a = arr[i - 1], b = arr[i];
+  if (b.t - a.t <= 2.5 * 3600_000) return a.v + ((b.v - a.v) * (t - a.t)) / (b.t - a.t);
+  return t - a.t <= 45 * 60_000 ? a.v : b.t - t <= 45 * 60_000 ? b.v : null;
+}
+
+const logRatio = (obs, mod) => Math.max(-1.4, Math.min(1.4, Math.log((obs + 5) / (mod + 5))));
+
+/* Haze at displayed time t: {src, field (HAZE raster, µg/m³), regions:
+   [{name, lat, lon, v, obs (bool)}], ratio, note}, or {src: "none", note}. */
+let hazeCache = { key: "", ctx: null };
+
+function hazeContext(t) {
+  const future = isFutureView();
+  const now = Date.now();
+  // hourly data: a 2-minute step is invisible and makes most glide frames
+  // cache hits (the veil recompute was ~4 ms at 4x CPU throttle)
+  t = Math.round(t / 120_000) * 120_000;
+  const key = `${t}|${future}|${airModel?.generated}|${[...hazeSeries.values()].reduce((n, a) => n + a.length, 0)}`;
+  if (hazeCache.key === key) return hazeCache.ctx;
+  const mod = airCellsAt(t);
+  const regs = [...hazeRegions.values()];
+  // per-region log ratios NEA / model: at t (past/live) or now (future)
+  const tRef = future ? now : t;
+  const modRef = future ? airCellsAt(now) : mod;
+  const pts = [];
+  for (const r of regs) {
+    const obs = hazeObsAt(r.name, tRef);
+    const m = airAt(modRef, r.lat, r.lon);
+    pts.push({ ...r, obs, lr: obs != null && Number.isFinite(m) ? logRatio(obs, m) : null });
+  }
+  const withLr = pts.filter((p) => p.lr != null);
+  const fade = future ? 0.5 ** ((t - now) / (HAZE.fadeHalfH * 3600_000)) : 1;
+  const meanLr = withLr.length ? withLr.reduce((s, p) => s + p.lr, 0) / withLr.length : 0;
+  const withObs = pts.filter((p) => p.obs != null);
+  let ctx;
+  if (!mod && (future || !withObs.length)) {
+    ctx = { src: "none", note: future ? `no haze forecast (model: ${airErr || "no data this far ahead"})`
+      : hazeErr || "no PM2.5 readings at this time" };
+  } else {
+    const cosLat = Math.cos((1.35 * Math.PI) / 180), d02 = HAZE.d0 ** 2;
+    // IDW residual around a mean, the same scheme as the temperature shading
+    const spread = (lat, lon, list, val, mean) => {
+      let ws = 0, rs = 0;
+      for (const p of list) {
+        const dx = (lon - p.lon) * cosLat * KM_PER_DEG, dy = (lat - p.lat) * KM_PER_DEG;
+        const w = 1 / (dx * dx + dy * dy + d02);
+        ws += w; rs += w * (val(p) - mean);
+      }
+      return mean + (list.length ? rs / (ws + HAZE.lambda) : 0);
+    };
+    if (mod && !airW) {
+      airW = new Float32Array(HAZE.w * HAZE.h * airModel.cells.length);
+      for (let j = 0; j < HAZE.h; j++) {
+        for (let i = 0; i < HAZE.w; i++) airWeightsAt(...hazePixLatLon(i, j), airW, (j * HAZE.w + i) * airModel.cells.length);
+      }
+    }
+    const obsMean = withObs.length ? withObs.reduce((s, p) => s + p.obs, 0) / withObs.length : 0;
+    const valueAt = mod
+      ? (lat, lon, off) => {
+        const m = off == null ? airAt(mod, lat, lon) : airMix(mod, airW, off);
+        // the +5 offset matches logRatio, so a region's own ratio lands
+        // exactly on its reading
+        return Math.max(0, (m + 5) * Math.exp(fade * spread(lat, lon, withLr, (p) => p.lr, meanLr)) - 5);
+      }
+      : (lat, lon) => Math.max(0, spread(lat, lon, withObs, (p) => p.obs, obsMean));
+    const field = new Float32Array(HAZE.w * HAZE.h);
+    const nc = airModel?.cells.length ?? 0;
+    for (let j = 0; j < HAZE.h; j++) {
+      for (let i = 0; i < HAZE.w; i++) {
+        const [lat, lon] = hazePixLatLon(i, j);
+        field[j * HAZE.w + i] = valueAt(lat, lon, mod ? (j * HAZE.w + i) * nc : null);
+      }
+    }
+    ctx = {
+      src: future ? "forecast" : mod ? (withObs.length ? "analysis" : "model") : "regions",
+      field, ratio: withLr.length ? Math.exp(meanLr) : null, fade,
+      // past/live tags show the actual reading; forecasts and gaps the field
+      regions: pts.map((p) => ({ name: p.name, lat: p.lat, lon: p.lon,
+        v: !future && p.obs != null ? p.obs : valueAt(p.lat, p.lon), obs: !future && p.obs != null })),
+    };
+  }
+  hazeCache = { key, ctx };
+  return ctx;
+}
+
+// NEA 1-hour PM2.5 bands
+function pmBand(v) {
+  return v <= 55 ? "normal" : v <= 150 ? "elevated" : v <= 250 ? "high" : "very high";
+}
+
+// µg/m³ -> veil opacity: invisible in clean air, a light veil ~35, a thick
+// one at 150+ (NEA "elevated" and beyond)
+function hazeAlpha(v) {
+  return v > 12 ? 0.5 * (1 - Math.exp(-(v - 12) / 120)) : 0;
+}
+
+let hazeLayer = null, hazeCanvas = null, hazeKey = "";
+const hazeTags = new Map(); // region -> marker
+
+let hazeOutlookCache = { key: "", v: null };
+
+function hazeOutlook() {
+  if (!airModel || !hazeRegions.size) return null;
+  const now = Date.now();
+  const key = `${Math.floor(now / 300_000)}|${airModel.generated}|${hazeCache.key}`;
+  if (hazeOutlookCache.key === key) return hazeOutlookCache.v;
+  let best = null;
+  for (const t of airModel.times) {
+    if (t <= now || t > now + FORECAST_HOURS * 3600_000) continue;
+    const vals = airCellsAt(t), ref = airCellsAt(now), fade = 0.5 ** ((t - now) / (HAZE.fadeHalfH * 3600_000));
+    let s = 0, n = 0;
+    for (const r of hazeRegions.values()) {
+      const m = airAt(vals, r.lat, r.lon), m0 = airAt(ref, r.lat, r.lon), obs = hazeObsAt(r.name, now);
+      if (!Number.isFinite(m)) continue;
+      s += obs != null && Number.isFinite(m0) ? Math.max(0, (m + 5) * Math.exp(fade * logRatio(obs, m0)) - 5) : m;
+      n++;
+    }
+    if (n && (!best || s / n > best.v)) best = { t, v: s / n };
+  }
+  hazeOutlookCache = { key, v: best };
+  return best;
+}
+
+function renderHaze(light = false) {
+  const el = document.getElementById("haze-status");
+  // the footer reflows on every change: landing frames only
+  const setStatus = (s) => { if (el && !light && el.textContent !== s) el.textContent = s; };
+  const hide = () => {
+    if (hazeLayer) hazeLayer.setOpacity(0);
+    hazeKey = "";
+    for (const m of hazeTags.values()) {
+      m._hazeShow = false;
+      const e = m.getElement && m.getElement()?.querySelector(".haze-tag");
+      if (e && e.style) e.style.opacity = "0";
+    }
+  };
+  if (!hazeOn) { hide(); setStatus("off"); return; }
+  if (typeof L === "undefined" || !map) return;
+  // mid-glide frames step in 10 min (the data is hourly; redrawing a
+  // full-map layer every frame cost ~5 ms at 4x throttle); landing is exact
+  const t0 = displayedTime() ?? Date.now();
+  const t = light ? Math.round(t0 / 600_000) * 600_000 : t0;
+  const ctx = hazeContext(t);
+  const modelNote = airErr ? ` · model unavailable (${airErr})` : "";
+  if (ctx.src === "none") { hide(); setStatus(ctx.note + (ctx.note.includes("model") ? "" : modelNote)); return; }
+
+  // veil
+  const key = hazeCache.key;
+  if (key !== hazeKey) {
+    hazeCanvas ??= document.createElement("canvas");
+    if (typeof hazeCanvas.getContext !== "function") return;
+    if (hazeCanvas.width !== HAZE.w) { hazeCanvas.width = HAZE.w; hazeCanvas.height = HAZE.h; }
+    const c2 = hazeCanvas.getContext("2d");
+    const img = c2.createImageData(HAZE.w, HAZE.h);
+    const k = ctx.src === "forecast" ? 0.85 : 1; // estimates a little lighter
+    for (let p = 0; p < ctx.field.length; p++) {
+      const o = p * 4;
+      img.data[o] = 196; img.data[o + 1] = 196; img.data[o + 2] = 198; // neutral grey, not a hue
+      img.data[o + 3] = Math.round(255 * hazeAlpha(ctx.field[p]) * k);
+    }
+    c2.putImageData(img, 0, 0);
+    if (!hazeLayer) {
+      hazeLayer = L.svgOverlay(hazeCanvas, [[OVERLAY.latMin, OVERLAY.lonMin], [OVERLAY.latMax, OVERLAY.lonMax]],
+        { pane: "haze", opacity: 1, interactive: false, className: "canvas-layer haze-veil",
+          attribution: 'Haze <a href="https://atmosphere.copernicus.eu/">CAMS</a>' }).addTo(map);
+    } else hazeLayer.setOpacity(1);
+    hazeKey = key;
+  }
+
+  // region tags, all five together once any region is hazy
+  const future = ctx.src === "forecast";
+  const show = ctx.regions.some((r) => r.v >= HAZE.tagMin);
+  for (const r of ctx.regions) {
+    let m = hazeTags.get(r.name);
+    if (!m) {
+      m = L.marker([r.lat, r.lon], {
+        pane: "rain", keyboard: false,
+        icon: L.divIcon({ className: "", html: `<span class="haze-tag" style="opacity:0"></span>`, iconSize: [0, 0] }),
+      }).addTo(map);
+      m.bindTooltip("");
+      hazeTags.set(r.name, m);
+    }
+    const e = m.getElement && m.getElement()?.querySelector(".haze-tag");
+    // DOM writes only on change: this runs every glide frame
+    const txt = `<small>PM2.5</small>${future || !r.obs ? "≈" : ""}${Math.round(r.v)}`;
+    if (m._hazeTxt === txt && m._hazeShow === show) continue;
+    m._hazeTxt = txt; m._hazeShow = show;
+    if (e && e.style) {
+      e.innerHTML = txt;
+      e.style.opacity = show ? "1" : "0";
+      if (e.classList) e.classList.toggle("fc", future || !r.obs);
+    }
+    if (m.setTooltipContent) {
+      const psi = !future && displayedT === null ? hazePsi?.byRegion?.[r.name] : null;
+      const name = r.name[0].toUpperCase() + r.name.slice(1);
+      m.setTooltipContent(`${name} · PM2.5 ${r.obs ? "" : "≈ "}${Math.round(r.v)} µg/m³ 1-h (${pmBand(r.v)})` +
+        (r.obs ? " · NEA" : future ? " · forecast" : " · model estimate") + (psi != null ? ` · PSI 24h ${psi}` : ""));
+    }
+  }
+
+  // footer
+  // no NEA regions at all (feed down): describe the model field instead
+  const vals = ctx.regions.length ? ctx.regions.map((r) => r.v) : [...ctx.field].filter(Number.isFinite);
+  const lo = Math.round(Math.min(...vals)), hi = Math.round(Math.max(...vals));
+  const range = vals.length ? (lo === hi ? `${lo}` : `${lo}–${hi}`) : "";
+  const ratio = ctx.ratio != null && Math.abs(Math.log(ctx.ratio)) > 0.1 ? ` ×${ctx.ratio.toFixed(1)}` : "";
+  if (future) {
+    setStatus(`≈ PM2.5 ${range} µg/m³ (CAMS model${ratio ? `${ratio} to match NEA, fading` : ""})`);
+  } else {
+    const nObs = ctx.regions.filter((r) => r.obs).length;
+    if (!ctx.regions.length) {
+      setStatus(`≈ PM2.5 ${range} µg/m³ over the map (CAMS model only — ${hazeErr || "no NEA regions"})`);
+      return;
+    }
+    const psiVals = displayedT === null && hazePsi ? Object.entries(hazePsi.byRegion)
+      .filter(([k, v]) => k !== "national" && Number.isFinite(v)).map(([, v]) => v) : [];
+    const psi = psiVals.length ? ` · PSI 24h ${Math.min(...psiVals)}–${Math.max(...psiVals)}` : "";
+    const how = ctx.src === "analysis" ? ` · map: CAMS model${ratio} to match NEA`
+      : ctx.src === "model" ? " · no NEA reading at this time: CAMS model only"
+      : " · field from NEA regions only";
+    const out = displayedT === null ? hazeOutlook() : null;
+    const outlook = out ? ` · next 24h peak ≈ ${Math.round(out.v)} ~${fmtHour(out.t)}` : "";
+    setStatus(`PM2.5 ${range} µg/m³ (${pmBand(hi)}) · ${nObs} NEA regions${psi}${how}${outlook}${modelNote}` +
+      (hazeErr ? ` · ${hazeErr}` : ""));
+  }
+}
+
 
 // Bilinear sample over a WGRID-shaped array (row 0 = north); null on NaN.
 function gridSample2(arr, lat, lon) {
@@ -2932,6 +3369,7 @@ function renderAll(light = false) {
   renderWindPins();
   renderRain(); // rain follows the scrubber (24h series)
   applyRadarFrame(light); // radar, nowcast and model rain follow it too
+  renderHaze(light);
 }
 
 // Coalesce slider-drag renders to animation frames.
@@ -3345,6 +3783,9 @@ function initMap() {
   const radarPane = map.createPane("radar"); // RainViewer tiles (fallback only)
   radarPane.style.zIndex = 430; // above the shading (400), below markers (600)
   radarPane.style.pointerEvents = "none";
+  const hazePane = map.createPane("haze"); // PM2.5 veil, under the rain clouds
+  hazePane.style.zIndex = 420;
+  hazePane.style.pointerEvents = "none";
   const cloudPane = map.createPane("clouds"); // decoded radar / nowcast / model rain
   cloudPane.style.zIndex = 432;
   cloudPane.style.pointerEvents = "none";
@@ -3433,6 +3874,14 @@ document.getElementById("radar-btn").addEventListener("click", () => {
 });
 updateRadarBtn();
 
+document.getElementById("haze-btn").addEventListener("click", () => {
+  hazeOn = !hazeOn;
+  try { localStorage.setItem("sgtemp-haze", hazeOn ? "on" : "off"); } catch { /* fine */ }
+  updateHazeBtn();
+  renderHaze(light);
+});
+updateHazeBtn();
+
 // Collapsible station panel: hide to give the map the full width; a slim
 // handle on the map edge brings it back. The map must re-measure after.
 let panelOpen = true;
@@ -3472,6 +3921,9 @@ seedRainRecent = withLoading("rainseed", "recent rain", seedRainRecent);
 refresh = withLoading("temp", () => (latestReadingT == null ? "temperatures" : null), refresh);
 refreshModel = withLoading("model", () => (model ? null : "forecast"), refreshModel);
 fetchRadar = withLoading("radar", "radar", fetchRadar);
+loadHazeHistory = withLoading("hazehist", () => (hazeDayLoaded ? null : "haze history"), loadHazeHistory);
+refreshAir = withLoading("air", () => (airModel ? null : "haze model"), refreshAir);
+fetchHaze = withLoading("haze", () => (hazeSeries.size ? null : "haze"), fetchHaze);
 
 initMap();
 startWind();
@@ -3485,6 +3937,8 @@ refresh().then(() => {
   pollCommunity();
   pollRain();
   pollRadar();
+  pollHaze();
+  setTimeout(() => loadHazeHistory().catch(() => {}), 4500);
   if (!TEST_RAIN) {
     setTimeout(() => seedRainRecent().catch(() => {}), 3000);
     setTimeout(() => loadRainHistory().catch(() => {}), 6000);
@@ -3496,6 +3950,9 @@ setInterval(pollRain, RAIN_POLL_MS);
 setInterval(pollRadar, RADAR_POLL_MS);
 setInterval(pollWind, POLL_MS);
 refreshModel();
+refreshAir();
+setInterval(refreshAir, MODEL_REFRESH_MS);
+setInterval(pollHaze, HAZE_POLL_MS);
 setInterval(refresh, POLL_MS);
 setInterval(refreshModel, MODEL_REFRESH_MS);
 setInterval(tickStatus, 1000);

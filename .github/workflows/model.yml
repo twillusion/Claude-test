@@ -20,11 +20,16 @@ jobs:
         with:
           node-version: 22
       - run: node scripts/fetch-model.mjs
+      # haze (CAMS PM2.5): a failure here must not hold back the weather
+      # model, but it stays visible as a failed step, and the page footer
+      # reports the missing/stale file
+      - run: node scripts/fetch-air.mjs
+        continue-on-error: true
       - name: Commit data
         run: |
           git config user.name "model-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/model.json
+          git add data/
           git diff --cached --quiet || git commit -m "Update forecast model data"
           # main may have moved while the fetch ran (a PR merge)
           git pull --rebase origin main

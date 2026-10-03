@@ -10,7 +10,7 @@ humans; this file is the working knowledge for continuing development.
 
 - `index.html` — layout: header stats, map + legend + timebar (LIVE / WIND /
   RADAR buttons, time slider), collapsible station panel, footer status line.
-- `assets/app.js` (~2.3k lines, plain JS, no modules) — everything.
+- `assets/app.js` (~4k lines, plain JS, no modules) — everything.
 - `assets/style.css` — dark theme; mobile breakpoint at 760px (end of file).
 - `assets/vendor/leaflet/` — Leaflet 1.9.4, vendored on purpose (unpkg
   rate-limited the CSS once and broke the whole layout).
@@ -18,6 +18,9 @@ humans; this file is the working knowledge for continuing development.
   (hourly at :37 — GitHub skips many scheduled runs, a 3h cron really ran
   every 5-7h; also manually runnable) that fetches the Open-Meteo forecast
   and commits `data/model.json`. Do not hand-edit `data/model.json`.
+- `scripts/fetch-air.mjs` — same Action, separate step (`continue-on-error`,
+  so a haze failure never holds back the weather model): CAMS PM2.5 into
+  `data/air.json`. Do not hand-edit it either.
 - `tests/smoke.js` — runs app.js in Node with stubbed DOM/Leaflet/fetch.
 
 ## Every change: the release routine
@@ -94,6 +97,18 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
   fails silently. The owner's free key is in `CARTO_KEY` (app.js; public by
   design, free tier 5M tiles/month); the smoke test asserts the tile URL
   carries it, and the footer "basemap" item says when it's missing.
+- **Haze**: NEA `pm25` and `psi` (v2 `api-open.data.gov.sg/v2/real-time/
+  api/pm25`, v1 `api.data.gov.sg/v1/environment/pm25` fallback; v2 uses
+  `regionMetadata`/`labelLocation`, v1 `region_metadata`/`label_location`;
+  readings `pm25_one_hourly` / `psi_twenty_four_hourly` keyed by region,
+  `national` ignored). Five regions only, hourly, stamped at the END of
+  the hour (we centre it). `?date=` gives a day (paginated in v2).
+  CAMS via Open-Meteo Air Quality (`air-quality-api.open-meteo.com`,
+  `domains=cams_global`, ~0.4° cells, 12-hourly runs, 5+ day horizon). The
+  Action samples a 0.2° lattice around the window and keeps each snapped
+  cell once; the page interpolates cell centres (Gaussian, σ 0.22°). No
+  browser fallback (Open-Meteo is blocked there); the file is accepted up
+  to 30 h old and the footer says when it's missing.
 - **Sensor.Community**: wired in, but has no sensors in Singapore
   (footer: "community none in range").
 - NASA GIBS Himawari IR was tried for clouds and abandoned (2km blocks,
@@ -164,6 +179,20 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
   Drawn at 80% opacity, footer "estimated from N gauges + model"; cross-
   fades into the oldest radar frame over 30 min. Source keys in the cloud
   cache include `rainSeries.size` so it redraws when the archive lands.
+- **Haze** (`hazeContext`/`renderHaze`, pane `haze` z420 under the
+  clouds): CAMS field scaled by NEA: per region log ratio
+  `ln((obs+5)/(model+5))` (clamped ±1.4), spread by IDW around the island
+  mean (λ halves ~10 km out, d0 3 km), applied as `(m+5)·e^corr − 5`, so a
+  region lands on its own reading. Future: the ratio at "now", halving
+  every 12 h (`HAZE.fadeHalfH`). No model → past/live from the regions
+  alone, no forecast, footer says why. Neutral grey veil (alpha 0 below 12
+  µg/m³, ~0.15 at 55, ~0.34 at 150) on a 48×31 canvas (smooth field;
+  96×61 cost ~4 ms per glide frame at 4×). Glide frames step haze time in
+  10 min and skip the footer (reflow); landing is exact. Region tags
+  ("PM2.5 64", dashed + ≈ for estimates) sit just below NEA's label points
+  (north coincides with the Sembawang wind pin) and show, all five, once
+  any region is ≥ 25. The 4th timebar button (HAZE) forced tighter phone
+  buttons; under 380px the sun/moon icon hides so row 1 still fits.
 - **Rain glyphs**: 🌧️ at the real gauge positions, **no rain colour**
   (owner's rule: colour means temperature), each with a **circle of
   effect** (owner asked for it back): radius 0.8–5 km by intensity on one

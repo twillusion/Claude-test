@@ -91,6 +91,15 @@ static page, no backend, no hosting costs.
   slider track. If the browser can't read radar pixels, RainViewer's own
   coloured tiles are shown instead (no nowcast) and the footer says so.
   The RADAR button toggles the cloud layer.
+- Haze: NEA's hourly 1-hour PM2.5 for the five regions (plus 24-hour PSI
+  in tooltips and the footer) and the CAMS PM2.5 forecast (Copernicus, ~45
+  km, via Open-Meteo, fetched by the same GitHub Action into
+  `data/air.json`). The map shows a neutral grey veil that thickens with
+  PM2.5: the CAMS field scaled toward the NEA readings (each region's
+  ratio spread by inverse distance around the island mean). The forecast
+  carries today's NEA/model ratio forward, halving every 12 h. Region tags
+  ("PM2.5 64") appear once any region reaches 25 µg/m³; forecasts and
+  model estimates are dashed and marked ≈. The HAZE button toggles it.
 - The wind field is precomputed onto a 24×16 grid once per change, so
   particles and rain sample it with one bilinear lookup per tick instead
   of per-particle IDW.
@@ -122,3 +131,5 @@ paths against mocked APIs. Development notes live in `CLAUDE.md`.
 Contains information from the National Environment Agency accessed via
 [data.gov.sg](https://data.gov.sg), made available under the
 [Singapore Open Data Licence](https://data.gov.sg/open-data-licence).
+Haze forecast: Copernicus Atmosphere Monitoring Service (CAMS) information,
+served by [Open-Meteo](https://open-meteo.com/en/docs/air-quality-api).
