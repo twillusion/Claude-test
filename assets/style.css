@@ -71,6 +71,46 @@ body { display: flex; flex-direction: column; }
   font-variant-numeric: tabular-nums;
 }
 
+/* haze key, under the temperature legend: the veil's own grey ramp */
+.haze-key {
+  position: absolute;
+  top: 44px;
+  right: 10px;
+  z-index: 800;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.25rem 0.6rem;
+  background: rgba(22, 29, 46, 0.92);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.66rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.haze-key b { color: var(--text); font-weight: 600; }
+.haze-key.hidden { display: none; }
+.haze-bar {
+  position: relative;
+  width: 60px;
+  height: 8px;
+  border-radius: 4px;
+  background:
+    linear-gradient(90deg, rgba(200, 200, 202, 0), rgba(200, 200, 202, 0.6)),
+    repeating-linear-gradient(45deg, #2a3450 0 3px, #1d2740 3px 6px);
+}
+/* tick: the haziest value on the map */
+.haze-bar::after {
+  content: "";
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  left: calc(var(--haze-mark, 0) * 100% - 1px);
+  width: 2px;
+  background: #e6e9ee;
+  border-radius: 1px;
+}
+
 .legend-bar {
   width: 84px;
   height: 8px;

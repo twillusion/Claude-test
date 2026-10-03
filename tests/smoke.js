@@ -204,6 +204,12 @@ const h = new Function(src + `
       return { src: ctx.src, gauges: ctx.gauges, atR1: ctx.rate(r1.lat, r1.lon), atR2: ctx.rate(r2.lat, r2.lon),
         sea: ctx.rate(1.12, 104.18) };
     },
+    hazeLook: () => {
+      const t = Date.now(), a = hazeDrift(t), b = hazeDrift(t + 3600e3);
+      let lo = 1, hi = 0, sum = 0;
+      for (let i = 0; i < 4000; i++) { const n = hazeFbm(i * 0.37, i * 0.11); lo = Math.min(lo, n); hi = Math.max(hi, n); sum += n; }
+      return { a35: hazeAlpha(35), a55: hazeAlpha(55), a8: hazeAlpha(8), driftE: b[0] - a[0], driftN: b[1] - a[1], lo, hi, mean: sum / 4000 };
+    },
     hazeTest: async () => {
       await refreshAir(); await fetchHaze(); await loadHazeHistory();
       const px = (c, lat, lon) => c.field[Math.floor((OVERLAY.latMax - lat) / (OVERLAY.latMax - OVERLAY.latMin) * HAZE.h) * HAZE.w
@@ -401,6 +407,13 @@ const h = new Function(src + `
   const nl = h.negativeLeadTest();
   console.assert(nl.ok && nl.future && nl.anvil, "radar newer than the viewed moment renders:", nl);
   h.goLive();
+
+  // haze look: visible at hazy-day levels, drifting with the model wind
+  // (10 km/h from the east), texture centred on 1x the data opacity
+  const hl = h.hazeLook();
+  console.assert(hl.a8 === 0 && hl.a35 > 0.12 && hl.a55 > 0.2, "haze veil opacity curve:", hl);
+  console.assert(Math.abs(hl.driftE + 10) < 0.2 && Math.abs(hl.driftN) < 0.2, "haze texture drifts with the wind:", hl);
+  console.assert(hl.lo >= 0 && hl.hi <= 1 && Math.abs(hl.mean - 0.5) < 0.06, "haze texture range:", hl);
 
   // haze: NEA regions + CAMS model
   const hz = await h.hazeTest();
