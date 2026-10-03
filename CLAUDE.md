@@ -185,10 +185,17 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
   mean (λ halves ~10 km out, d0 3 km), applied as `(m+5)·e^corr − 5`, so a
   region lands on its own reading. Future: the ratio at "now", halving
   every 12 h (`HAZE.fadeHalfH`). No model → past/live from the regions
-  alone, no forecast, footer says why. Neutral grey veil (alpha 0 below 12
-  µg/m³, ~0.15 at 55, ~0.34 at 150) on a 48×31 canvas (smooth field;
-  96×61 cost ~4 ms per glide frame at 4×). Glide frames step haze time in
-  10 min and skip the footer (reflow); landing is exact. Region tags
+  alone, no forecast, footer says why. Neutral grey veil: alpha 0 ≤10
+  µg/m³, ~0.16 at 35, ~0.24 at 55, ~0.44 at 150 (the first curve, ~0.13
+  at a real 40-55 night, was invisible — the owner asked "can we visualize
+  the haze?" with the layer already on). Data field 48×31; painted at
+  96×61 (48×31 + 2 noise octaves on glide frames) with a cosmetic fBm
+  texture (~12 km patches, opacity ×0.55-1.45, mean 1) that drifts with
+  the model's island-mean wind integrated over time (`hazeDrift`), so the
+  haze rolls when scrubbing. Grey key `#haze-key` under the temperature
+  legend, tick = haziest value on the map; shown only while the veil is.
+  Glide frames step haze DATA in 10 min and skip the footer (reflow);
+  the texture uses the exact time; landing is exact. Region tags
   ("PM2.5 64", dashed + ≈ for estimates) sit just below NEA's label points
   (north coincides with the Sembawang wind pin) and show, all five, once
   any region is ≥ 25. The 4th timebar button (HAZE) forced tighter phone

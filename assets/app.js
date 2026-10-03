@@ -19,7 +19,7 @@ const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
 const HISTORY_HOURS = 24;
 // Shown in the footer; bump together with the ?v= stamps in index.html so a
 // glance settles "am I looking at the new build or a stale cache?"
-const APP_VERSION = "20261003a";
+const APP_VERSION = "20261003b";
 
 // CARTO basemap key. Since Aug 2026 basemaps.cartocdn.com answers keyless
 // requests with HTTP 200 tiles that have "API KEY REQUIRED" burned in, so
@@ -1973,7 +1973,9 @@ const PM25_URLS = ["https://api-open.data.gov.sg/v2/real-time/api/pm25", "https:
 const PSI_URLS = ["https://api-open.data.gov.sg/v2/real-time/api/psi", "https://api.data.gov.sg/v1/environment/psi"];
 const HAZE_POLL_MS = 10 * 60_000; // NEA updates hourly; catch it within 10 min
 const HAZE = {
-  w: 48, h: 31,           // veil raster (~1.7 km px; smooth field, browser-smoothed)
+  w: 48, h: 31,           // data field (~1.7 km px; the field itself is smooth)
+  pw: 96, ph: 61,         // painted veil incl. texture (~0.85 km px); half on glide frames
+  texKm: 12,              // haze patch size (texture base wavelength)
   sigmaDeg: 0.22,         // CAMS cell interpolation (cells ~0.4° apart)
   lambda: 1 / (10 * 10),  // region residuals halve ~10 km out
   d0: 3,                  // km
@@ -2254,14 +2256,92 @@ function pmBand(v) {
   return v <= 55 ? "normal" : v <= 150 ? "elevated" : v <= 250 ? "high" : "very high";
 }
 
-// µg/m³ -> veil opacity: invisible in clean air, a light veil ~35, a thick
-// one at 150+ (NEA "elevated" and beyond)
+// µg/m³ -> veil opacity: nothing in clean air (≤10), clearly there by 35-55
+// (what a hazy Singapore day looks like), thick at 150+ (NEA "elevated" and
+// beyond). The first curve (0.12-0.15 at 40-55) was too faint to read as
+// haze over a whole map with no clear edge to compare against.
 function hazeAlpha(v) {
-  return v > 12 ? 0.5 * (1 - Math.exp(-(v - 12) / 120)) : 0;
+  return v > 10 ? 0.55 * (1 - Math.exp(-(v - 10) / 90)) : 0;
+}
+
+/* Texture: haze is never a flat sheet, so the veil carries soft patches
+   (value-noise fBm, ~12 km) that drift with the model's island-mean wind
+   as time moves, the way the rain clouds roll. The patches are cosmetic:
+   they modulate the opacity around the data value (×0.55-1.45, mean 1);
+   the data field itself (NEA + CAMS) is what sets how hazy each place is. */
+function hazeHash(ix, iy) {
+  let h = (Math.imul(ix, 374761393) + Math.imul(iy, 668265263)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
+function hazeNoise(x, y) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+  const a = hazeHash(ix, iy), b = hazeHash(ix + 1, iy), c = hazeHash(ix, iy + 1), d = hazeHash(ix + 1, iy + 1);
+  return a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy;
+}
+
+// coarse = glide frames: the finest octave is invisible mid-motion
+function hazeFbm(x, y, coarse = false) {
+  const b = 0.55 * hazeNoise(x, y) + 0.3 * hazeNoise(2.03 * x + 17.1, 2.03 * y + 5.3);
+  return coarse ? b + 0.075 : b + 0.15 * hazeNoise(4.07 * x + 3.7, 4.07 * y + 11.9);
+}
+
+// How far the air has moved (km east, km north) by time t: the model's
+// island-mean 10 m wind integrated hour by hour, so the drift is smooth
+// across hours and consistent wherever you scrub to.
+let hazeDriftCache = { key: "", times: [], cx: [], cy: [], u: [], v: [] };
+
+function hazeDrift(t) {
+  if (!model?.uGrids?.length) return [0, 0];
+  const key = `${model.times[0]}|${model.times.length}|${model.uGrids[0][0]}`;
+  const c = hazeDriftCache;
+  if (c.key !== key) {
+    const mean = (g) => {
+      let s = 0, n = 0;
+      for (const x of g) if (x === x) { s += x; n++; }
+      return n ? s / n : 0;
+    };
+    const u = model.uGrids.map(mean), v = model.vGrids.map(mean), cx = [0], cy = [0];
+    for (let k = 1; k < model.times.length; k++) {
+      const h = (model.times[k] - model.times[k - 1]) / 3600_000;
+      cx.push(cx[k - 1] + 0.5 * (u[k - 1] + u[k]) * h);
+      cy.push(cy[k - 1] + 0.5 * (v[k - 1] + v[k]) * h);
+    }
+    hazeDriftCache = { key, times: model.times, cx, cy, u, v };
+  }
+  const { times, cx, cy, u, v } = hazeDriftCache, n = times.length;
+  if (t <= times[0]) { const h = (t - times[0]) / 3600_000; return [u[0] * h, v[0] * h]; }
+  if (t >= times[n - 1]) { const h = (t - times[n - 1]) / 3600_000; return [cx[n - 1] + u[n - 1] * h, cy[n - 1] + v[n - 1] * h]; }
+  let k = 0;
+  while (k < n - 2 && times[k + 1] <= t) k++;
+  const h = (t - times[k]) / 3600_000, f = (t - times[k]) / (times[k + 1] - times[k]);
+  // trapezoid within the hour (wind varies linearly between model hours)
+  const uu = u[k] + (u[k + 1] - u[k]) * f / 2, vv = v[k] + (v[k + 1] - v[k]) * f / 2;
+  return [cx[k] + uu * h, cy[k] + vv * h];
 }
 
 let hazeLayer = null, hazeCanvas = null, hazeKey = "";
 const hazeTags = new Map(); // region -> marker
+
+// Grey key under the temperature legend: what the veil's density means,
+// with a tick at the haziest value on the map right now. Only while the
+// veil is visible.
+function renderHazeKey(ctx) {
+  const el = document.getElementById("haze-key");
+  if (!el || !el.classList) return;
+  let max = 0;
+  if (ctx?.field) for (const v of ctx.field) if (v > max) max = v;
+  const on = !!ctx?.field && hazeAlpha(max) >= 0.05;
+  el.classList.toggle("hidden", !on);
+  if (!on) return;
+  const frac = Math.min(1, hazeAlpha(max) / hazeAlpha(250));
+  if (el.style?.setProperty) el.style.setProperty("--haze-mark", frac.toFixed(3));
+  const val = document.getElementById("haze-key-max");
+  const txt = `${ctx.src === "forecast" ? "≈" : ""}${Math.round(max)}`;
+  if (val && val.textContent !== txt) val.textContent = txt;
+}
 
 let hazeOutlookCache = { key: "", v: null };
 
@@ -2294,6 +2374,7 @@ function renderHaze(light = false) {
   const hide = () => {
     if (hazeLayer) hazeLayer.setOpacity(0);
     hazeKey = "";
+    renderHazeKey(null);
     for (const m of hazeTags.values()) {
       m._hazeShow = false;
       const e = m.getElement && m.getElement()?.querySelector(".haze-tag");
@@ -2302,27 +2383,44 @@ function renderHaze(light = false) {
   };
   if (!hazeOn) { hide(); setStatus("off"); return; }
   if (typeof L === "undefined" || !map) return;
-  // mid-glide frames step in 10 min (the data is hourly; redrawing a
-  // full-map layer every frame cost ~5 ms at 4x throttle); landing is exact
+  // mid-glide frames step the DATA in 10 min (it's hourly); the texture
+  // drift uses the exact time so the haze glides with the slider
   const t0 = displayedTime() ?? Date.now();
   const t = light ? Math.round(t0 / 600_000) * 600_000 : t0;
   const ctx = hazeContext(t);
   const modelNote = airErr ? ` · model unavailable (${airErr})` : "";
   if (ctx.src === "none") { hide(); setStatus(ctx.note + (ctx.note.includes("model") ? "" : modelNote)); return; }
 
-  // veil
-  const key = hazeCache.key;
+  // veil: data field (bilinear) x drifting texture
+  const [dx, dy] = hazeDrift(t0);
+  const key = `${hazeCache.key}|${light}|${Math.round(dx * 10)}|${Math.round(dy * 10)}`;
   if (key !== hazeKey) {
     hazeCanvas ??= document.createElement("canvas");
     if (typeof hazeCanvas.getContext !== "function") return;
-    if (hazeCanvas.width !== HAZE.w) { hazeCanvas.width = HAZE.w; hazeCanvas.height = HAZE.h; }
+    const PW = light ? HAZE.pw / 2 : HAZE.pw, PH = Math.ceil(light ? HAZE.ph / 2 : HAZE.ph);
+    if (hazeCanvas.width !== PW || hazeCanvas.height !== PH) { hazeCanvas.width = PW; hazeCanvas.height = PH; }
     const c2 = hazeCanvas.getContext("2d");
-    const img = c2.createImageData(HAZE.w, HAZE.h);
+    const img = c2.createImageData(PW, PH);
     const k = ctx.src === "forecast" ? 0.85 : 1; // estimates a little lighter
-    for (let p = 0; p < ctx.field.length; p++) {
-      const o = p * 4;
-      img.data[o] = 196; img.data[o + 1] = 196; img.data[o + 2] = 198; // neutral grey, not a hue
-      img.data[o + 3] = Math.round(255 * hazeAlpha(ctx.field[p]) * k);
+    const kmX = ((OVERLAY.lonMax - OVERLAY.lonMin) * Math.cos((1.35 * Math.PI) / 180) * KM_PER_DEG) / PW;
+    const kmY = ((OVERLAY.latMax - OVERLAY.latMin) * KM_PER_DEG) / PH;
+    const F = ctx.field, W = HAZE.w, H = HAZE.h;
+    for (let j = 0; j < PH; j++) {
+      const fy = Math.min(H - 1.001, Math.max(0, ((j + 0.5) / PH) * H - 0.5));
+      const j0 = Math.floor(fy), ty = fy - j0;
+      // texture coordinates move WITH the air: subtract the drift
+      const ny = ((PH - j - 0.5) * kmY - dy) / HAZE.texKm;
+      for (let i = 0; i < PW; i++) {
+        const fx = Math.min(W - 1.001, Math.max(0, ((i + 0.5) / PW) * W - 0.5));
+        const i0 = Math.floor(fx), tx = fx - i0, q = j0 * W + i0;
+        const v = (F[q] + (F[q + 1] - F[q]) * tx) * (1 - ty) + (F[q + W] + (F[q + W + 1] - F[q + W]) * tx) * ty;
+        const a = hazeAlpha(v);
+        if (a <= 0) continue;
+        const n = hazeFbm(((i + 0.5) * kmX - dx) / HAZE.texKm, ny, light);
+        const o = (j * PW + i) * 4;
+        img.data[o] = 200; img.data[o + 1] = 200; img.data[o + 2] = 202; // neutral grey, not a hue
+        img.data[o + 3] = Math.round(255 * Math.min(0.8, a * (0.55 + 0.9 * n)) * k);
+      }
     }
     c2.putImageData(img, 0, 0);
     if (!hazeLayer) {
@@ -2332,6 +2430,8 @@ function renderHaze(light = false) {
     } else hazeLayer.setOpacity(1);
     hazeKey = key;
   }
+
+  renderHazeKey(ctx);
 
   // region tags, all five together once any region is hazy
   const future = ctx.src === "forecast";

@@ -16,7 +16,7 @@
   <link rel="stylesheet" href="assets/vendor/leaflet/leaflet.css">
   <!-- bump ?v= whenever style.css or app.js changes: stale cached assets
        under a fresh index.html render a broken hybrid of old and new -->
-  <link rel="stylesheet" href="assets/style.css?v=20261003a">
+  <link rel="stylesheet" href="assets/style.css?v=20261003b">
 </head>
 <body>
   <header class="topbar">
@@ -43,6 +43,11 @@
         <span id="legend-lo">–</span>
         <div class="legend-bar"></div>
         <span id="legend-hi">–</span>
+      </div>
+      <div class="haze-key hidden" id="haze-key" title="Haze veil density: NEA PM2.5 + CAMS model, µg/m³ (tick = haziest spot on the map)">
+        <span>haze</span>
+        <div class="haze-bar"></div>
+        <span>PM2.5 <b id="haze-key-max">–</b></span>
       </div>
       <div class="timebar">
         <button id="live-btn" title="Jump to latest reading">LIVE</button>
@@ -105,6 +110,6 @@
   </footer>
 
   <script src="assets/vendor/leaflet/leaflet.js"></script>
-  <script src="assets/app.js?v=20261003a"></script>
+  <script src="assets/app.js?v=20261003b"></script>
 </body>
 </html>

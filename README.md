@@ -95,7 +95,9 @@ static page, no backend, no hosting costs.
   in tooltips and the footer) and the CAMS PM2.5 forecast (Copernicus, ~45
   km, via Open-Meteo, fetched by the same GitHub Action into
   `data/air.json`). The map shows a neutral grey veil that thickens with
-  PM2.5: the CAMS field scaled toward the NEA readings (each region's
+  PM2.5 (soft patches that drift with the wind as you scrub; the patches
+  are texture, the density is data — a grey key under the temperature
+  legend marks the haziest value): the CAMS field scaled toward the NEA readings (each region's
   ratio spread by inverse distance around the island mean). The forecast
   carries today's NEA/model ratio forward, halving every 12 h. Region tags
   ("PM2.5 64") appear once any region reaches 25 µg/m³; forecasts and
