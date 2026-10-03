@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>SG Temp — Live Singapore Weather</title>
-  <meta name="description" content="Live temperature, wind, rain and radar across Singapore, with 24 hours of history and a 24-hour forecast. Data from NEA via data.gov.sg and Open-Meteo.">
+  <meta name="description" content="Live temperature, wind, rain, haze and radar across Singapore, with 24 hours of history and a 24-hour forecast. Data from NEA via data.gov.sg and Open-Meteo.">
   <meta name="theme-color" content="#161d2e">
   <link rel="preconnect" href="https://api.data.gov.sg" crossorigin>
   <link rel="preconnect" href="https://api-open.data.gov.sg" crossorigin>
@@ -16,7 +16,7 @@
   <link rel="stylesheet" href="assets/vendor/leaflet/leaflet.css">
   <!-- bump ?v= whenever style.css or app.js changes: stale cached assets
        under a fresh index.html render a broken hybrid of old and new -->
-  <link rel="stylesheet" href="assets/style.css?v=20260923j">
+  <link rel="stylesheet" href="assets/style.css?v=20261003a">
 </head>
 <body>
   <header class="topbar">
@@ -48,6 +48,7 @@
         <button id="live-btn" title="Jump to latest reading">LIVE</button>
         <button id="wind-btn" title="Toggle wind streaks">WIND</button>
         <button id="radar-btn" title="Toggle rain clouds (radar, nowcast, model)">RADAR</button>
+        <button id="haze-btn" title="Toggle haze (NEA PM2.5 + CAMS model)">HAZE</button>
         <div class="slider-wrap">
           <input type="range" id="time-slider" min="0" max="0" step="1" value="0"
                  aria-label="Time scrubber: 24 hours back to 24 hours ahead">
@@ -95,14 +96,15 @@
       model <a href="https://open-meteo.com" target="_blank" rel="noopener">Open-Meteo</a></span>
     <span class="fi"><b>shading</b> <span id="shade-mode">stations only</span></span>
     <span class="fi"><b>wind</b> <span id="wind-status">–</span></span>
-    <span class="fi"><b>rain</b> <span id="rain-status">…</span></span>
-    <span class="fi"><b>radar</b> <span id="radar-status">…</span></span>
+    <span class="fi long"><b>rain</b> <span id="rain-status">…</span></span>
+    <span class="fi long"><b>radar</b> <span id="radar-status">…</span></span>
+    <span class="fi long"><b>haze</b> <span id="haze-status">…</span></span>
     <span class="fi"><b>community</b> <span id="civ-status">…</span></span>
     <span class="fi"><b>basemap</b> <span id="basemap-status">…</span></span>
     <span class="fi version">v<span id="app-version">?</span></span>
   </footer>
 
   <script src="assets/vendor/leaflet/leaflet.js"></script>
-  <script src="assets/app.js?v=20260923j"></script>
+  <script src="assets/app.js?v=20261003a"></script>
 </body>
 </html>

@@ -70,12 +70,54 @@ function dayItems(dateStr) {
   return items;
 }
 
+// haze: CAMS 20 µg/m³ everywhere; NEA west 60, the other regions 40
+const HAZE_REGIONS = { west: [1.35735, 103.7], east: [1.35735, 103.94], central: [1.35735, 103.82],
+  south: [1.29587, 103.82], north: [1.41803, 103.82] };
+const hazeVal = (name) => (name === "west" ? 60 : 40);
+function airFixture() {
+  const start = Math.floor(Date.now() / 3600e3) * 3600 - 26 * 3600;
+  const times = Array.from({ length: 80 }, (_, i) => start + i * 3600);
+  const cells = [];
+  for (const lat of [1.0, 1.4, 1.8]) for (const lon of [103.4, 103.8, 104.2]) cells.push({ lat, lon, pm2_5: times.map(() => 20) });
+  return { generated: Date.now(), times, cells };
+}
+function pm25Items(dateStr) {
+  // hourly, stamped at the end of the hour (SGT), up to now
+  const out = [];
+  for (let h = 1; h <= 24; h++) {
+    const t = new Date(`${dateStr}T00:00:00+08:00`).getTime() + h * 3600e3;
+    if (t > Date.now()) break;
+    out.push({ timestamp: new Date(t).toISOString(),
+      readings: { pm25_one_hourly: Object.fromEntries(Object.keys(HAZE_REGIONS).map((k) => [k, hazeVal(k)])) } });
+  }
+  return out;
+}
+
 global.fetch = async (url) => {
+  const ok = (body) => ({ ok: true, status: 200, headers: { get: () => null }, json: async () => body });
   if (typeof url === "string" && url.startsWith("data/model.json")) {
     return { ok: false, status: 404 }; // force the direct Open-Meteo path
   }
+  if (typeof url === "string" && url.startsWith("data/air.json")) return ok(airFixture());
   const u = new URL(url);
-  const ok = (body) => ({ ok: true, status: 200, headers: { get: () => null }, json: async () => body });
+  if (u.pathname.endsWith("/pm25")) {
+    // v2 shape (regionMetadata / labelLocation)
+    if (u.host !== "api-open.data.gov.sg") return { ok: false, status: 500, headers: { get: () => null } };
+    const date = u.searchParams.get("date");
+    const items = pm25Items(date ?? new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10));
+    return ok({ code: 0, data: {
+      regionMetadata: Object.entries(HAZE_REGIONS).map(([name, [latitude, longitude]]) => ({ name, labelLocation: { latitude, longitude } })),
+      items: date ? items : items.slice(-1),
+    } });
+  }
+  if (u.pathname.endsWith("/psi")) {
+    // v2 refused, so the v1 shape (region_metadata / label_location) is exercised
+    if (u.host !== "api.data.gov.sg") return { ok: false, status: 500, headers: { get: () => null } };
+    return ok({
+      region_metadata: Object.entries(HAZE_REGIONS).map(([name, [latitude, longitude]]) => ({ name, label_location: { latitude, longitude } })),
+      items: [{ timestamp: new Date().toISOString(), readings: { psi_twenty_four_hourly: { west: 81, east: 64, central: 70, south: 66, north: 68, national: 81 } } }],
+    });
+  }
   if (u.host === "data.sensor.community") {
     const mk = (sid, temp, agoMs, vt = "temperature") => ({
       timestamp: new Date(Date.now() - agoMs).toISOString().slice(0, 19).replace("T", " "),
@@ -161,6 +203,42 @@ const h = new Function(src + `
       const r1 = rainLocs.get("R1"), r2 = rainLocs.get("R2");
       return { src: ctx.src, gauges: ctx.gauges, atR1: ctx.rate(r1.lat, r1.lon), atR2: ctx.rate(r2.lat, r2.lon),
         sea: ctx.rate(1.12, 104.18) };
+    },
+    hazeTest: async () => {
+      await refreshAir(); await fetchHaze(); await loadHazeHistory();
+      const px = (c, lat, lon) => c.field[Math.floor((OVERLAY.latMax - lat) / (OVERLAY.latMax - OVERLAY.latMin) * HAZE.h) * HAZE.w
+        + Math.floor((lon - OVERLAY.lonMin) / (OVERLAY.lonMax - OVERLAY.lonMin) * HAZE.w)];
+      const W = hazeRegions.get("west");
+      displayedT = null; renderAll();
+      const live = hazeContext(Date.now());
+      const out = { src: live.src, regions: live.regions.length, tags: hazeTags.size,
+        westTag: live.regions.find((r) => r.name === "west").v, westField: px(live, W.lat, W.lon), sea: px(live, 1.12, 104.18),
+        status: document.getElementById("haze-status").textContent, series: hazeSeries.get("west")?.length };
+      // past: 6 h ago, readings from the day files
+      displayedT = Math.floor((Date.now() - 6 * 3600e3) / 300_000) * 300_000; renderAll();
+      const past = hazeContext(displayedT);
+      out.pastSrc = past.src; out.pastWest = past.regions.find((r) => r.name === "west").v;
+      // +12 h: model with the NEA ratio half faded
+      displayedT = Date.now() + 12 * 3600e3; renderAll();
+      const fc = hazeContext(displayedT);
+      out.fcSrc = fc.src; out.fcWest = fc.regions.find((r) => r.name === "west").v;
+      out.fcStatus = document.getElementById("haze-status").textContent;
+      // model missing: live falls back to the regions alone and says so
+      const keep = airModel; airModel = null; airErr = "test: no file"; displayedT = null; renderAll();
+      const nm = hazeContext(Date.now());
+      out.noModelSrc = nm.src; out.noModelWest = px(nm, W.lat, W.lon);
+      out.noModelStatus = document.getElementById("haze-status").textContent;
+      displayedT = Date.now() + 3 * 3600e3; renderAll();
+      out.noModelFc = hazeContext(displayedT).src;
+      airModel = keep; airErr = "";
+      // NEA feed down, model fine: the footer describes the model field
+      const regs = new Map(hazeRegions), ser = new Map(hazeSeries);
+      hazeRegions.clear(); hazeSeries.clear(); hazeErr = "NEA PM2.5 test"; displayedT = null; renderAll();
+      out.noNeaStatus = document.getElementById("haze-status").textContent;
+      for (const [k, v] of regs) hazeRegions.set(k, v);
+      for (const [k, v] of ser) hazeSeries.set(k, v);
+      hazeErr = ""; renderAll();
+      return out;
     },
     loadingLeft: () => [...loadingItems.keys()].filter((k) => k !== "tiles"),
     // newest radar frame newer than the viewed future moment (radar and
@@ -323,6 +401,21 @@ const h = new Function(src + `
   const nl = h.negativeLeadTest();
   console.assert(nl.ok && nl.future && nl.anvil, "radar newer than the viewed moment renders:", nl);
   h.goLive();
+
+  // haze: NEA regions + CAMS model
+  const hz = await h.hazeTest();
+  console.assert(hz.src === "analysis" && hz.regions === 5 && hz.tags === 5, "haze analysis with 5 region tags:", hz);
+  console.assert(hz.westTag === 60 && hz.westField > 50 && hz.westField < 62, "haze field follows the west reading:", hz);
+  console.assert(hz.sea > 38 && hz.sea < 50, "far from regions: model scaled by the mean NEA ratio:", hz);
+  console.assert(/PM2\.5 40–60 .*5 NEA regions.*PSI 24h 64–81/.test(hz.status), "haze footer (live):", hz.status);
+  console.assert(hz.series >= 1, "haze history loaded:", hz.series);
+  console.assert(hz.pastSrc === "analysis" && hz.pastWest === 60, "haze 6 h ago from the day files:", hz);
+  console.assert(hz.fcSrc === "forecast" && hz.fcWest > 25 && hz.fcWest < 50, "haze +12 h: ratio fading toward the model:", hz);
+  console.assert(/^≈ PM2\.5/.test(hz.fcStatus), "haze footer (forecast):", hz.fcStatus);
+  console.assert(hz.noModelSrc === "regions" && hz.noModelWest > 45 && /model unavailable \(test: no file\)/.test(hz.noModelStatus),
+    "haze without the model: regions only, said out loud:", hz);
+  console.assert(/^≈ PM2\.5 20 µg\/m³ over the map \(CAMS model only — NEA PM2\.5 test\)$/.test(hz.noNeaStatus), "haze without NEA:", hz.noNeaStatus);
+  console.assert(hz.noModelFc === "none", "no haze forecast without the model:", hz.noModelFc);
 
   console.assert(h.loadingLeft().length === 0, "nothing left marked as loading:", h.loadingLeft());
 
