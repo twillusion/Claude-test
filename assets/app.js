@@ -19,7 +19,7 @@ const MODEL_REFRESH_MS = 30 * 60_000; // Open-Meteo models update hourly
 const HISTORY_HOURS = 24;
 // Shown in the footer; bump together with the ?v= stamps in index.html so a
 // glance settles "am I looking at the new build or a stale cache?"
-const APP_VERSION = "20261018b";
+const APP_VERSION = "20261018c";
 
 // CARTO basemap key. Since Aug 2026 basemaps.cartocdn.com answers keyless
 // requests with HTTP 200 tiles that have "API KEY REQUIRED" burned in, so
@@ -1982,9 +1982,8 @@ const HAZE = {
   fadeHalfH: 12,          // future: NEA/model ratio halves every 12 h
   tagMin: 25,             // µg/m³ at any region before the tags appear
 };
-// The island veil is always on (it's invisible in clean air); HAZE now
-// opens the regional view instead (see "regional haze view" below).
-const hazeOn = true;
+let hazeOn = true;
+try { hazeOn = localStorage.getItem("sgtemp-haze") !== "off"; } catch { /* default on */ }
 const hazeRegions = new Map(); // name -> {name, lat, lon}
 const hazeSeries = new Map();  // name -> [{t: centre of the hour, v}] sorted
 let hazePsi = null;            // {t, byRegion: {name: psi24}}
@@ -1994,7 +1993,7 @@ let airW = null;               // Gaussian weights pixel x cell, row-major
 
 function updateHazeBtn() {
   const b = document.getElementById("haze-btn");
-  if (b && b.classList) b.classList.toggle("active", hazeRegional);
+  if (b && b.classList) b.classList.toggle("active", hazeOn);
 }
 
 // v2 and v1 shapes differ only in naming
@@ -2184,21 +2183,17 @@ function hazeContext(t) {
   // hourly data: a 2-minute step is invisible and makes most glide frames
   // cache hits (the veil recompute was ~4 ms at 4x CPU throttle)
   t = Math.round(t / 120_000) * 120_000;
-  const key = `${t}|${future}|${airModel?.generated}|${hazeRegion?.generated}|${[...hazeSeries.values()].reduce((n, a) => n + a.length, 0)}`;
+  const key = `${t}|${future}|${airModel?.generated}|${[...hazeSeries.values()].reduce((n, a) => n + a.length, 0)}`;
   if (hazeCache.key === key) return hazeCache.ctx;
-  // the model: the regional CAMS file when loaded (so the island veil and
-  // the haze around it agree at the window edge), else data/air.json
-  const regG = hazeRegion ? regionGridAt(t) : null;
-  const mod = regG ? null : airCellsAt(t);
+  const mod = airCellsAt(t);
   const regs = [...hazeRegions.values()];
   // per-region log ratios NEA / model: at t (past/live) or now (future)
   const tRef = future ? now : t;
-  const regRef = future ? (hazeRegion ? regionGridAt(now) : null) : regG;
-  const modRef = regRef ? null : future ? airCellsAt(now) : mod;
+  const modRef = future ? airCellsAt(now) : mod;
   const pts = [];
   for (const r of regs) {
     const obs = hazeObsAt(r.name, tRef);
-    const m = regRef ? regionSample(regRef, r.lat, r.lon) : airAt(modRef, r.lat, r.lon);
+    const m = airAt(modRef, r.lat, r.lon);
     pts.push({ ...r, obs, lr: obs != null && Number.isFinite(m) ? logRatio(obs, m) : null });
   }
   const withLr = pts.filter((p) => p.lr != null);
@@ -2206,8 +2201,7 @@ function hazeContext(t) {
   const meanLr = withLr.length ? withLr.reduce((s, p) => s + p.lr, 0) / withLr.length : 0;
   const withObs = pts.filter((p) => p.obs != null);
   let ctx;
-  const hasModel = !!(regG || mod);
-  if (!hasModel && (future || !withObs.length)) {
+  if (!mod && (future || !withObs.length)) {
     ctx = { src: "none", note: future ? `no haze forecast (model: ${airErr || "no data this far ahead"})`
       : hazeErr || "no PM2.5 readings at this time" };
   } else {
@@ -2222,16 +2216,16 @@ function hazeContext(t) {
       }
       return mean + (list.length ? rs / (ws + HAZE.lambda) : 0);
     };
-    if (mod && !airW) { // Gaussian weights for data/air.json cells
+    if (mod && !airW) {
       airW = new Float32Array(HAZE.w * HAZE.h * airModel.cells.length);
       for (let j = 0; j < HAZE.h; j++) {
         for (let i = 0; i < HAZE.w; i++) airWeightsAt(...hazePixLatLon(i, j), airW, (j * HAZE.w + i) * airModel.cells.length);
       }
     }
     const obsMean = withObs.length ? withObs.reduce((s, p) => s + p.obs, 0) / withObs.length : 0;
-    const valueAt = hasModel
+    const valueAt = mod
       ? (lat, lon, off) => {
-        const m = regG ? regionSample(regG, lat, lon) : off == null ? airAt(mod, lat, lon) : airMix(mod, airW, off);
+        const m = off == null ? airAt(mod, lat, lon) : airMix(mod, airW, off);
         // the +5 offset matches logRatio, so a region's own ratio lands
         // exactly on its reading
         return Math.max(0, (m + 5) * Math.exp(fade * spread(lat, lon, withLr, (p) => p.lr, meanLr)) - 5);
@@ -2246,10 +2240,7 @@ function hazeContext(t) {
       }
     }
     ctx = {
-      src: future ? "forecast" : hasModel ? (withObs.length ? "analysis" : "model") : "regions",
-      // for the haze around the island: the island-mean NEA/model log
-      // ratio (already faded for forecasts), and the model sampler
-      outerCorr: withLr.length ? meanLr * fade : 0, regG,
+      src: future ? "forecast" : mod ? (withObs.length ? "analysis" : "model") : "regions",
       field, ratio: withLr.length ? Math.exp(meanLr) : null, fade,
       // past/live tags show the actual reading; forecasts and gaps the field
       regions: pts.map((p) => ({ name: p.name, lat: p.lat, lon: p.lon,
@@ -2265,14 +2256,10 @@ function pmBand(v) {
   return v <= 55 ? "normal" : v <= 150 ? "elevated" : v <= 250 ? "high" : "very high";
 }
 
-// µg/m³ -> veil opacity: nothing in clean air (≤10), clearly there by 35-55
-// (what a hazy Singapore day looks like), thick at 150+ (NEA "elevated" and
-// beyond). The first curve (0.12-0.15 at 40-55) was too faint to read as
-// haze over a whole map with no clear edge to compare against.
-// Contrast: the owner found the haze too flat (30-100 all read as the same
-// mid grey). Now log-scaled and steeper — light haze stays faint, plumes
-// stand out — and dense haze is also brighter (hazeGrey), so density has
-// two cues. ~0.13 at 35, ~0.24 at 55, ~0.42 at 100, ~0.57 at 150, 0.78 at 250+.
+// µg/m³ -> veil look. Log-scaled and steep, so light haze stays faint and
+// heavy haze stands out (the owner asked for more contrast: 30-100 all read
+// as one mid grey), and dense haze is also brighter (hazeGrey) — two cues.
+// Opacity ~0.13 at 35, 0.24 at 55, 0.42 at 100, 0.57 at 150, 0.78 at 250+.
 function hazeLevel(v) {
   return v > 12 ? Math.min(1, Math.log(v / 12) / Math.log(250 / 12)) : 0;
 }
@@ -2290,7 +2277,7 @@ function hazeGrey(v) {
 /* Texture: haze is never a flat sheet, so the veil carries soft patches
    (value-noise fBm, ~12 km) that drift with the model's island-mean wind
    as time moves, the way the rain clouds roll. The patches are cosmetic:
-   they modulate the opacity around the data value (×0.55-1.45, mean 1);
+   they modulate the opacity around the data value (×0.45-1.55, mean 1);
    the data field itself (NEA + CAMS) is what sets how hazy each place is. */
 function hazeHash(ix, iy) {
   let h = (Math.imul(ix, 374761393) + Math.imul(iy, 668265263)) | 0;
@@ -2346,111 +2333,6 @@ function hazeDrift(t) {
 }
 
 let hazeLayer = null, hazeCanvas = null, hazeKey = "";
-
-/* The general view can be pinched out to ~±2° around Singapore (NEAR):
-   haze outside the island window comes from the regional CAMS file, scaled
-   by the island's NEA/model ratio fading out over ~80 km — so at the window
-   edge it meets the island veil, and further out it's the model. Same grey
-   ramp and the same drifting texture (same km origin), so the two layers
-   join without a seam. Only drawn while the view reaches past the window. */
-const NEAR = { latMin: -0.6, latMax: 3.2, lonMin: 101.6, lonMax: 106.0 };
-let outerLayer = null, outerCanvas = null, outerKey = "", islandOutline = null;
-
-function viewBeyondIsland() {
-  if (!map?.getBounds) return false;
-  const b = map.getBounds();
-  if (!b?.getNorth) return false;
-  return b.getNorth() > OVERLAY.latMax + 0.005 || b.getSouth() < OVERLAY.latMin - 0.005 ||
-    b.getEast() > OVERLAY.lonMax + 0.005 || b.getWest() < OVERLAY.lonMin - 0.005;
-}
-
-function hideOuterHaze() {
-  if (outerLayer) outerLayer.setOpacity(0);
-  outerKey = "";
-  islandOutline?.remove();
-}
-
-// haze value outside the island window: CAMS x the island ratio, fading
-// over ~80 km from the window edge
-function outerValue(ctx, lat, lon) {
-  const cosLat = Math.cos((1.35 * Math.PI) / 180);
-  const dyKm = Math.max(0, OVERLAY.latMin - lat, lat - OVERLAY.latMax) * KM_PER_DEG;
-  const dxKm = Math.max(0, OVERLAY.lonMin - lon, lon - OVERLAY.lonMax) * KM_PER_DEG * cosLat;
-  const m = regionSample(ctx.regG, lat, lon);
-  if (!(m >= 0)) return NaN; // gap
-  return Math.max(0, (m + 5) * Math.exp(ctx.outerCorr * Math.exp(-Math.hypot(dxKm, dyKm) / 80)) - 5);
-}
-
-// Once the view reaches past the island window, ONE layer covering the
-// visible area replaces the island veil: inside the window it samples the
-// island field (NEA-corrected), outside the regional haze (outerValue).
-// Two separate layers left a dark halo — the coarse outer canvas was
-// transparent inside the window and the browser's smoothing smeared that
-// hole outward. Resolution follows the screen (1 px per 8, 16 mid-glide).
-function islandFieldAt(ctx, lat, lon) {
-  const F = ctx.field, W = HAZE.w, H = HAZE.h;
-  const fx = Math.min(W - 1.001, Math.max(0, ((lon - OVERLAY.lonMin) / (OVERLAY.lonMax - OVERLAY.lonMin)) * W - 0.5));
-  const fy = Math.min(H - 1.001, Math.max(0, ((OVERLAY.latMax - lat) / (OVERLAY.latMax - OVERLAY.latMin)) * H - 0.5));
-  const i0 = Math.floor(fx), j0 = Math.floor(fy), tx = fx - i0, ty = fy - j0, q = j0 * W + i0;
-  return (F[q] + (F[q + 1] - F[q]) * tx) * (1 - ty) + (F[q + W] + (F[q + W + 1] - F[q + W]) * tx) * ty;
-}
-
-function renderOuterHaze(ctx, t0, light) {
-  if (typeof L === "undefined" || !map) return false;
-  if (!ctx?.field || !viewBeyondIsland()) { hideOuterHaze(); return false; }
-  const vb = map.getBounds(), size = map.getSize?.() ?? { x: 800, y: 600 };
-  const la0 = Math.max(NEAR.latMin, vb.getSouth()), la1 = Math.min(NEAR.latMax, vb.getNorth());
-  const lo0 = Math.max(NEAR.lonMin, vb.getWest()), lo1 = Math.min(NEAR.lonMax, vb.getEast());
-  if (!(la1 > la0 && lo1 > lo0)) { hideOuterHaze(); return false; }
-  const [dx, dy] = hazeDrift(t0);
-  const key = `${hazeCache.key}|${light}|${Math.round(dx * 4)}|${Math.round(dy * 4)}|${la0.toFixed(3)},${lo0.toFixed(3)},${la1.toFixed(3)},${lo1.toFixed(3)}`;
-  if (!islandOutline) {
-    islandOutline = L.rectangle([[OVERLAY.latMin, OVERLAY.lonMin], [OVERLAY.latMax, OVERLAY.lonMax]],
-      { pane: "haze", color: "#e6e9ee", weight: 1, opacity: 0.45, dashArray: "4 5", fill: false, interactive: false });
-  }
-  if (!map.hasLayer || !map.hasLayer(islandOutline)) islandOutline.addTo(map);
-  if (key === outerKey) return true;
-  outerCanvas ??= document.createElement("canvas");
-  if (typeof outerCanvas.getContext !== "function") return true;
-  const step = light ? 20 : 8;
-  const fracX = (lo1 - lo0) / (vb.getEast() - vb.getWest()), fracY = (la1 - la0) / (vb.getNorth() - vb.getSouth());
-  const W = Math.max(8, Math.ceil((size.x * fracX) / step)), H = Math.max(8, Math.ceil((size.y * fracY) / step));
-  if (outerCanvas.width !== W || outerCanvas.height !== H) { outerCanvas.width = W; outerCanvas.height = H; }
-  const c2 = outerCanvas.getContext("2d");
-  const img = c2.createImageData(W, H);
-  const k = ctx.src === "forecast" ? 0.85 : 1;
-  const cosLat = Math.cos((1.35 * Math.PI) / 180);
-  for (let j = 0; j < H; j++) {
-    const lat = la1 - ((j + 0.5) / H) * (la1 - la0);
-    const inLat = lat >= OVERLAY.latMin && lat <= OVERLAY.latMax;
-    for (let i = 0; i < W; i++) {
-      const lon = lo0 + ((i + 0.5) / W) * (lo1 - lo0);
-      const inside = inLat && lon >= OVERLAY.lonMin && lon <= OVERLAY.lonMax;
-      const v = inside ? islandFieldAt(ctx, lat, lon) : ctx.regG ? outerValue(ctx, lat, lon) : NaN;
-      // fade out toward the NEAR box's edge instead of stopping at a hard line
-      const edge = smooth01(Math.min(lat - NEAR.latMin, NEAR.latMax - lat, lon - NEAR.lonMin, NEAR.lonMax - lon) / 0.35);
-      const a = hazeAlpha(v) * edge; // 0 for NaN gaps
-      if (!(a > 0)) continue;
-      // texture in the island veil's km frame, so the patches line up
-      const n = hazeFbm(((lon - OVERLAY.lonMin) * cosLat * KM_PER_DEG - dx) / HAZE.texKm,
-        ((lat - OVERLAY.latMin) * KM_PER_DEG - dy) / HAZE.texKm, light);
-      const o = (j * W + i) * 4, g = hazeGrey(v);
-      img.data[o] = g; img.data[o + 1] = g; img.data[o + 2] = Math.min(255, g + 2);
-      img.data[o + 3] = Math.round(255 * Math.min(0.85, a * (0.45 + 1.1 * n)) * k);
-    }
-  }
-  c2.putImageData(img, 0, 0);
-  const bounds = [[la0, lo0], [la1, lo1]];
-  if (!outerLayer) {
-    outerLayer = L.svgOverlay(outerCanvas, bounds,
-      { pane: "haze", opacity: 1, interactive: false, className: "canvas-layer haze-outer" }).addTo(map);
-  } else {
-    if (outerLayer.setBounds) outerLayer.setBounds(L.latLngBounds(bounds));
-    outerLayer.setOpacity(1);
-  }
-  outerKey = key;
-  return true;
-}
 const hazeTags = new Map(); // region -> marker
 
 // Grey key under the temperature legend: what the veil's density means,
@@ -2502,7 +2384,6 @@ function renderHaze(light = false) {
   const hide = () => {
     if (hazeLayer) hazeLayer.setOpacity(0);
     hazeKey = "";
-    hideOuterHaze();
     renderHazeKey(null);
     for (const m of hazeTags.values()) {
       m._hazeShow = false;
@@ -2520,16 +2401,10 @@ function renderHaze(light = false) {
   const modelNote = airErr ? ` · model unavailable (${airErr})` : "";
   if (ctx.src === "none") { hide(); setStatus(ctx.note + (ctx.note.includes("model") ? "" : modelNote)); return; }
 
-  // zoomed out past the island: one viewport layer does it all
-  const outer = renderOuterHaze(ctx, t0, light);
-  if (outer) {
-    if (hazeLayer) hazeLayer.setOpacity(0);
-    hazeKey = "";
-  }
   // veil: data field (bilinear) x drifting texture
   const [dx, dy] = hazeDrift(t0);
   const key = `${hazeCache.key}|${light}|${Math.round(dx * 10)}|${Math.round(dy * 10)}`;
-  if (!outer && key !== hazeKey) {
+  if (key !== hazeKey) {
     hazeCanvas ??= document.createElement("canvas");
     if (typeof hazeCanvas.getContext !== "function") return;
     const PW = light ? HAZE.pw / 2 : HAZE.pw, PH = Math.ceil(light ? HAZE.ph / 2 : HAZE.ph);
@@ -2902,213 +2777,6 @@ function fieldAt(lat, lon, grid, residuals) {
     rSum += w * p.r;
   }
   return base + rSum / (wSum + RESIDUAL_LAMBDA);
-}
-
-// ---------- regional haze view ----------
-
-/* Haze over Singapore is a blanket hundreds of km wide, blown in from
-   fires in Sumatra and Kalimantan; at the island's scale no data source has
-   any "cloud" structure (CAMS cells are ~45 km: the island window covers
-   about 2x3 of them). So HAZE zooms the map out to the region, where the
-   CAMS PM2.5 field shows the real plumes moving hour by hour, drawn as a
-   neutral grey smoke raster (colour still means temperature). Island layers
-   are hidden meanwhile; the island window is outlined, and tapping it (or
-   HAZE again) goes back. Data: data/haze-region.json from the GitHub
-   Action (scripts/fetch-haze-region.mjs), CAMS native 0.4° cells, refreshed
-   every ~6 h (CAMS runs twice a day). Not corrected to NEA: the NEA ratio
-   is local to Singapore — the Singapore tag carries the island value. */
-const REGION_VIEW = {
-  bounds: [[-4.2, 97.4], [6.2, 111.0]],
-  w: 136, h: 104, // raster (~0.1° px; bicubic between 0.4° cells)
-};
-let hazeRegional = false, hazeRegion = null, hazeRegionErr = "", hazeRegionLoading = false;
-let regionLayer = null, regionCanvas = null, regionKey = "", regionOutline = null, regionTag = null;
-
-function refreshHazeRegion() {
-  if (hazeRegionLoading) return;
-  hazeRegionLoading = true;
-  loadHazeRegion().finally(() => { hazeRegionLoading = false; hazeCache.key = ""; scheduleRender(); });
-}
-
-async function loadHazeRegion() {
-  try {
-    const res = await fetch(`data/haze-region.json?t=${Math.floor(Date.now() / 600_000)}`);
-    if (!res.ok) throw new Error(`data/haze-region.json HTTP ${res.status}`);
-    const j = await res.json();
-    const g = j.grid;
-    if (!g || !j.times?.length || j.pm?.length !== j.times.length || j.pm[0].length !== g.nlat * g.nlon) {
-      throw new Error("data/haze-region.json is malformed");
-    }
-    const age = Date.now() - (j.generated ?? 0);
-    if (age > 30 * 3600_000) throw new Error(`data/haze-region.json is ${Math.round(age / 3600_000)}h old`);
-    hazeRegion = {
-      grid: g, generated: j.generated, times: j.times.map((x) => x * 1000),
-      pm: j.pm.map((a) => Float32Array.from(a, (v) => (v < 0 ? NaN : v))),
-    };
-    hazeRegionErr = "";
-  } catch (e) {
-    hazeRegionErr = e.message;
-    console.warn("[sgtemp] regional haze unavailable:", e.message);
-  }
-  regionKey = "";
-  scheduleRender();
-}
-
-// CAMS cells at t (linear in time); null outside the file's hours
-function regionGridAt(t) {
-  const { times, pm } = hazeRegion;
-  if (t < times[0] || t > times[times.length - 1]) return null;
-  let k = 0;
-  while (k < times.length - 2 && times[k + 1] <= t) k++;
-  const f = Math.min(1, Math.max(0, (t - times[k]) / (times[k + 1] - times[k] || 1)));
-  const a = pm[k], b = pm[k + 1], out = new Float32Array(a.length);
-  for (let i = 0; i < a.length; i++) {
-    out[i] = a[i] !== a[i] ? b[i] : b[i] !== b[i] ? a[i] : a[i] + (b[i] - a[i]) * f;
-  }
-  return out;
-}
-
-// Catmull-Rom over the 0.4° lattice; NaN where any tap is missing.
-// Hot path (every haze pixel): no closures or arrays per call.
-function regionSample(cells, lat, lon) {
-  const { lat0, lon0, step, nlat, nlon } = hazeRegion.grid;
-  const fy = (lat - lat0) / step, fx = (lon - lon0) / step;
-  if (fy < 0 || fx < 0 || fy > nlat - 1 || fx > nlon - 1) return NaN;
-  const iy = Math.floor(fy), ix = Math.floor(fx), ty = fy - iy, tx = fx - ix;
-  const c0 = ix > 0 ? ix - 1 : 0, c1 = ix, c2 = ix + 1 < nlon ? ix + 1 : nlon - 1, c3 = ix + 2 < nlon ? ix + 2 : nlon - 1;
-  let out = 0;
-  for (let k = 0; k < 4; k++) {
-    let ry = iy - 1 + k;
-    ry = ry < 0 ? 0 : ry > nlat - 1 ? nlat - 1 : ry;
-    const r = ry * nlon;
-    const p0 = cells[r + c0], p1 = cells[r + c1], p2 = cells[r + c2], p3 = cells[r + c3];
-    const v = p1 + 0.5 * tx * (p2 - p0 + tx * (2 * p0 - 5 * p1 + 4 * p2 - p3 + tx * (3 * (p1 - p2) + p3 - p0)));
-    const w = k === 0 ? 0.5 * (-ty + 2 * ty * ty - ty * ty * ty)
-      : k === 1 ? 0.5 * (2 - 5 * ty * ty + 3 * ty * ty * ty)
-      : k === 2 ? 0.5 * (ty + 4 * ty * ty - 3 * ty * ty * ty)
-      : 0.5 * (-ty * ty + ty * ty * ty);
-    out += w * v; // NaN taps propagate: gaps stay gaps
-  }
-  return out > 0 ? out : out === out ? 0 : NaN;
-}
-
-function renderRegionalHaze(light = false) {
-  if (typeof L === "undefined" || !map) return;
-  const t = displayedTime() ?? Date.now();
-  const status = document.getElementById("haze-status");
-  const setStatus = (txt) => { if (status && !light && status.textContent !== txt) status.textContent = txt; };
-  const cells = hazeRegion ? regionGridAt(t) : null;
-  const tagEl = regionTag?.getElement && regionTag.getElement()?.querySelector(".haze-tag");
-  if (!cells) {
-    if (regionLayer) regionLayer.setOpacity(0);
-    regionKey = "";
-    renderHazeKey(null);
-    // say it on the map too, not only in the footer
-    const msg = `<small>Singapore</small>${hazeRegionLoading ? "loading regional haze…" : "no regional haze data (see footer)"}`;
-    if (tagEl && tagEl.innerHTML !== msg) tagEl.innerHTML = msg;
-    setStatus(`regional view: ${hazeRegionLoading ? "loading…" : hazeRegionErr || "no regional data for this time"}`);
-    return;
-  }
-  const key = `${Math.round(t / 20_000)}|${light}|${hazeRegion.generated}`;
-  let max = 0, maxAt = null;
-  if (key !== regionKey) {
-    regionCanvas ??= document.createElement("canvas");
-    if (typeof regionCanvas.getContext !== "function") return;
-    const W = light ? REGION_VIEW.w / 2 : REGION_VIEW.w, H = light ? REGION_VIEW.h / 2 : REGION_VIEW.h;
-    if (regionCanvas.width !== W || regionCanvas.height !== H) { regionCanvas.width = W; regionCanvas.height = H; }
-    const c2 = regionCanvas.getContext("2d");
-    const img = c2.createImageData(W, H);
-    const [[la0, lo0], [la1, lo1]] = REGION_VIEW.bounds;
-    const k = isFutureView() ? 0.85 : 1;
-    for (let j = 0; j < H; j++) {
-      const lat = la1 - ((j + 0.5) / H) * (la1 - la0);
-      for (let i = 0; i < W; i++) {
-        const lon = lo0 + ((i + 0.5) / W) * (lo1 - lo0);
-        const v = regionSample(cells, lat, lon);
-        if (!(v > 10)) continue; // also skips NaN gaps
-        // fade out toward the data's edge instead of stopping at a hard line
-        const edge = smooth01(Math.min(lat - la0, la1 - lat, lon - lo0, lo1 - lon) / 0.8);
-        const o = (j * W + i) * 4, g = hazeGrey(v);
-        img.data[o] = g; img.data[o + 1] = g; img.data[o + 2] = Math.min(255, g + 2); // neutral, not a hue
-        img.data[o + 3] = Math.round(255 * hazeAlpha(v) * k * edge);
-      }
-    }
-    c2.putImageData(img, 0, 0);
-    if (!regionLayer) {
-      regionLayer = L.svgOverlay(regionCanvas, REGION_VIEW.bounds,
-        { pane: "region", opacity: 1, interactive: false, className: "canvas-layer haze-region" }).addTo(map);
-    } else regionLayer.setOpacity(1);
-    regionKey = key;
-  }
-  for (let i = 0; i < cells.length; i++) if (cells[i] > max) { max = cells[i]; maxAt = i; }
-  renderHazeKey({ src: isFutureView() ? "forecast" : "model", field: [max] });
-
-  // Singapore: the island value (NEA-corrected), so the two views agree
-  const isl = hazeContext(t);
-  const vals = isl.regions?.map((r) => r.v) ?? [];
-  const est = isFutureView() || isl.regions?.some((r) => !r.obs);
-  const sgTxt = vals.length ? `${est ? "≈" : ""}${Math.round(Math.min(...vals))}–${Math.round(Math.max(...vals))}` : "?";
-  const html = `<small>Singapore PM2.5</small>${sgTxt}`;
-  if (tagEl && tagEl.innerHTML !== html) {
-    tagEl.innerHTML = html;
-    if (tagEl.classList) tagEl.classList.toggle("fc", est);
-  }
-
-  if (!light) {
-    const { lat0, lon0, step, nlon } = hazeRegion.grid;
-    const mlat = lat0 + Math.floor(maxAt / nlon) * step;
-    const where = maxAt == null ? "" : ` near ${Math.abs(mlat).toFixed(1)}°${mlat < 0 ? "S" : "N"} ${(lon0 + (maxAt % nlon) * step).toFixed(1)}°E`;
-    setStatus(`regional view: CAMS model PM2.5 (Copernicus), up to ${Math.round(max)} µg/m³${where}` +
-      ` · not corrected to NEA · run ${fmtHour(hazeRegion.generated)} · tap Singapore or HAZE to go back`);
-  }
-}
-
-function setHazeRegional(on) {
-  if (!map || hazeRegional === on) return;
-  hazeRegional = on;
-  updateHazeBtn();
-  const wrap = map.getContainer?.()?.closest?.(".map-wrap");
-  if (wrap?.classList) wrap.classList.toggle("regional", on);
-  if (on) {
-    if (!map.getPane("region")) {
-      const pane = map.createPane("region");
-      pane.style.zIndex = 425;
-    }
-    if (!regionOutline) {
-      // the island view's window, outlined; tap it to go back
-      regionOutline = L.rectangle([[OVERLAY.latMin, OVERLAY.lonMin], [OVERLAY.latMax, OVERLAY.lonMax]],
-        { pane: "region", color: "#e6e9ee", weight: 1.2, opacity: 0.8, dashArray: "4 4", fill: true, fillOpacity: 0 });
-      regionOutline.on("click", () => setHazeRegional(false));
-      regionTag = L.marker([OVERLAY.latMax, (OVERLAY.lonMin + OVERLAY.lonMax) / 2], {
-        pane: "region", keyboard: false,
-        icon: L.divIcon({ className: "", html: `<span class="haze-tag region-sg"></span>`, iconSize: [0, 0] }),
-      });
-      regionTag.on("click", () => setHazeRegional(false));
-    }
-    regionOutline.addTo(map);
-    regionTag.addTo(map);
-    const b = L.latLngBounds(REGION_VIEW.bounds);
-    map.setMinZoom(0);
-    map.setMaxBounds(b.pad(0.05));
-    map.fitBounds(b);
-    map.setMinZoom(map.getBoundsZoom(b));
-    if (!hazeRegion && !hazeRegionLoading) refreshHazeRegion();
-  } else {
-    regionOutline?.remove();
-    regionTag?.remove();
-    if (regionLayer) regionLayer.setOpacity(0);
-    regionKey = "";
-    const near = L.latLngBounds([NEAR.latMin, NEAR.lonMin], [NEAR.latMax, NEAR.lonMax]);
-    map.setMinZoom(0);
-    fitIsland();
-    map.setMaxBounds(near);
-    map.setMinZoom(map.getBoundsZoom(near));
-    outerKey = "";
-    hazeKey = ""; // island veil redraws
-    cloudKey = "";
-  }
-  if (windCtx) windCtx.clearRect(0, 0, windCanvas.width, windCanvas.height);
-  scheduleRender();
 }
 
 // ---------- temperature colour scale (light blue = cool -> orange = hot) ----------
@@ -3789,13 +3457,6 @@ function scrubStep(now) {
 // light = mid-glide frame: skip the station list, detail panel and slider
 // track (heavy DOM work that nobody reads while the map is moving)
 function renderAll(light = false) {
-  if (hazeRegional) {
-    // regional haze view: island layers are hidden (CSS) and not drawn
-    const t = displayedTime();
-    renderTimebar(t, light);
-    renderRegionalHaze(light);
-    return;
-  }
   const t = displayedTime();
   const values = displayedValues(t);
   const grid = buildBlendedGrid(t ?? Date.now());
@@ -3955,7 +3616,7 @@ function startWind() {
 
   function frame(ts) {
     requestAnimationFrame(frame);
-    if (!windOn || hazeRegional || document.hidden) { last = ts; return; }
+    if (!windOn || document.hidden) { last = ts; return; }
     ensureWindField();
     const budget = windBudget();
     if (!budget) {
@@ -4219,24 +3880,13 @@ function scheduleHistRetry(days) {
 
 // ---------- init ----------
 
-// Island view: the data window filling the screen (the default framing).
-let userMovedMap = false;
-
-function fitIsland() {
-  const b = L.latLngBounds([OVERLAY.latMin, OVERLAY.lonMin], [OVERLAY.latMax, OVERLAY.lonMax]);
-  map.setView(b.getCenter(), map.getBoundsZoom(b, true), { animate: false });
-}
-
 function initMap() {
-  // Opens on the island window (filling the screen); pinching out reaches
-  // ~±2° around Singapore (NEAR) for the haze around the island — the
-  // island data layers stay inside their window.
+  // hard-locked to the Open-Meteo grid window — no padding, no drifting off it
   const dataBounds = L.latLngBounds(
     [OVERLAY.latMin, OVERLAY.lonMin], [OVERLAY.latMax, OVERLAY.lonMax]);
-  const nearBounds = L.latLngBounds([NEAR.latMin, NEAR.lonMin], [NEAR.latMax, NEAR.lonMax]);
   map = L.map("map", {
     zoomControl: true,
-    maxBounds: nearBounds,
+    maxBounds: dataBounds,
     maxBoundsViscosity: 1.0, // hard wall when panning
     zoomSnap: 0, // fractional zoom, so min zoom can match the bounds exactly
   });
@@ -4252,39 +3902,12 @@ function initMap() {
   const rainPane = map.createPane("rain"); // gauge glyphs + splash circles
   rainPane.style.zIndex = 440;
   map.fitBounds(dataBounds);
-  fitIsland();
-  // Zoom-out limit: the whole NEAR box (regional view: the region).
-  // Recompute when the container changes shape; until the user has touched
-  // the map, also re-frame the island (phones measure the container late —
-  // the old hard lock used to fix that framing as a side effect).
-  const lockMinZoom = () => {
-    if (hazeRegional) { map.setMinZoom(map.getBoundsZoom(L.latLngBounds(REGION_VIEW.bounds))); return; }
-    map.setMinZoom(map.getBoundsZoom(nearBounds));
-    if (!userMovedMap) fitIsland();
-  };
+  // Fully zoomed out = screen completely filled by the data window
+  // (inside=true), so the map can never show past the data edge. Recompute
+  // when the container changes shape, or a resize would reopen the gap.
+  const lockMinZoom = () => map.setMinZoom(map.getBoundsZoom(dataBounds, true));
   lockMinZoom();
   map.on("resize", lockMinZoom);
-  const el = map.getContainer?.();
-  if (el?.addEventListener) {
-    for (const ev of ["mousedown", "touchstart", "wheel", "keydown"]) {
-      el.addEventListener(ev, () => { userMovedMap = true; }, { passive: true });
-    }
-  }
-  // the haze around the island appears/disappears as the view reaches past
-  // it; far out, the island's pills and tags would pile into one clump, so
-  // they step aside (the temperature shading stays)
-  const onView = () => {
-    if (hazeRegional) return;
-    const wrap = map.getContainer?.()?.closest?.(".map-wrap");
-    if (wrap?.classList && map.latLngToContainerPoint) {
-      const a = map.latLngToContainerPoint([OVERLAY.latMin, OVERLAY.lonMin]);
-      const b = map.latLngToContainerPoint([OVERLAY.latMax, OVERLAY.lonMax]);
-      wrap.classList.toggle("far", Math.abs(b.x - a.x) < 240);
-    }
-    renderHaze();
-  };
-  map.on("moveend", onView);
-  map.on("zoomend", onView);
   const tileOpts = {
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
     maxZoom: 18,
@@ -4361,7 +3984,12 @@ document.getElementById("radar-btn").addEventListener("click", () => {
 });
 updateRadarBtn();
 
-document.getElementById("haze-btn").addEventListener("click", () => setHazeRegional(!hazeRegional));
+document.getElementById("haze-btn").addEventListener("click", () => {
+  hazeOn = !hazeOn;
+  try { localStorage.setItem("sgtemp-haze", hazeOn ? "on" : "off"); } catch { /* fine */ }
+  updateHazeBtn();
+  renderHaze(); // (was renderHaze(light) — no 'light' here: every click threw)
+});
 updateHazeBtn();
 
 // Collapsible station panel: hide to give the map the full width; a slim
@@ -4434,8 +4062,6 @@ setInterval(pollWind, POLL_MS);
 refreshModel();
 refreshAir();
 setInterval(refreshAir, MODEL_REFRESH_MS);
-refreshHazeRegion(); // haze around the island (and the regional view)
-setInterval(refreshHazeRegion, MODEL_REFRESH_MS);
 setInterval(pollHaze, HAZE_POLL_MS);
 setInterval(refresh, POLL_MS);
 setInterval(refreshModel, MODEL_REFRESH_MS);
