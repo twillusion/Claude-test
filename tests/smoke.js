@@ -30,6 +30,10 @@ global.L = {
   map: () => ({
     setView() { return this; }, panTo() {}, on() {}, invalidateSize() {},
     fitBounds() { return this; }, getBoundsZoom: () => 11, setMinZoom() {}, setMaxBounds() {},
+    hasLayer: () => false,
+    // the view: the island window, or (zoomedOut) the NEAR box around it
+    getBounds() { const z = this.zoomedOut; return { getNorth: () => (z ? 3 : 1.5), getSouth: () => (z ? -0.4 : 1.1),
+      getEast: () => (z ? 105.8 : 104.2), getWest: () => (z ? 101.8 : 103.5) }; },
     getSize: () => ({ x: 800, y: 600 }),
     container: { style: { setProperty(k, v) { this[k] = v; } },
       closest: () => (els["map-wrap"] ||= makeEl()) },
@@ -38,7 +42,7 @@ global.L = {
     createPane(n) { return (this.panes[n] ??= { style: {}, appendChild() {} }); },
     getPane(n) { return this.panes[n]; },
   }),
-  latLngBounds: () => ({ pad() { return this; } }),
+  latLngBounds: () => ({ pad() { return this; }, getCenter: () => [1.35, 103.8] }),
   tileLayer: (url) => ({ url, addTo() { return this; }, on() {}, once(e, fn) { fn(); }, remove() {}, setUrl() {}, setOpacity(v) { this.opacity = v; } }),
   circle: () => ({ addTo() { return this; }, setRadius() {}, setStyle() {}, remove() {} }),
   rectangle: () => ({ addTo() { return this; }, on() {}, remove() {} }),
@@ -224,6 +228,24 @@ const h = new Function(src + `
       return { src: ctx.src, gauges: ctx.gauges, atR1: ctx.rate(r1.lat, r1.lon), atR2: ctx.rate(r2.lat, r2.lon),
         sea: ctx.rate(1.12, 104.18) };
     },
+    // general view with the regional file: island veil meets the haze
+    // around it at the window edge; that layer only when zoomed out
+    nearTest: async () => {
+      while (hazeRegionLoading) await new Promise((r) => setTimeout(r, 5));
+      displayedT = null; hazeCache.key = ""; renderAll();
+      const ctx = hazeContext(Date.now());
+      const lat = 1.33, j = Math.floor((OVERLAY.latMax - lat) / (OVERLAY.latMax - OVERLAY.latMin) * HAZE.h);
+      const islandEdge = ctx.field[j * HAZE.w + HAZE.w - 1];
+      const outside = outerValue(ctx, lat, OVERLAY.lonMax + 0.01);
+      const farOut = outerValue(ctx, lat, 105.8), modelFar = regionSample(ctx.regG, lat, 105.8);
+      const modelEdge = regionSample(ctx.regG, lat, OVERLAY.lonMax + 0.01);
+      const shownIn = !!outerLayer && outerLayer.opacity === 1;
+      map.zoomedOut = true; hazeCache.key = ""; renderAll();
+      const shownOut = !!outerLayer && outerLayer.opacity === 1;
+      map.zoomedOut = false; renderAll();
+      return { usesRegion: !!ctx.regG, islandEdge, outside, modelEdge, farOut, modelFar, shownIn, shownOut,
+        hiddenAgain: !outerLayer || outerLayer.opacity === 0 };
+    },
     regionTest: async () => {
       displayedT = null;
       setHazeRegional(true);
@@ -253,6 +275,8 @@ const h = new Function(src + `
     },
     hazeTest: async () => {
       await refreshAir(); await fetchHaze(); await loadHazeHistory();
+      // the data/air.json path first (the regional file is tested below)
+      const keepRegion = hazeRegion; hazeRegion = null; hazeCache.key = "";
       const px = (c, lat, lon) => c.field[Math.floor((OVERLAY.latMax - lat) / (OVERLAY.latMax - OVERLAY.latMin) * HAZE.h) * HAZE.w
         + Math.floor((lon - OVERLAY.lonMin) / (OVERLAY.lonMax - OVERLAY.lonMin) * HAZE.w)];
       const W = hazeRegions.get("west");
@@ -284,7 +308,7 @@ const h = new Function(src + `
       out.noNeaStatus = document.getElementById("haze-status").textContent;
       for (const [k, v] of regs) hazeRegions.set(k, v);
       for (const [k, v] of ser) hazeSeries.set(k, v);
-      hazeErr = ""; renderAll();
+      hazeErr = ""; hazeRegion = keepRegion; hazeCache.key = ""; renderAll();
       return out;
     },
     loadingLeft: () => [...loadingItems.keys()].filter((k) => k !== "tiles"),
@@ -470,6 +494,15 @@ const h = new Function(src + `
     "haze without the model: regions only, said out loud:", hz);
   console.assert(/^≈ PM2\.5 20 µg\/m³ over the map \(CAMS model only — NEA PM2\.5 test\)$/.test(hz.noNeaStatus), "haze without NEA:", hz.noNeaStatus);
   console.assert(hz.noModelFc === "none", "no haze forecast without the model:", hz.noModelFc);
+
+  // general view: haze around the island from the regional file
+  const nt = await h.nearTest();
+  if (process.env.DEBUG_NEAR) console.log(nt);
+  console.assert(nt.usesRegion, "island haze uses the regional CAMS file when loaded:", nt);
+  console.assert(Math.abs(nt.islandEdge - nt.outside) / nt.outside < 0.1, "island veil meets the outer haze at the edge:", nt);
+  // ~180 km out the NEA ratio has mostly faded: closer to the raw model
+  console.assert(Math.abs(nt.farOut / nt.modelFar - 1) < Math.abs(nt.outside / nt.modelEdge - 1) / 3, "far out: the model:", nt);
+  console.assert(!nt.shownIn && nt.shownOut && nt.hiddenAgain, "outer haze only when zoomed out past the island:", nt);
 
   // regional haze view: CAMS plume over the region, moving with time
   const rg = await h.regionTest();

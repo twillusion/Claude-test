@@ -191,17 +191,35 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
   mean (λ halves ~10 km out, d0 3 km), applied as `(m+5)·e^corr − 5`, so a
   region lands on its own reading. Future: the ratio at "now", halving
   every 12 h (`HAZE.fadeHalfH`). No model → past/live from the regions
-  alone, no forecast, footer says why. Neutral grey veil: alpha 0 ≤10
-  µg/m³, ~0.16 at 35, ~0.24 at 55, ~0.44 at 150 (the first curve, ~0.13
-  at a real 40-55 night, was invisible — the owner asked "can we visualize
-  the haze?" with the layer already on). Data field 48×31; painted at
+  alone, no forecast, footer says why. Neutral grey veil with a contrast
+  ramp (`hazeLevel` = log(v/12)/log(250/12)): alpha `0.78·t^1.7` (~0.13
+  at 35, 0.24 at 55, 0.42 at 100, 0.57 at 150, 0.78 at 250+) AND
+  brightness `hazeGrey` 150→250 (dense haze whiter) — two cues. History:
+  ~0.13 at a real 40-55 night was invisible ("can we visualize the
+  haze?"); then 30-100 all read as one mid grey ("more contrast"). The
+  model is the regional CAMS file when loaded (`regionSample`), else
+  `data/air.json` (Gaussian). Data field 48×31; painted at
   96×61 (48×31 + 2 noise octaves on glide frames) with a cosmetic fBm
   texture (~12 km patches, opacity ×0.55-1.45, mean 1) that drifts with
   the model's island-mean wind integrated over time (`hazeDrift`), so the
   haze rolls when scrubbing. Grey key `#haze-key` under the temperature
   legend, tick = haziest value on the map; shown only while the veil is.
   Glide frames step haze DATA in 10 min and skip the footer (reflow);
-  the texture uses the exact time; landing is exact. Region tags
+  the texture uses the exact time; landing is exact.
+- **Map framing / haze around the island**: the general view opens on the
+  island window filling the screen (`fitIsland`; re-applied on resize
+  until the user touches the map — phones measure late), but pinches out
+  to `NEAR` (−0.6…3.2°N, 101.6…106°E; maxBounds + minZoom). Once the view
+  reaches past the window (`viewBeyondIsland`), ONE viewport layer
+  (`renderOuterHaze`, 1 px per 8 screen px, 20 mid-glide; ~10.5 ms glide
+  frame at 4×) replaces the island veil: island field inside the window,
+  `outerValue` outside (regional CAMS × the island NEA ratio fading over
+  ~80 km — meets the island value at the edge, smoke-tested), same texture
+  frame, fade at the NEAR edge, island window outlined dashed. Two layers
+  (coarse outer + island veil) left a dark halo: the outer canvas was
+  transparent inside the window and browser smoothing smeared it outward.
+  Far out (window < 240 px wide) `.map-wrap.far` hides pills/glyphs/tags.
+  `regionSample` is allocation-free (it was the zoomed-out hot path). Region tags
   ("PM2.5 64", dashed + ≈ for estimates) sit just below NEA's label points
   (north coincides with the Sembawang wind pin) and show, all five, once
   any region is ≥ 25. The 4th timebar button (HAZE) forced tighter phone
@@ -213,7 +231,8 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
   `renderRegionalHaze`); island panes are hidden by `.map-wrap.regional`
   CSS and not drawn; wind particles pause. Raster 136×104 (half on glide
   frames, ~5 ms at 4×), Catmull-Rom between cells, NaN gaps stay gaps,
-  fades out over 0.8° at the domain edge, opacity = `hazeAlpha`×1.25.
+  fades out over 0.8° at the domain edge.
+  Same contrast ramp as the island (no extra boost).
   Raw CAMS, NOT NEA-corrected (the ratio is local to Singapore); the
   Singapore tag shows the island (NEA-corrected) range so both views
   agree. The island window is outlined; tapping it or the tag goes back.
