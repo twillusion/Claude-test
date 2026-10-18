@@ -101,7 +101,12 @@ static page, no backend, no hosting costs.
   ratio spread by inverse distance around the island mean). The forecast
   carries today's NEA/model ratio forward, halving every 12 h. Region tags
   ("PM2.5 64") appear once any region reaches 25 µg/m³; forecasts and
-  model estimates are dashed and marked ≈. The HAZE button toggles it.
+  model estimates are dashed and marked ≈.
+- HAZE zooms out to the region (Sumatra, southern Malaysia, Singapore, West
+  Kalimantan) to show where the haze comes from: the CAMS PM2.5 plumes as
+  grey smoke moving hour by hour with the slider (model, not corrected to
+  NEA; the Singapore tag carries the island value). Tap Singapore or HAZE
+  to go back.
 - The wind field is precomputed onto a 24×16 grid once per change, so
   particles and rain sample it with one bilinear lookup per tick instead
   of per-particle IDW.

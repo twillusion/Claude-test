@@ -29,9 +29,10 @@ global.document = {
 global.L = {
   map: () => ({
     setView() { return this; }, panTo() {}, on() {}, invalidateSize() {},
-    fitBounds() { return this; }, getBoundsZoom: () => 11, setMinZoom() {},
+    fitBounds() { return this; }, getBoundsZoom: () => 11, setMinZoom() {}, setMaxBounds() {},
     getSize: () => ({ x: 800, y: 600 }),
-    container: { style: { setProperty(k, v) { this[k] = v; } } },
+    container: { style: { setProperty(k, v) { this[k] = v; } },
+      closest: () => (els["map-wrap"] ||= makeEl()) },
     getContainer() { return this.container; },
     panes: {},
     createPane(n) { return (this.panes[n] ??= { style: {}, appendChild() {} }); },
@@ -40,6 +41,7 @@ global.L = {
   latLngBounds: () => ({ pad() { return this; } }),
   tileLayer: (url) => ({ url, addTo() { return this; }, on() {}, once(e, fn) { fn(); }, remove() {}, setUrl() {}, setOpacity(v) { this.opacity = v; } }),
   circle: () => ({ addTo() { return this; }, setRadius() {}, setStyle() {}, remove() {} }),
+  rectangle: () => ({ addTo() { return this; }, on() {}, remove() {} }),
   divIcon: (o) => o,
   marker: () => ({ on() {}, addTo() { return this; }, setIcon() {}, bindTooltip() {}, remove() {} }),
   imageOverlay: () => ({ addTo() { return this; }, setUrl() {}, opacity: 1, setOpacity(v) { this.opacity = v; } }),
@@ -81,6 +83,23 @@ function airFixture() {
   for (const lat of [1.0, 1.4, 1.8]) for (const lon of [103.4, 103.8, 104.2]) cells.push({ lat, lon, pm2_5: times.map(() => 20) });
   return { generated: Date.now(), times, cells };
 }
+// regional haze: a plume (peak 140) drifting east 0.2°/h through the region
+function hazeRegionFixture() {
+  const grid = { lat0: -4.0, lon0: 97.6, step: 0.4, nlat: 26, nlon: 34 };
+  const start = Math.floor(Date.now() / 3600e3) * 3600 - 30 * 3600;
+  const times = Array.from({ length: 70 }, (_, i) => start + i * 3600);
+  const pm = times.map((t) => {
+    const cx = 101 + 0.2 * (t - Date.now() / 1000) / 3600, cy = 0.5;
+    const a = [];
+    for (let iy = 0; iy < grid.nlat; iy++) for (let ix = 0; ix < grid.nlon; ix++) {
+      const lat = grid.lat0 + iy * grid.step, lon = grid.lon0 + ix * grid.step;
+      a.push(ix === 0 && iy === 0 ? -1 : Math.round(15 + 125 * Math.exp(-((lat - cy) ** 2 + (lon - cx) ** 2) / 2)));
+    }
+    return a;
+  });
+  return { generated: Date.now(), grid, times, pm };
+}
+
 function pm25Items(dateStr) {
   // hourly, stamped at the end of the hour (SGT), up to now
   const out = [];
@@ -99,6 +118,7 @@ global.fetch = async (url) => {
     return { ok: false, status: 404 }; // force the direct Open-Meteo path
   }
   if (typeof url === "string" && url.startsWith("data/air.json")) return ok(airFixture());
+  if (typeof url === "string" && url.startsWith("data/haze-region.json")) return ok(hazeRegionFixture());
   const u = new URL(url);
   if (u.pathname.endsWith("/pm25")) {
     // v2 shape (regionMetadata / labelLocation)
@@ -203,6 +223,27 @@ const h = new Function(src + `
       const r1 = rainLocs.get("R1"), r2 = rainLocs.get("R2");
       return { src: ctx.src, gauges: ctx.gauges, atR1: ctx.rate(r1.lat, r1.lon), atR2: ctx.rate(r2.lat, r2.lon),
         sea: ctx.rate(1.12, 104.18) };
+    },
+    regionTest: async () => {
+      displayedT = null;
+      setHazeRegional(true);
+      while (hazeRegionLoading) await new Promise((r) => setTimeout(r, 5));
+      renderAll();
+      const now = Date.now(), at = (t, lat, lon) => regionSample(regionGridAt(t), lat, lon);
+      const out = {
+        on: hazeRegional, wrapRegional: true, status: document.getElementById("haze-status").textContent,
+        peakNow: at(now, 0.5, 101), eastNow: at(now, 0.5, 102.2),
+        // +6 h: the plume centre has moved 1.2° east
+        peak6h: at(now + 6 * 3600e3, 0.5, 102.2), west6h: at(now + 6 * 3600e3, 0.5, 101),
+        gap: at(now, -4.0, 97.6),
+      };
+      displayedT = now + 6 * 3600e3; renderAll(true); renderAll();
+      out.fcStatus = document.getElementById("haze-status").textContent;
+      setHazeRegional(false);
+      displayedT = null; renderAll();
+      out.off = !hazeRegional;
+      out.backStatus = document.getElementById("haze-status").textContent;
+      return out;
     },
     hazeLook: () => {
       const t = Date.now(), a = hazeDrift(t), b = hazeDrift(t + 3600e3);
@@ -429,6 +470,15 @@ const h = new Function(src + `
     "haze without the model: regions only, said out loud:", hz);
   console.assert(/^≈ PM2\.5 20 µg\/m³ over the map \(CAMS model only — NEA PM2\.5 test\)$/.test(hz.noNeaStatus), "haze without NEA:", hz.noNeaStatus);
   console.assert(hz.noModelFc === "none", "no haze forecast without the model:", hz.noModelFc);
+
+  // regional haze view: CAMS plume over the region, moving with time
+  const rg = await h.regionTest();
+  console.assert(rg.on && /^regional view: CAMS model PM2\.5/.test(rg.status), "regional haze view:", rg);
+  console.assert(rg.peakNow > 120 && rg.eastNow < rg.peakNow, "regional plume where the model has it:", rg);
+  console.assert(rg.peak6h > 120 && rg.west6h < rg.peak6h, "regional plume moves with time:", rg);
+  console.assert(Number.isNaN(rg.gap), "regional gaps stay gaps:", rg.gap);
+  console.assert(/up to 1[2-4]\d µg/.test(rg.fcStatus), "regional footer in the forecast:", rg.fcStatus);
+  console.assert(rg.off && /^PM2\.5 /.test(rg.backStatus), "back to the island view:", rg);
 
   console.assert(h.loadingLeft().length === 0, "nothing left marked as loading:", h.loadingLeft());
 

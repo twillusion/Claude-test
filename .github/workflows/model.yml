@@ -25,6 +25,9 @@ jobs:
       # reports the missing/stale file
       - run: node scripts/fetch-air.mjs
         continue-on-error: true
+      # regional haze view (skips itself while the file is < 5.5 h old)
+      - run: node scripts/fetch-haze-region.mjs
+        continue-on-error: true
       - name: Commit data
         run: |
           git config user.name "model-bot"
