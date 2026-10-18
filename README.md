@@ -102,6 +102,9 @@ static page, no backend, no hosting costs.
   carries today's NEA/model ratio forward, halving every 12 h. Region tags
   ("PM2.5 64") appear once any region reaches 25 µg/m³; forecasts and
   model estimates are dashed and marked ≈.
+- Pinch out from the island to see the haze around it (Johor, the Riau
+  islands, Sumatra's coast): the regional CAMS field, scaled near the island
+  to match NEA. Denser haze is both more opaque and whiter.
 - HAZE zooms out to the region (Sumatra, southern Malaysia, Singapore, West
   Kalimantan) to show where the haze comes from: the CAMS PM2.5 plumes as
   grey smoke moving hour by hour with the slider (model, not corrected to

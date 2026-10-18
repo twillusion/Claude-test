@@ -491,6 +491,12 @@ body { display: flex; flex-direction: column; }
   filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.7));
 }
 
+/* general view pinched far out: the island's pills, glyphs and tags would
+   pile into one clump; the shading and the haze stay */
+.map-wrap.far:not(.regional) .leaflet-marker-pane,
+.map-wrap.far:not(.regional) .leaflet-rain-pane,
+.map-wrap.far:not(.regional) .leaflet-tooltip-pane { display: none; }
+
 /* regional haze view: every island layer steps aside (they're also not
    redrawn); the haze key stays, the temperature legend goes */
 .map-wrap.regional .leaflet-overlay-pane,
