@@ -21,6 +21,12 @@ humans; this file is the working knowledge for continuing development.
 - `scripts/fetch-air.mjs` — same Action, separate step (`continue-on-error`,
   so a haze failure never holds back the weather model): CAMS PM2.5 into
   `data/air.json`. Do not hand-edit it either.
+- `scripts/fetch-haze-region.mjs` — same Action, `continue-on-error`: CAMS
+  PM2.5 for the whole haze region (26×34 native 0.4° cells, −4…6°N,
+  97.6…110.8°E) into `data/haze-region.json`; skips itself while the file
+  is < 5.5 h old (CAMS runs 2×/day; ~880 locations per run, keeps us inside
+  Open-Meteo's free 10k calls/day with the hourly fetches). `FORCE=1`
+  overrides the skip.
 - `tests/smoke.js` — runs app.js in Node with stubbed DOM/Leaflet/fetch.
 
 ## Every change: the release routine
@@ -200,6 +206,24 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
   (north coincides with the Sembawang wind pin) and show, all five, once
   any region is ≥ 25. The 4th timebar button (HAZE) forced tighter phone
   buttons; under 380px the sun/moon icon hides so row 1 still fits.
+- **Regional haze view** (HAZE button → `setHazeRegional`): at island
+  scale no data has haze "cloud" structure (CAMS cells ~45 km; the island
+  window covers ~2×3), so HAZE zooms out to −4.2…6.2°N, 97.4…111°E where
+  the CAMS plumes are real. `renderAll` takes a short branch (timebar +
+  `renderRegionalHaze`); island panes are hidden by `.map-wrap.regional`
+  CSS and not drawn; wind particles pause. Raster 136×104 (half on glide
+  frames, ~5 ms at 4×), Catmull-Rom between cells, NaN gaps stay gaps,
+  fades out over 0.8° at the domain edge, opacity = `hazeAlpha`×1.25.
+  Raw CAMS, NOT NEA-corrected (the ratio is local to Singapore); the
+  Singapore tag shows the island (NEA-corrected) range so both views
+  agree. The island window is outlined; tapping it or the tag goes back.
+  Map lock is mode-aware (`lockMinZoom`). Missing/stale file: tag on the
+  map + footer say so. The island veil is always on now (no toggle; it's
+  invisible below 10 µg/m³). The owner asked for haze that looks like a
+  moving cloud; options offered were regional view / FIRMS hotspots
+  (needs a free MAP_KEY as an Action secret) / Himawari visible imagery
+  (GIBS `Himawari_AHI_Band3_Red_Visible_1km`, daytime, past only) /
+  island-only + WAQI stations — they chose the regional view only.
 - **Rain glyphs**: 🌧️ at the real gauge positions, **no rain colour**
   (owner's rule: colour means temperature), each with a **circle of
   effect** (owner asked for it back): radius 0.8–5 km by intensity on one
@@ -234,6 +258,8 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
 
 ## Open ideas (not started)
 
+- Haze: FIRMS fire hotspots in the regional view; Himawari visible
+  imagery as a past backdrop (see the regional haze view notes).
 - Higher-res radar from NEA's own rain-area PNGs (weather.gov.sg, 5-min).
   Needs manual geo-registration (corner coordinates) calibrated against
   real storms with the owner — do it as its own careful task.
