@@ -491,27 +491,6 @@ body { display: flex; flex-direction: column; }
   filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.7));
 }
 
-/* general view pinched far out: the island's pills, glyphs and tags would
-   pile into one clump; the shading and the haze stay */
-.map-wrap.far:not(.regional) .leaflet-marker-pane,
-.map-wrap.far:not(.regional) .leaflet-rain-pane,
-.map-wrap.far:not(.regional) .leaflet-tooltip-pane { display: none; }
-
-/* regional haze view: every island layer steps aside (they're also not
-   redrawn); the haze key stays, the temperature legend goes */
-.map-wrap.regional .leaflet-overlay-pane,
-.map-wrap.regional .leaflet-marker-pane,
-.map-wrap.regional .leaflet-shadow-pane,
-.map-wrap.regional .leaflet-tooltip-pane,
-.map-wrap.regional .leaflet-radar-pane,
-.map-wrap.regional .leaflet-haze-pane,
-.map-wrap.regional .leaflet-clouds-pane,
-.map-wrap.regional .leaflet-rain-pane,
-.map-wrap.regional .leaflet-windParticles-pane,
-.map-wrap.regional .legend { display: none; }
-.map-wrap.regional .haze-key { top: 10px; }
-.haze-tag.region-sg { transform: translate(-50%, -100%) translateY(-4px); cursor: pointer; }
-
 /* haze: NEA region PM2.5 tag, neutral grey (colour means temperature);
    dashed like the forecast pills when it's a model estimate */
 .haze-tag {

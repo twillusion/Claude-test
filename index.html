@@ -16,7 +16,7 @@
   <link rel="stylesheet" href="assets/vendor/leaflet/leaflet.css">
   <!-- bump ?v= whenever style.css or app.js changes: stale cached assets
        under a fresh index.html render a broken hybrid of old and new -->
-  <link rel="stylesheet" href="assets/style.css?v=20261018b">
+  <link rel="stylesheet" href="assets/style.css?v=20261018c">
 </head>
 <body>
   <header class="topbar">
@@ -44,7 +44,7 @@
         <div class="legend-bar"></div>
         <span id="legend-hi">–</span>
       </div>
-      <div class="haze-key hidden" id="haze-key" title="Haze density, PM2.5 µg/m³ (tick = haziest spot on the map)">
+      <div class="haze-key hidden" id="haze-key" title="Haze veil density: NEA PM2.5 + CAMS model, µg/m³ (tick = haziest spot on the map)">
         <span>haze</span>
         <div class="haze-bar"></div>
         <span>PM2.5 <b id="haze-key-max">–</b></span>
@@ -53,7 +53,7 @@
         <button id="live-btn" title="Jump to latest reading">LIVE</button>
         <button id="wind-btn" title="Toggle wind streaks">WIND</button>
         <button id="radar-btn" title="Toggle rain clouds (radar, nowcast, model)">RADAR</button>
-        <button id="haze-btn" title="Regional haze view: smoke plumes over Sumatra, Malaysia and Singapore (CAMS model)">HAZE</button>
+        <button id="haze-btn" title="Show / hide the haze over Singapore (NEA PM2.5 + CAMS model)">HAZE</button>
         <div class="slider-wrap">
           <input type="range" id="time-slider" min="0" max="0" step="1" value="0"
                  aria-label="Time scrubber: 24 hours back to 24 hours ahead">
@@ -110,6 +110,6 @@
   </footer>
 
   <script src="assets/vendor/leaflet/leaflet.js"></script>
-  <script src="assets/app.js?v=20261018b"></script>
+  <script src="assets/app.js?v=20261018c"></script>
 </body>
 </html>

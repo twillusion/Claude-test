@@ -21,12 +21,6 @@ humans; this file is the working knowledge for continuing development.
 - `scripts/fetch-air.mjs` — same Action, separate step (`continue-on-error`,
   so a haze failure never holds back the weather model): CAMS PM2.5 into
   `data/air.json`. Do not hand-edit it either.
-- `scripts/fetch-haze-region.mjs` — same Action, `continue-on-error`: CAMS
-  PM2.5 for the whole haze region (26×34 native 0.4° cells, −4…6°N,
-  97.6…110.8°E) into `data/haze-region.json`; skips itself while the file
-  is < 5.5 h old (CAMS runs 2×/day; ~880 locations per run, keeps us inside
-  Open-Meteo's free 10k calls/day with the hourly fetches). `FORCE=1`
-  overrides the skip.
 - `tests/smoke.js` — runs app.js in Node with stubbed DOM/Leaflet/fetch.
 
 ## Every change: the release routine
@@ -196,53 +190,31 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
   at 35, 0.24 at 55, 0.42 at 100, 0.57 at 150, 0.78 at 250+) AND
   brightness `hazeGrey` 150→250 (dense haze whiter) — two cues. History:
   ~0.13 at a real 40-55 night was invisible ("can we visualize the
-  haze?"); then 30-100 all read as one mid grey ("more contrast"). The
-  model is the regional CAMS file when loaded (`regionSample`), else
-  `data/air.json` (Gaussian). Data field 48×31; painted at
+  haze?"); then 30-100 all read as one mid grey ("more contrast").
+  Data field 48×31; painted at
   96×61 (48×31 + 2 noise octaves on glide frames) with a cosmetic fBm
-  texture (~12 km patches, opacity ×0.55-1.45, mean 1) that drifts with
+  texture (~12 km patches, opacity ×0.45-1.55, mean 1) that drifts with
   the model's island-mean wind integrated over time (`hazeDrift`), so the
   haze rolls when scrubbing. Grey key `#haze-key` under the temperature
   legend, tick = haziest value on the map; shown only while the veil is.
   Glide frames step haze DATA in 10 min and skip the footer (reflow);
-  the texture uses the exact time; landing is exact.
-- **Map framing / haze around the island**: the general view opens on the
-  island window filling the screen (`fitIsland`; re-applied on resize
-  until the user touches the map — phones measure late), but pinches out
-  to `NEAR` (−0.6…3.2°N, 101.6…106°E; maxBounds + minZoom). Once the view
-  reaches past the window (`viewBeyondIsland`), ONE viewport layer
-  (`renderOuterHaze`, 1 px per 8 screen px, 20 mid-glide; ~10.5 ms glide
-  frame at 4×) replaces the island veil: island field inside the window,
-  `outerValue` outside (regional CAMS × the island NEA ratio fading over
-  ~80 km — meets the island value at the edge, smoke-tested), same texture
-  frame, fade at the NEAR edge, island window outlined dashed. Two layers
-  (coarse outer + island veil) left a dark halo: the outer canvas was
-  transparent inside the window and browser smoothing smeared it outward.
-  Far out (window < 240 px wide) `.map-wrap.far` hides pills/glyphs/tags.
-  `regionSample` is allocation-free (it was the zoomed-out hot path). Region tags
+  the texture uses the exact time; landing is exact. Region tags
   ("PM2.5 64", dashed + ≈ for estimates) sit just below NEA's label points
   (north coincides with the Sembawang wind pin) and show, all five, once
-  any region is ≥ 25. The 4th timebar button (HAZE) forced tighter phone
-  buttons; under 380px the sun/moon icon hides so row 1 still fits.
-- **Regional haze view** (HAZE button → `setHazeRegional`): at island
-  scale no data has haze "cloud" structure (CAMS cells ~45 km; the island
-  window covers ~2×3), so HAZE zooms out to −4.2…6.2°N, 97.4…111°E where
-  the CAMS plumes are real. `renderAll` takes a short branch (timebar +
-  `renderRegionalHaze`); island panes are hidden by `.map-wrap.regional`
-  CSS and not drawn; wind particles pause. Raster 136×104 (half on glide
-  frames, ~5 ms at 4×), Catmull-Rom between cells, NaN gaps stay gaps,
-  fades out over 0.8° at the domain edge.
-  Same contrast ramp as the island (no extra boost).
-  Raw CAMS, NOT NEA-corrected (the ratio is local to Singapore); the
-  Singapore tag shows the island (NEA-corrected) range so both views
-  agree. The island window is outlined; tapping it or the tag goes back.
-  Map lock is mode-aware (`lockMinZoom`). Missing/stale file: tag on the
-  map + footer say so. The island veil is always on now (no toggle; it's
-  invisible below 10 µg/m³). The owner asked for haze that looks like a
-  moving cloud; options offered were regional view / FIRMS hotspots
-  (needs a free MAP_KEY as an Action secret) / Himawari visible imagery
-  (GIBS `Himawari_AHI_Band3_Red_Visible_1km`, daytime, past only) /
-  island-only + WAQI stations — they chose the regional view only.
+  any region is ≥ 25. HAZE toggles the veil, key and tags
+  (`sgtemp-haze` in localStorage); it never moves the map. The 4th timebar
+  button forced tighter phone buttons; under 380px the sun/moon icon hides
+  so row 1 still fits. Its click handler once called `renderHaze(light)`
+  outside any `light` scope and threw on every click for three releases;
+  the smoke stub now keeps listeners and the test clicks HAZE.
+- **Regional haze — tried and rejected (Oct 2026)**: a HAZE mode that
+  zoomed out to Sumatra/Malaysia (CAMS plumes over the region,
+  `data/haze-region.json`), then a pinch-out to ±2° around Singapore. The
+  owner: "I am just interested in Singapore, not the neighbouring
+  countries." Both were removed (v20261018c); the map stays locked to the
+  island window. Don't reintroduce zoomed-out views. (At island scale CAMS
+  has no "cloud" structure — ~45 km cells, ~2×3 over the window — so the
+  texture is the visual; the data sets how hazy.)
 - **Rain glyphs**: 🌧️ at the real gauge positions, **no rain colour**
   (owner's rule: colour means temperature), each with a **circle of
   effect** (owner asked for it back): radius 0.8–5 km by intensity on one
@@ -277,8 +249,6 @@ smoke test's mocks plus the owner's reports — ask them to read the footer.
 
 ## Open ideas (not started)
 
-- Haze: FIRMS fire hotspots in the regional view; Himawari visible
-  imagery as a past backdrop (see the regional haze view notes).
 - Higher-res radar from NEA's own rain-area PNGs (weather.gov.sg, 5-min).
   Needs manual geo-registration (corner coordinates) calibrated against
   real storms with the owner — do it as its own careful task.

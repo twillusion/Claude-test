@@ -95,21 +95,14 @@ static page, no backend, no hosting costs.
   in tooltips and the footer) and the CAMS PM2.5 forecast (Copernicus, ~45
   km, via Open-Meteo, fetched by the same GitHub Action into
   `data/air.json`). The map shows a neutral grey veil that thickens with
-  PM2.5 (soft patches that drift with the wind as you scrub; the patches
+  PM2.5 — denser haze is both more opaque and whiter (soft patches that
+  drift with the wind as you scrub; the patches
   are texture, the density is data — a grey key under the temperature
   legend marks the haziest value): the CAMS field scaled toward the NEA readings (each region's
   ratio spread by inverse distance around the island mean). The forecast
   carries today's NEA/model ratio forward, halving every 12 h. Region tags
   ("PM2.5 64") appear once any region reaches 25 µg/m³; forecasts and
-  model estimates are dashed and marked ≈.
-- Pinch out from the island to see the haze around it (Johor, the Riau
-  islands, Sumatra's coast): the regional CAMS field, scaled near the island
-  to match NEA. Denser haze is both more opaque and whiter.
-- HAZE zooms out to the region (Sumatra, southern Malaysia, Singapore, West
-  Kalimantan) to show where the haze comes from: the CAMS PM2.5 plumes as
-  grey smoke moving hour by hour with the slider (model, not corrected to
-  NEA; the Singapore tag carries the island value). Tap Singapore or HAZE
-  to go back.
+  model estimates are dashed and marked ≈. The HAZE button shows or hides it.
 - The wind field is precomputed onto a 24×16 grid once per change, so
   particles and rain sample it with one bilinear lookup per tick instead
   of per-particle IDW.
